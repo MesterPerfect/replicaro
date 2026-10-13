@@ -297,9 +297,21 @@ func xmlEscape(value string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 	return replacer.Replace(value)
 }
+
+// systemdEscape quotes the executable for ExecStart. Inside the quotes systemd
+// reads C-style backslash escapes, expands % specifiers, and replaces $NAME
+// and ${NAME} with environment variables, so a literal $ is written $$.
 func systemdEscape(value string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`).Replace(value) + `"`
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`, `$`, `$$`).Replace(value) + `"`
 }
+
+// desktopEscape quotes the executable for the Exec key of a desktop entry.
+// The Desktop Entry spec reads that value twice: first as a string value,
+// where \\ stands for one backslash, and then as an Exec line, where a quoted
+// argument escapes ", `, $ and \ with a backslash. So the quoting escapes are
+// applied first and every backslash is then doubled once more, which writes a
+// literal backslash as four. A literal % is %%, the Exec line's own escape.
 func desktopEscape(value string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", `%`, `%%`).Replace(value) + `"`
+	quoted := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", `$`, `\$`).Replace(value) + `"`
+	return strings.NewReplacer(`\`, `\\`, `%`, `%%`).Replace(quoted)
 }

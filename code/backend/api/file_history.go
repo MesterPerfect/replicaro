@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -379,10 +378,6 @@ func snapshotIDs(snapshots []models.Snapshot) []string {
 	return ids
 }
 
-func logMetadataError(operation, repository string, err error) {
-	log.Printf("metadata cache %s for %s: %v", operation, repository, err)
-}
-
 // These strings name the native tree, never the viewing machine's filesystem.
 func normalizeSnapshotPath(value string) string { return strings.Trim(value, "/") }
 
@@ -404,12 +399,121 @@ func canonicalRestoreSelectionPath(value string) (string, error) {
 	return value, nil
 }
 
-func pathBase(value string) string {
-	value = normalizeSnapshotPath(value)
-	if index := strings.LastIndex(value, "/"); index >= 0 {
-		return value[index+1:]
+// writeRestoreRequestRefusal reports a restore refused before any work was
+// queued, by engines.ValidateRestoreRequest or by restoreSelection's Kopia
+// rules: its folder check, and its destination check for selected files, both
+// done inline there. /api/restore runs the same destination check through
+// refuseKopiaFileIntoMissingDestination. The coded refusals let the UI show
+// its own text, and for an invalid name offer to restore the containing
+// folder instead.
+func writeRestoreRequestRefusal(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, engines.ErrRestoreSelectionNameInvalid):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_selection_name_invalid", err.Error())
+	case errors.Is(err, engines.ErrRestoreDestinationNotAbsolute):
+		writeCodedError(w, http.StatusBadRequest, "restore_destination_not_absolute", err.Error())
+	case errors.Is(err, engines.ErrKopiaSelectionIncludesFolder):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_kopia_folder_selection", err.Error())
+	case errors.Is(err, engines.ErrKopiaSelectedFileDestinationMissing):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_kopia_destination_missing", err.Error())
+	case errors.Is(err, engines.ErrUnsupported):
+		writeError(w, http.StatusUnprocessableEntity, err)
+	default:
+		writeError(w, http.StatusBadRequest, err)
 	}
-	return value
+}
+
+// errSelectionSnapshotNotReady means a selected item's snapshot is known to the
+// metadata cache but its entries are not indexed yet.
+var errSelectionSnapshotNotReady = errors.New("selected snapshot entries are not indexed yet")
+
+// cachedSelectionKinds reports whether the metadata cache, which the
+// selection was made from, lists any selected item as a folder, and whether
+// it lists any as a file. It runs before any work is queued, so a Kopia
+// request that would merge folders (see engines.ErrKopiaSelectionIncludesFolder)
+// or restore a file into a folder that doesn't exist (see
+// engines.ErrKopiaSelectedFileDestinationMissing) is refused with nothing
+// restored.
+//
+// An item whose snapshot is still being indexed can't be checked, and the
+// snapshot may be ready by the time the queued restore runs. The answer then
+// also carries errSelectionSnapshotNotReady, after the other items had their
+// chance to show a folder or a file, and the caller decides what that means
+// for its rule. Any other item the cache cannot place (its snapshot is
+// unknown to the cache, or the root or entry is missing) is left alone: the
+// restore refuses an unknown snapshot or root before any native call, and
+// the Kopia adapter checks the native type before each restore.
+func cachedSelectionKinds(ctx context.Context, db *sql.DB, repositoryID string, items []RestoreSelectionItem) (folder, file bool, err error) {
+	authority, err := database.LoadMetadataReadAuthority(ctx, db, repositoryID)
+	if err != nil {
+		return false, false, err
+	}
+	type listing struct {
+		snapshot models.Snapshot
+		entries  []models.SnapshotEntry
+		ready    bool
+	}
+	listings := map[string]listing{}
+	notReady := false
+	for _, item := range items {
+		parent := ""
+		if index := strings.LastIndex(item.Path, "/"); index >= 0 {
+			parent = item.Path[:index]
+		}
+		key := item.SnapshotID + "\x00" + parent
+		children, cached := listings[key]
+		if !cached {
+			children.snapshot, children.entries, children.ready, err =
+				database.ReadyMetadataSnapshotEntriesForAuthority(ctx, db, authority, item.SnapshotID, parent)
+			if err != nil {
+				return folder, file, err
+			}
+			listings[key] = children
+		}
+		if !children.ready {
+			// A snapshot the cache doesn't know comes back with an empty ID.
+			if children.snapshot.ID != "" {
+				notReady = true
+			}
+			continue
+		}
+		root, rootErr := exactRestoreNativeRoot(children.snapshot, item.NativeRootID, true)
+		if rootErr != nil {
+			continue
+		}
+		for _, entry := range children.entries {
+			if entry.Path == item.Path && entry.SourceRoot == root.Path {
+				folder = folder || entry.IsDir
+				file = file || !entry.IsDir
+			}
+		}
+	}
+	if notReady {
+		return folder, file, errSelectionSnapshotNotReady
+	}
+	return folder, file, nil
+}
+
+// refuseKopiaFileIntoMissingDestination is the destination rule of
+// restoreSelection for /api/restore's one selected item: a Kopia restore of a
+// selected file into a destination folder that doesn't exist is refused (see
+// engines.ErrKopiaSelectedFileDestinationMissing). When the cache can't tell
+// yet, the request goes on and the Kopia adapter checks again before it
+// restores the file. It reports whether it wrote a response.
+func refuseKopiaFileIntoMissingDestination(w http.ResponseWriter, r *http.Request, db *sql.DB, repositoryID, destination string, items []RestoreSelectionItem) bool {
+	if !engines.RestoreDestinationMissing(destination) {
+		return false
+	}
+	_, file, err := cachedSelectionKinds(r.Context(), db, repositoryID, items)
+	if file {
+		writeRestoreRequestRefusal(w, engines.ErrKopiaSelectedFileDestinationMissing)
+		return true
+	}
+	if err != nil && !errors.Is(err, errSelectionSnapshotNotReady) && !errors.Is(err, database.ErrMetadataIndexingUnavailable) {
+		writeError(w, http.StatusInternalServerError, err)
+		return true
+	}
+	return false
 }
 
 func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w http.ResponseWriter, r *http.Request) {
@@ -476,8 +580,39 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 	}
 	for _, item := range normalized {
 		options := engines.RestoreOptions{Destination: req.TargetPath, Selection: item.Path, ConflictMode: req.ConflictMode}
-		if capabilityErr := engines.ValidateRestoreCapability(descriptor, options); capabilityErr != nil {
-			writeError(w, http.StatusUnprocessableEntity, capabilityErr)
+		if validationErr := engines.ValidateRestoreRequest(descriptor, options); validationErr != nil {
+			writeRestoreRequestRefusal(w, validationErr)
+			return
+		}
+	}
+	// These rules depend on the whole request and on the cached entry types,
+	// so they sit here rather than in engines.ValidateRestoreRequest, which
+	// checks one item without the database. /api/restore restores one item
+	// and needs only the destination rule.
+	destinationMissing := descriptor.ID == engines.KopiaID && engines.RestoreDestinationMissing(req.TargetPath)
+	if descriptor.ID == engines.KopiaID && (len(normalized) > 1 || destinationMissing) {
+		includesFolder, includesFile, cacheErr := cachedSelectionKinds(r.Context(), db, repoModel.ID, normalized)
+		if len(normalized) > 1 && includesFolder {
+			writeRestoreRequestRefusal(w, engines.ErrKopiaSelectionIncludesFolder)
+			return
+		}
+		if destinationMissing && includesFile {
+			writeRestoreRequestRefusal(w, engines.ErrKopiaSelectedFileDestinationMissing)
+			return
+		}
+		// The cache is briefly unreadable while it is rebuilt, its vault is
+		// removed, or the app shuts down, and a selected snapshot can still be
+		// indexing. That is not a failure of this request: nothing has been
+		// queued or restored, so answer the same retryable 409 that browsing
+		// gives and let the user try again. A single item only needed the
+		// destination rule, which the Kopia adapter checks again, so it goes on.
+		retryable := errors.Is(cacheErr, database.ErrMetadataIndexingUnavailable) || errors.Is(cacheErr, errSelectionSnapshotNotReady)
+		if retryable && len(normalized) > 1 {
+			writeCodedError(w, http.StatusConflict, "metadata_not_ready", "backup data is still being prepared")
+			return
+		}
+		if cacheErr != nil && !retryable {
+			writeError(w, http.StatusInternalServerError, cacheErr)
 			return
 		}
 	}
@@ -594,8 +729,15 @@ func restoreSelectionInBackground(op *trackedOperation, repoModel models.Reposit
 		output, restoreErr := manager.Restore(nativeContext, repoModel, item.SnapshotID, options)
 		operationStatus, processStarted, _, nativeStageErr, followupErr, stageKnown :=
 			engines.RequestedOperationOutcome(restoreErr)
-		if itemIndex == len(normalized)-1 || operationCtx.Err() != nil ||
-			stageKnown && operationStatus == engines.RequestedOperationInterrupted {
+		// The engine reports any context error as interrupted, including an
+		// internal deadline such as a local rclone preparation command's time
+		// limit. Only this request's own cancel or shutdown makes the item (and
+		// the request) interrupted; an internal timeout is handled as the
+		// preparation or native failure it is, so the request still fails and
+		// notifies, the same way a whole restore does.
+		ownCancel := stageKnown && operationStatus == engines.RequestedOperationInterrupted &&
+			operationruntime.TerminalStatus(operationCtx, restoreErr) == "interrupted"
+		if itemIndex == len(normalized)-1 || operationCtx.Err() != nil || ownCancel {
 			// The last requested restore child has returned, or cancellation means no
 			// later selection will run. Close the cancel gate before per-item
 			// bookkeeping so a late cancel request cannot change results the engine has
@@ -692,7 +834,16 @@ func restoreSelectionInBackground(op *trackedOperation, repoModel models.Reposit
 				result.NativeError = ""
 				result.OrchestrationStatus = "failed"
 				result.OrchestrationError = "native engine preparation failed; requested native restore was not started"
-				if operationStatus == engines.RequestedOperationInterrupted {
+				// Other preparation failures leave the item error empty, but
+				// these refusals are the reason the user has to change the
+				// selection or the destination, so the item carries the text.
+				switch {
+				case errors.Is(restoreErr, engines.ErrKopiaSelectionIncludesFolder):
+					result.Error = engines.ErrKopiaSelectionIncludesFolder.Error()
+				case errors.Is(restoreErr, engines.ErrKopiaSelectedFileDestinationMissing):
+					result.Error = engines.ErrKopiaSelectedFileDestinationMissing.Error()
+				}
+				if ownCancel {
 					cancellationInterrupted = true
 					stopReason = "not attempted because the restore request was cancelled"
 				} else {
@@ -720,7 +871,7 @@ func restoreSelectionInBackground(op *trackedOperation, repoModel models.Reposit
 					result.Error = nativeStageErr.Error()
 					result.NativeError = result.Error
 				}
-				if stageKnown && operationStatus == engines.RequestedOperationInterrupted {
+				if ownCancel {
 					result.Status = "interrupted"
 					result.NativeStatus = "interrupted"
 					cancellationInterrupted = true

@@ -1,19 +1,11 @@
 package engines
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/local/replicaro/appdata"
-)
-
-var (
-	rcloneCleanupAfterOpenForTest func(string)
-	rcloneCleanupChildOpenForTest func(string)
-	rcloneWipeAfterOpenForTest    func(string)
 )
 
 func recognizedRcloneSessionPath(path string) (string, string, error) {
@@ -70,65 +62,14 @@ func recognizedRcloneConfigSessionPath(path string) error {
 	return nil
 }
 
-func recognizedRcloneConfigPath(path string) error {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	absolute = filepath.Clean(absolute)
-	if filepath.Base(absolute) == "rclone.conf" {
-		if _, _, err := recognizedRcloneSessionPath(filepath.Dir(absolute)); err == nil {
-			return nil
-		}
-	}
-	profileRoot, err := appdata.RcloneProfileSessionRoot()
-	if err != nil {
-		return err
-	}
-	profileRoot, err = filepath.Abs(profileRoot)
-	if err != nil {
-		return err
-	}
-	name := filepath.Base(absolute)
-	if filepath.Dir(absolute) == filepath.Clean(profileRoot) &&
-		strings.HasPrefix(name, "rclone-") &&
-		strings.HasSuffix(name, ".conf") &&
-		len(name) > len("rclone-.conf") {
-		return nil
-	}
-	vaultRoot, err := appdata.RcloneVaultConfigRoot()
-	if err != nil {
-		return err
-	}
-	vaultRoot, err = filepath.Abs(vaultRoot)
-	if err != nil {
-		return err
-	}
-	vaultDirectory := filepath.Dir(absolute)
-	if filepath.Base(absolute) == "rclone.conf" &&
-		filepath.Dir(vaultDirectory) == filepath.Clean(vaultRoot) &&
-		validRepositoryUUID(filepath.Base(vaultDirectory)) {
-		return nil
-	}
-	return fmt.Errorf("private rclone config is outside a recognized session")
-}
-
-// removeRcloneSessionTree removes only an immediate recognized config,
-// authorization, or operation session. Platform implementations bind traversal and deletion
-// to opened directory identities and never follow replacement paths.
+// removeRcloneSessionTree removes one recognized config, authorization or
+// operation session folder with everything in it. The name check keeps the
+// removal to an immediate op-*, auth-* or config-* child of a session root;
+// os.RemoveAll then deletes links inside it (or a session name that is itself
+// a link) without following them, so nothing outside the session is touched.
 func removeRcloneSessionTree(root string) error {
 	if _, _, err := recognizedRcloneSessionPath(root); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
 		return err
 	}
-	return removeRcloneSessionTreeSecure(root)
-}
-
-func wipeRcloneConfig(filename string) error {
-	if err := recognizedRcloneConfigPath(filename); err != nil {
-		return err
-	}
-	return wipeRcloneConfigSecure(filename)
+	return os.RemoveAll(root)
 }

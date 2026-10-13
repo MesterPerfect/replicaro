@@ -13,7 +13,6 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/local/replicaro/appdata"
 )
 
 // Only this cache schema version is accepted. It stores shared blocks and
@@ -283,45 +282,42 @@ func closeMetadataCacheHandle(handle *metadataCacheHandle) error {
 }
 
 func preflightMetadataCache(path, repositoryID, binding string) (bool, error) {
-	info, err := os.Lstat(path)
+	// Like the main database, the cache lives wherever the app-data root
+	// resolves to and links are followed. There's deliberately no ancestor
+	// walk or link refusal on the cache or its -wal/-shm files: those would
+	// only resist tampering by anyone with access to the computer (other
+	// local users or software running on it), which Replicaro doesn't try to
+	// defend against, and they break symlinked home or state folders. The
+	// regular-file checks just turn a stray folder into a clear error.
+	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return true, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() {
 		return false, fmt.Errorf("metadata cache path must be a regular file")
 	}
-	if runtime.GOOS != "windows" {
-		current, _ := filepath.Abs(filepath.Dir(path))
-		for {
-			ancestor, statErr := os.Lstat(current)
-			if statErr != nil {
-				return false, statErr
-			}
-			if ancestor.Mode()&os.ModeSymlink != 0 || !ancestor.IsDir() {
-				return false, fmt.Errorf("metadata cache parent is not a real directory: %s", current)
-			}
-			if current == filepath.Dir(current) {
-				break
-			}
-			current = filepath.Dir(current)
-		}
+	// If the cache file is a link, SQLite keeps -wal and -shm next to its
+	// target; see sqliteSidecarBase.
+	base, err := sqliteSidecarBase(path)
+	if err != nil {
+		return false, err
 	}
 	var walInfo, shmInfo os.FileInfo
-	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
-		sidecarInfo, sidecarErr := os.Lstat(sidecar)
+	for _, sidecar := range []string{base + "-wal", base + "-shm"} {
+		sidecarInfo, sidecarErr := os.Stat(sidecar)
 		if errors.Is(sidecarErr, os.ErrNotExist) {
 			continue
 		}
 		if sidecarErr != nil {
 			return false, sidecarErr
 		}
-		if sidecarInfo.Mode()&os.ModeSymlink != 0 || !sidecarInfo.Mode().IsRegular() {
-			return false, fmt.Errorf("metadata cache sidecar path is unsafe")
+		if !sidecarInfo.Mode().IsRegular() {
+			return false, fmt.Errorf("metadata cache sidecar must be a regular file")
 		}
-		if sidecar == path+"-wal" {
+		if sidecar == base+"-wal" {
 			walInfo = sidecarInfo
 		} else {
 			shmInfo = sidecarInfo
@@ -337,7 +333,7 @@ func preflightMetadataCache(path, repositoryID, binding string) (bool, error) {
 	// committed only in WAL. Inspect every nonempty WAL, not just caches whose
 	// immutable main-file version check would fail.
 	if walInfo != nil && walInfo.Size() > 0 {
-		if err := validateMetadataCacheWALCopy(path, info, walInfo, shmInfo, repositoryID, binding); err != nil {
+		if err := validateMetadataCacheWALCopy(path, base, info, walInfo, shmInfo, repositoryID, binding); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -390,8 +386,12 @@ func validatePreflightMetadataCache(db *sql.DB, repositoryID, binding string) er
 // Let SQLite interpret a private DB/WAL copy instead; omit SHM so SQLite rebuilds
 // that disposable index. This copy is only for validation, never publication or
 // recovery. Reusing exact-vault replacement names lets existing cleanup reclaim
-// crash residue without adding a second recovery lifecycle.
-func validateMetadataCacheWALCopy(path string, databaseInfo, walInfo, shmInfo os.FileInfo, repositoryID, binding string) (resultErr error) {
+// crash residue without adding a second recovery lifecycle. sidecarBase is
+// what the -wal and -shm names hang off (see sqliteSidecarBase); the private
+// copy itself always goes next to path. Both copied files are created 0600 and,
+// on Windows, inherit the application folder's protected DACL, so they get no
+// ACL write of their own.
+func validateMetadataCacheWALCopy(path, sidecarBase string, databaseInfo, walInfo, shmInfo os.FileInfo, repositoryID, binding string) (resultErr error) {
 	temporaryFile, err := os.CreateTemp(filepath.Dir(path), metadataReplacementPrefix(path)+"*.db")
 	if err != nil {
 		return err
@@ -414,7 +414,7 @@ func validateMetadataCacheWALCopy(path string, databaseInfo, walInfo, shmInfo os
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, databaseSource.Close()) }()
-	walSource, openedWALInfo, err := openMetadataValidationSource(path+"-wal", walInfo)
+	walSource, openedWALInfo, err := openMetadataValidationSource(sidecarBase+"-wal", walInfo)
 	if err != nil {
 		_ = temporaryFile.Close()
 		return err
@@ -426,11 +426,6 @@ func validateMetadataCacheWALCopy(path string, databaseInfo, walInfo, shmInfo os
 	}
 	if err := temporaryFile.Close(); err != nil {
 		return err
-	}
-	if runtime.GOOS == "windows" {
-		if err := appdata.SecurePath(temporary, false); err != nil {
-			return err
-		}
 	}
 
 	temporaryWAL := temporary + "-wal"
@@ -444,11 +439,6 @@ func validateMetadataCacheWALCopy(path string, databaseInfo, walInfo, shmInfo os
 	}
 	if err := walFile.Close(); err != nil {
 		return err
-	}
-	if runtime.GOOS == "windows" {
-		if err := appdata.SecurePath(temporaryWAL, false); err != nil {
-			return err
-		}
 	}
 	if err := metadataValidationSourceUnchanged(databaseSource, openedDatabaseInfo); err != nil {
 		return err
@@ -476,10 +466,10 @@ func validateMetadataCacheWALCopy(path string, databaseInfo, walInfo, shmInfo os
 	if err := metadataValidationPathUnchanged(path, openedDatabaseInfo); err != nil {
 		return err
 	}
-	if err := metadataValidationPathUnchanged(path+"-wal", openedWALInfo); err != nil {
+	if err := metadataValidationPathUnchanged(sidecarBase+"-wal", openedWALInfo); err != nil {
 		return err
 	}
-	return metadataValidationOptionalPathUnchanged(path+"-shm", shmInfo)
+	return metadataValidationOptionalPathUnchanged(sidecarBase+"-shm", shmInfo)
 }
 
 func openMetadataValidationSource(path string, expected os.FileInfo) (*os.File, os.FileInfo, error) {
@@ -525,12 +515,18 @@ func metadataValidationSourceUnchanged(source *os.File, opened os.FileInfo) erro
 	return nil
 }
 
+// The two checks below re-stat the cache files after the validation copy,
+// following links like the rest of preflight. The database and WAL are
+// compared against the stat of the file we opened and copied; -shm isn't
+// copied, so it's compared against what preflight saw. A mismatch means the
+// files changed while we copied them and the copy can't be trusted. These are
+// consistency checks, not a defense against deliberate file swaps.
 func metadataValidationPathUnchanged(path string, opened os.FileInfo) error {
-	current, err := os.Lstat(path)
+	current, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("metadata cache changed after validation copy: %w", err)
 	}
-	if current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) ||
+	if !current.Mode().IsRegular() || !os.SameFile(opened, current) ||
 		current.Size() != opened.Size() || !current.ModTime().Equal(opened.ModTime()) {
 		return fmt.Errorf("metadata cache changed after validation copy")
 	}
@@ -538,7 +534,7 @@ func metadataValidationPathUnchanged(path string, opened os.FileInfo) error {
 }
 
 func metadataValidationOptionalPathUnchanged(path string, opened os.FileInfo) error {
-	current, err := os.Lstat(path)
+	current, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if opened == nil {
 			return nil
@@ -548,7 +544,7 @@ func metadataValidationOptionalPathUnchanged(path string, opened os.FileInfo) er
 	if err != nil {
 		return err
 	}
-	if opened == nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) ||
+	if opened == nil || !current.Mode().IsRegular() || !os.SameFile(opened, current) ||
 		current.Size() != opened.Size() || !current.ModTime().Equal(opened.ModTime()) {
 		return fmt.Errorf("metadata cache changed after validation copy")
 	}
@@ -785,20 +781,18 @@ func removeClosedMetadataCache(removal metadataCacheRemoval) error {
 		// a validated original establishes this crash-recovery cleanup scope.
 		result = removeAbandonedMetadataReplacements(path)
 	}
+	// os.Remove never follows a link. When the cache file is a link, only the
+	// link goes away. Its target and the -wal/-shm files SQLite keeps next to
+	// the target are left alone, so the target stays a complete database for
+	// whoever put it there; deleting just the target's WAL would silently drop
+	// committed transactions from a file we aren't removing. The -wal/-shm
+	// names next to the link are in Replicaro's own metadata folder and are
+	// removed if anything is there. Missing files are fine; anything else is
+	// reported.
 	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
-		info, err := os.Lstat(candidate)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+		if err := removeMetadataCacheFile(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
 			result = errors.Join(result, err)
-			continue
 		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			result = errors.Join(result, fmt.Errorf("metadata cache cleanup path is unsafe: %s", candidate))
-			continue
-		}
-		result = errors.Join(result, removeMetadataCacheFile(candidate))
 	}
 	return result
 }

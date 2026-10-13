@@ -161,6 +161,25 @@ func VaultWorkerFailingSince(db *sql.DB, repositoryID, worker string) (time.Time
 	return time.Parse(time.RFC3339Nano, since)
 }
 
+// VaultWorkerLastFailure returns the worker's saved last failure time, or the
+// zero time when the clock is not running.
+func VaultWorkerLastFailure(db *sql.DB, repositoryID, worker string) (time.Time, error) {
+	_, column, err := reconnectWorkerColumns(worker)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var last string
+	err = db.QueryRow(`SELECT `+column+` FROM vault_reconnect_state WHERE repository_id = ?`,
+		repositoryID).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && last == "") {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Parse(time.RFC3339Nano, last)
+}
+
 func clearVaultReconnectStateTx(tx *sql.Tx, repositoryID string) error {
 	_, err := tx.Exec(`DELETE FROM vault_reconnect_state WHERE repository_id = ?`, repositoryID)
 	return err

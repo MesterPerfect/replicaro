@@ -11,8 +11,8 @@ const (
 
 func ValidLanguage(value string) bool {
 	switch value {
-	case LanguageSystem, LanguageEnglish, "de", "fr", "ar", "ur", "hi", "es", "it", "zh-Hans", "yue-Hant",
-		"ja", "ga", "ko", "ms", "id", "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm":
+	case LanguageSystem, LanguageEnglish, "de", "fr", "ar", "ur", "hi", "es", "it",
+		"zh-Hans", "zh-Hant", "yue-Hant", "yue-Hans", "ja", "ga", "ko", "ms", "id", "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm":
 		return true
 	default:
 		return false
@@ -33,7 +33,6 @@ func ValidTheme(value string) bool {
 // effect when the page reloads, using EffectiveLocale.
 type Settings struct {
 	DefaultEngine                string `json:"defaultEngine"`
-	AutoStart                    bool   `json:"autoStart"`
 	LogRetentionDays             int    `json:"logRetentionDays"`
 	Theme                        string `json:"theme"`
 	Language                     string `json:"language"`
@@ -49,7 +48,6 @@ type Settings struct {
 
 	StartWithWindows             bool `json:"startWithWindows"`
 	StartAtLogin                 bool `json:"startAtLogin"`
-	MinimizeToTray               bool `json:"minimizeToTray"`
 	MaxConcurrentJobRuns         int  `json:"maxConcurrentJobRuns"`
 	DisableAutomaticUpdateChecks bool `json:"disableAutomaticUpdateChecks"`
 }

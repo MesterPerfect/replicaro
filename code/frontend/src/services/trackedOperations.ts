@@ -63,10 +63,13 @@ export function activeVaultChanges(operations: OperationEntry[]) {
 }
 
 // newestVaultOperations returns the newest operation of each vault in
-// operations, of any kind or, with kind, of that kind only. It goes by start
-// time rather than list order because the dashboard merges operations it kept
-// from earlier reads into the backend's newest-first list; for equal times the
-// earlier entry in the list wins, as the backend lists newest first.
+// operations, of any kind or, with kind, of that kind only. The Protect page
+// passes each vault's newest operation from the backend followed by the active
+// operations, so a vault can appear more than once and a queued or running
+// change can be newer than the backend's pick; it therefore goes by start time
+// rather than list order. For equal times, and among start times it can't
+// read, the earlier entry in the list wins, so the backend's pick stands. The
+// dashboard passes only the backend's newest password change of each vault.
 export function newestVaultOperations(operations: OperationEntry[], kind?: string) {
 	const started = (operation: OperationEntry) => {
 		const time = Date.parse(operation.startedAt);

@@ -116,6 +116,13 @@ func AdvanceVaultPasswordChange(db *sql.DB, repositoryID, from, to string) error
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	query := `UPDATE vault_password_change_operations SET phase=?,updated_at=?
 		WHERE repository_id=? AND phase=?`
+	if to == "native_started" {
+		// An error saved while preparing says nothing about the native attempt
+		// that starts now, and the status reads show the last error of a
+		// native_started change as the reason it stopped.
+		query = `UPDATE vault_password_change_operations SET phase=?,updated_at=?,last_error=''
+		WHERE repository_id=? AND phase=?`
+	}
 	if from == "native_started" && to == "publishing" {
 		query += ` AND native_status='succeeded'`
 	}
@@ -175,6 +182,49 @@ func RecordVaultPasswordNativeResult(db *sql.DB, repositoryID, status, dispositi
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// ResetVaultPasswordNativeResultForRerun clears the recorded native result
+// of this operation before recovery starts the native password command again,
+// so a crash during the rerun leaves the result unresolved instead of the
+// earlier run's. The rerun count is kept in the stage record, not here.
+func ResetVaultPasswordNativeResultForRerun(db *sql.DB, repositoryID, operationUUID string) error {
+	result, err := db.Exec(`UPDATE vault_password_change_operations
+		SET native_status='',native_mutation_disposition='unknown',native_output='',last_error='',updated_at=?
+		WHERE repository_id=? AND operation_uuid=? AND phase='native_started' AND native_status IN ('','interrupted')`,
+		time.Now().UTC().Format(time.RFC3339Nano), repositoryID, operationUUID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("vault-password change can no longer be rerun")
+	}
+	return nil
+}
+
+// AbandonRolledBackVaultPasswordChange removes this operation's row and its
+// pending candidate once recovery has rolled the change back: the native
+// command stopped, only the committed password opens the vault, and the
+// remote fences and local staging are gone. Recovery decides that from the
+// stage record and the probes, so any recorded native result is accepted.
+func AbandonRolledBackVaultPasswordChange(db *sql.DB, repositoryID, operationUUID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.Exec(`DELETE FROM vault_password_change_operations
+		WHERE repository_id=? AND operation_uuid=? AND phase='native_started'`, repositoryID, operationUUID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("vault-password change is no longer safely abandonable")
+	}
+	if _, err := tx.Exec(`UPDATE repositories SET pending_passphrase='' WHERE id=?`, repositoryID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func RecordVaultPasswordChangeError(db *sql.DB, repositoryID, safeError string) error {

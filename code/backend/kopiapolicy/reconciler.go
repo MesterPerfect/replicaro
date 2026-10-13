@@ -14,7 +14,6 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
 	"github.com/local/replicaro/vaultreconnect"
@@ -41,10 +40,11 @@ type Manager struct {
 }
 
 // policyRetry is one vault's automatic retry after a reconciliation error.
-// The attempt count lives only in memory: startup already turns every saved
-// error back to dirty and reconciles it, so a restart simply starts the
-// backoff over. How long the vault has been failing is kept separately, in
-// the database, by the reconnect clock (package vaultreconnect).
+// The attempt count lives only in memory: startup reopens every saved error
+// (as dirty, or as applying when it keeps a fence) and reconciles it, so a
+// restart simply starts the backoff over. How long the vault has been failing
+// is kept separately, in the database, by the reconnect clock (package
+// vaultreconnect).
 type policyRetry struct {
 	attempts int
 	// armed identifies the pending timer; stop is nil when none is pending.
@@ -280,9 +280,19 @@ func reconcileRepositoryUnderLock(
 		if state.ActiveFencePath == "" || state.ProofKind == "" {
 			return "", fmt.Errorf("prior Kopia policy process has no durable fence proof")
 		}
-		inactive, proofErr := command.NativeProcessFenceInactive(state.ActiveFencePath)
+		// The fence may have been closed a moment ago, by a reconciliation
+		// whose result lost to a job edit, so allow the short settle window
+		// rather than parking the row for a whole retry delay.
+		inactive, proofErr := command.NativeProcessFenceInactiveAfterClose(state.ActiveFencePath)
 		if proofErr != nil || !inactive {
-			return "", fmt.Errorf("prior Kopia policy process is not proven inactive")
+			// The earlier process may run for a long time (or never exit, for
+			// a stuck child). Park the row as an error that keeps its fence so
+			// the retry backoff paces the next look instead of the worker
+			// polling it.
+			cause := database.ErrKopiaPolicyFenceHeld
+			return "", errors.Join(cause, database.MarkKopiaPolicyErrorKeepingFence(
+				db, repo.ID, digest, state.ActiveFencePath, cause,
+			))
 		}
 		if err := database.ResetInterruptedKopiaPolicyApplication(
 			db, repo.ID, digest, state.ActiveFencePath,
@@ -336,8 +346,7 @@ func reconcileRepositoryUnderLock(
 	var careStore vaultprofile.Store
 	var authority vaultprofile.RootCareAuthority
 	if repo.ObjectLock.Enrolled {
-		careStore = (vaultprofile.Store{Repository: repo}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+		careStore = (vaultprofile.Store{Repository: repo})
 		authority, err = readRootCareAuthority(ctx, careStore, repo.CheckSchedule, repo.MaintenanceSchedule, repo.ObjectLock)
 		if err != nil {
 			return finishWithoutNative(fmt.Errorf("verify protected vault care before Kopia reconciliation: %w", err))
@@ -347,7 +356,7 @@ func reconcileRepositoryUnderLock(
 		// reconciliation independent from recovery-sidecar availability.
 		repo.NativeMaintenanceOwnerClientUUID = authority.OwnerClientUUID
 	}
-	engine, err := engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
+	engine, err := engines.Resolve(repo)
 	if err != nil {
 		return finishWithoutNative(err)
 	}
@@ -491,6 +500,27 @@ func (manager *Manager) reconcile(repositoryID string) {
 			manager.retryLater(repositoryID)
 			return
 		}
+		// A queue signal that arrived while an earlier pass was running makes
+		// run call reconcile again after that pass already applied and read
+		// back the current policy. Every change to the desired policy leaves
+		// the row not ready in the same transaction (dirty, or applying while a
+		// fence is held), so a ready row whose applied digest is the desired
+		// one has nothing left to verify. Running the pass anyway would close
+		// backup admission (ready -> applying) for the whole native readback,
+		// and a transient failure in it would turn a verified policy into an
+		// error. Count it as the success it already is and reset the worker's
+		// failure clock; only this goroutine records this worker's failures,
+		// so that can't race. A pending retry is deliberately left alone: this
+		// read holds no lock, and repository maintenance can record an error
+		// and arm a retry right after it. When a stale retry fires on a ready
+		// row, retryDue forgets it as a success without a native pass. A job
+		// edit that commits after this read queues the vault again and is
+		// reconciled normally.
+		if beforeErr == nil && before.State == "ready" && before.DesiredDigest != "" &&
+			before.AppliedDigest == before.DesiredDigest {
+			vaultreconnect.RecordWorkerSuccess(manager.db, repositoryID, vaultreconnect.WorkerKopiaPolicy)
+			return
+		}
 		// Taken before backgroundReconcile waits for the vault lock; see
 		// RecordWorkerFailure.
 		startedAt := vaultreconnect.Now()
@@ -511,20 +541,40 @@ func (manager *Manager) reconcile(repositoryID string) {
 			manager.retryAfterFailure(repositoryID, startedAt, reconcileErr, state.LastError)
 			return
 		}
-		// A relevant job mutation can replace the desired digest while the
-		// prior native process is fenced. Once that process returns and its
-		// fence closes, consume the latest dirty/applying state here.
 		if state.State == "applying" {
-			timer := time.NewTimer(250 * time.Millisecond)
-			select {
-			case <-timer.C:
-			case <-manager.ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
+			// A job edit can replace the desired digest while this pass's
+			// native process runs; the pass then cannot record its result and
+			// leaves the row applying with its own, now closed, fence. Look
+			// again shortly to reconcile the new digest.
+			if beforeErr != nil || state.DesiredDigest != before.DesiredDigest ||
+				state.ActiveFencePath != before.ActiveFencePath {
+				timer := time.NewTimer(250 * time.Millisecond)
+				select {
+				case <-timer.C:
+				case <-manager.ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
 				}
-				return
+				continue
 			}
-			continue
+			// Otherwise the pass changed nothing: it stopped before it checked
+			// the earlier fence (for example the vault is unplugged), or it
+			// found the fence held but could not record that. Park the row as
+			// an error that keeps the fence so the retry backoff paces the
+			// next attempt; looking again every 250 ms would spin for as long
+			// as the cause lasts.
+			cause := reconcileErr
+			if cause == nil {
+				cause = errors.New("Kopia policy reconciliation stopped before checking the earlier policy process")
+			}
+			if database.MarkKopiaPolicyErrorKeepingFence(
+				manager.db, repositoryID, state.DesiredDigest, state.ActiveFencePath, cause,
+			) == nil {
+				manager.retryAfterFailure(repositoryID, startedAt, cause, "")
+			}
+			return
 		}
 		if beforeErr == nil && state.State == "dirty" && state.DesiredDigest != before.DesiredDigest {
 			continue

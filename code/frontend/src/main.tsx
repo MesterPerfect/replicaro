@@ -1,7 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App.tsx'
+import App, { AppErrorBoundary } from './App.tsx'
 import { getSettings } from './services/api.ts'
 import { applyThemePreference } from './theme.ts'
 import { activateLocale } from './i18n.ts'
@@ -29,7 +29,9 @@ async function start() {
 
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
-      <App failedLocale={failedLocale} />
+      <AppErrorBoundary>
+        <App failedLocale={failedLocale} />
+      </AppErrorBoundary>
     </StrictMode>,
   )
 }

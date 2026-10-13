@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/local/replicaro/appdata"
 	"github.com/local/replicaro/storageidentity"
 )
 
@@ -16,11 +17,10 @@ import (
 // the GUI executable or any PATH-resolved program.
 //
 // The full materialization runs on first use and whenever the cached helper
-// can no longer be trusted. Between those, a probe only checks that the cached
-// executable is still a safe regular file with the embedded checksum, because
-// the full procedure (directory checks and permission repair under a global
-// lock) is far too slow to repeat for every probe when many backups start at
-// once.
+// can no longer be used. Between those, a probe only checks that the cached
+// executable still matches the embedded checksum, because the full procedure
+// (folder creation, reinstall and permission repair under a global lock) is
+// too slow to repeat for every probe when many backups start at once.
 type Runner struct {
 	timeout       time.Duration
 	maxConcurrent int
@@ -141,18 +141,24 @@ func (runner *Runner) prepareFull(stale *preparedHelper) (*preparedHelper, error
 }
 
 // forget drops helper from the cache after a start failure so the next probe
-// runs the full preparation, which also repairs problems the checksum cannot
-// see, such as a lost execute permission. A newer entry is left alone.
+// runs the full preparation. On Unix that also repairs problems the checksum
+// cannot see, such as a lost execute permission; on Windows the preparation's
+// chmod only clears the read-only attribute. A newer entry is left alone.
 func (runner *Runner) forget(helper *preparedHelper) {
 	runner.current.CompareAndSwap(helper, nil)
 }
 
 // installedHelperMatches is the per-launch check for an already prepared
-// helper: the path must still be a safe regular file with the embedded bytes.
-// It takes no lock and writes nothing.
+// helper: the path must still hold a regular file with the embedded checksum.
+// It takes no lock and writes nothing, and like any read it follows a link at
+// the path. A mismatch sends the probe through the full preparation, which
+// reinstalls the file. The checksum guards against a corrupted or replaced
+// binary; owner and link checks would only matter against local tampering,
+// which Replicaro doesn't defend against, so don't add them here without a
+// product decision.
 func installedHelperMatches(path string) bool {
 	_, expected, err := embeddedComponent()
-	return err == nil && verifyExecutable(path, expected) == nil
+	return err == nil && appdata.VerifyExecutable(path, expected) == nil
 }
 
 func isDisappearance(err error) bool {

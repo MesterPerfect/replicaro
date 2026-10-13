@@ -66,6 +66,13 @@ func startVaultPasswordChange(db *sql.DB, runtimeManager *operationruntime.Manag
 		}
 		return
 	}
+	if runner.StartupPasswordRecoveryRunning(repo.ID) {
+		// Startup is still recovering this vault's unfinished change in the
+		// background. A second change or Retry would only wait for the vault and
+		// then run on whatever that recovery left behind.
+		writeVaultWorkRefusal(w, database.ErrVaultChangeActive)
+		return
+	}
 	if retry {
 		_, err = database.VaultPasswordChange(db, repositoryID)
 	} else {
@@ -300,7 +307,7 @@ func saveVaultSettingsInBackground(op *trackedOperation, repo models.Repository,
 		return
 	}
 	if publishesRoot && plan.publishesRoot() {
-		err = saveOwnerVaultCareUnderLock(op.ctx, db, repo, req, plan)
+		err = saveOwnerVaultCare(op.ctx, db, repo, req, plan)
 	} else {
 		// Only this computer's profile-local preferences change. Schedules from
 		// an earlier UI read are deliberately not replayed: owner-loss admission
@@ -323,6 +330,10 @@ func saveVaultSettingsInBackground(op *trackedOperation, repo models.Repository,
 	}
 	op.finish("success", "Vault settings saved.")
 }
+
+// saveOwnerVaultCare is saveOwnerVaultCareUnderLock; tests replace it to make
+// the publication fail in a chosen way.
+var saveOwnerVaultCare = saveOwnerVaultCareUnderLock
 
 // saveOwnerVaultCareUnderLock publishes the owner's care settings to the
 // protected root and only then commits them locally. The caller holds the

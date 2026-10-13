@@ -188,18 +188,6 @@ export interface ExistingVaultPreview {
 	};
 }
 
-export interface ExistingVaultUpdateConfirmation {
-	vaultUUID: string;
-	previewDigest: string;
-	previousLocation: string;
-	location: string;
-	name: string;
-	description: string;
-	checkSchedule: string;
-	maintenanceSchedule: string;
-	concurrencyMode: "reduced" | "native" | "increased" | "maximum";
-}
-
 export interface DormantRecoveryJob {
 	repositoryId: string;
 	jobId: string;
@@ -283,14 +271,27 @@ export interface BackupJob {
 	retentionMonthly?: number;
 	retentionYearly?: number;
     excludes: string;
+	// The user's own "skip the contents of any folder that contains ..."
+	// choices. The CACHEDIR.TAG one is also forced on while the job has a
+	// Kopia vault; this saved value doesn't change then.
+	skipNoBackupFolders: boolean;
+	skipCacheDirFolders: boolean;
+	skipMarkerFileName: string;
     tag: string;
 	beforeScriptPath: string;
 	beforeScriptMustSucceed: boolean;
 	afterScriptPath: string;
 	afterScriptMustSucceed: boolean;
     engineSettings: Record<string, EngineJobSettings>;
+	// True when the job also backs up to a vault that isn't attached on this
+	// computer. Its engine isn't known here, so the job's Kopia settings
+	// section decides whether the job counts as using Kopia.
+	unattachedTargets?: boolean;
     sizeBytes: number | null;
 	sizeMeasuredAt: string;
+	// Digest of the stored definition. An edit sends it back, and the backend
+	// refuses the edit (job_definition_changed) when the job changed since.
+	revision: string;
 }
 
 export interface VaultSizeStatus {
@@ -357,7 +358,8 @@ export type StorageAvailabilityReason =
     | "storage_missing"
     | "identity_mismatch"
     | "observation_failed"
-    | "observation_timeout";
+    | "observation_timeout"
+    | "observation_slots_exhausted";
 
 export interface OperationEntry {
     id: string;
@@ -414,7 +416,9 @@ export interface OperationLogResponse {
 export interface DashboardIssue {
     id: string;
     timestamp: string;
-    kind: "operation" | "log";
+    // "kopia_policy_stuck" is a current condition of one Kopia vault, whose
+    // name is the title.
+    kind: "operation" | "log" | "kopia_policy_stuck";
     isNew?: boolean;
     operationKind?: string;
 	operationId?: string;
@@ -433,6 +437,19 @@ export interface DashboardIssues {
     nextCursor?: string;
 }
 
+// The dashboard timeline tabs other than Issues, which has its own feed.
+export type DashboardTimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other";
+
+export type DashboardTimelineItem =
+    | { id: string; kind: "operation"; operation: OperationEntry }
+    | { id: string; kind: "log"; log: ActivityEntry };
+
+export interface DashboardTimeline {
+    items: DashboardTimelineItem[];
+    hasMore: boolean;
+    nextCursor?: string;
+}
+
 export interface DashboardStats {
     repositoryCount: number;
     jobCount: number;
@@ -441,7 +458,6 @@ export interface DashboardStats {
     failedRuns: number;
     warningRuns?: number;
     lastBackup: string;
-    nextBackup: string;
 }
 
 export interface ActivityEntry {
@@ -523,7 +539,6 @@ export interface Settings {
     /** Read-only: the catalog the "system" preference resolves to now. */
     systemLocale?: string;
     defaultEngine: "restic" | "kopia";
-    autoStart: boolean;
     logRetentionDays: number;
     theme: ThemePreference;
     webhookUrl: string;
@@ -535,7 +550,6 @@ export interface Settings {
     notifyWebhookOnFailure: boolean;
     startWithWindows: boolean;
     startAtLogin?: boolean;
-    minimizeToTray: boolean;
     maxConcurrentJobRuns: number;
     disableAutomaticUpdateChecks: boolean;
 }

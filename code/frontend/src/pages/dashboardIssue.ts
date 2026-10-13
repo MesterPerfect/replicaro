@@ -56,8 +56,16 @@ export function dashboardIssueEvent(entry: DashboardIssue): TimelineEvent {
 		return {
 			id: entry.id, timestamp: entry.timestamp, kind: "operation", operationKind: entry.operationKind,
 			operationID: entry.operationId, operationStatus: entry.status, tone: (entry.severity ?? (entry.status === "completed_with_issues" ? "warning" : "error")) === "warning" ? "warn" : "danger", tag,
-			title: `${entry.title}${elapsed !== "—" ? ` · ${elapsed}` : ""}`,
+			// An empty title is shown as unknown, without the duration.
+			title: entry.title.trim() ? `${entry.title}${elapsed !== "—" ? ` · ${elapsed}` : ""}` : "",
 			outputAvailable: entry.outputAvailable, issue: true, isNew: entry.isNew,
+		};
+	}
+	if (entry.kind === "kopia_policy_stuck") {
+		return {
+			id: entry.id, timestamp: entry.timestamp, kind: "log", tone: "danger", tag: logTagLabel("failed"),
+			title: t("ui.overview.kopiaPolicyStuck", { vault: entry.title }), outputAvailable: false, issue: true,
+			isNew: entry.isNew,
 		};
 	}
 	const level = entry.level ?? "WARN";

@@ -56,7 +56,7 @@ Creating backups should be easy. Replicaro makes it easy. Get started in five mi
 
 ## Restoring Made Easier
 
-Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders, with each having its own history. The choice is yours.
+Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders (Kopia vaults: one folder at a time, or several files together), with each having its own history. The choice is yours.
 
 Whole snapshot restore is supported too, of course.
 
@@ -72,7 +72,7 @@ View the history of your backed up files & folders, so you can restore specific 
 
 #### Search Across File History
 
-Search by name or path, compare available versions, select multiple files or folders, and restore.
+Search by name or path, compare available versions, select multiple files or folders (Kopia vaults: one folder at a time, or several files together), and restore.
 
 ![Searching for files in Replicaro File History](./readme-assets/file-history-dark.png)
 
@@ -200,7 +200,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Multi-language and internationalization support.**
 
-  - English not your prefered language? No problem. Replicaro also supports Arabic (Modern Standard), Bengali, Brazilian Portuguese, Cantonese (Traditional Chinese), Dutch, European Portuguese, French, German, Greek, Hebrew, Hindi, Indonesian, Irish, Italian, Japanese, Korean, Malaysian Malay, Mandarin (Simplified Chinese), Nigerian Pidgin, Persian (Farsi), Polish, Russian, Spanish, Turkish, Urdu, and Vietnamese.
+  - English not your prefered language? No problem. Replicaro also supports Arabic (Modern Standard), Bengali, Brazilian Portuguese, Cantonese (Simplified Chinese), Cantonese (Traditional Chinese), Dutch, European Portuguese, French, German, Greek, Hebrew, Hindi, Indonesian, Irish, Italian, Japanese, Korean, Malaysian Malay, Mandarin (Simplified Chinese), Mandarin (Traditional Chinese), Nigerian Pidgin, Persian (Farsi), Polish, Russian, Spanish, Turkish, Urdu, and Vietnamese.
 
 - **Make the interface yours.**
 

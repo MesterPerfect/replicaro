@@ -18,13 +18,6 @@ const maxJSONBodyBytes int64 = 4 << 20
 
 type securityContextKey struct{}
 
-type SecurityMode uint8
-
-const (
-	SecurityModeProduction SecurityMode = iota
-	SecurityModeDevelopment
-)
-
 type requestSecurity struct {
 	endpoint runtimeendpoint.Endpoint
 	// lanOrigins are the HTTPS origins from --lan-origin, served by the user's
@@ -34,7 +27,6 @@ type requestSecurity struct {
 	// must carry this list: with it on only one side the page loads but every
 	// API call is rejected, or the other way round.
 	lanOrigins runtimeendpoint.LANOrigins
-	mode       SecurityMode
 	clientUUID string
 }
 
@@ -56,7 +48,8 @@ var endpointMethods = map[string][]string{
 	rcloneRemoteListPath:          {http.MethodPost},
 	"/api/filesystem/directories": {http.MethodGet}, "/api/dashboard": {http.MethodGet},
 	"/api/dashboard/issues": {http.MethodGet}, "/api/dashboard/issues/review": {http.MethodPost},
-	"/api/dashboard/activity": {http.MethodGet}, "/api/operations/active": {http.MethodGet},
+	"/api/dashboard/timeline": {http.MethodGet}, "/api/dashboard/activity": {http.MethodGet},
+	"/api/operations/active": {http.MethodGet}, "/api/operations/latest-by-vault": {http.MethodGet},
 	"/api/operations/live": {http.MethodGet}, "/api/operations/cancel": {http.MethodPost},
 	"/api/operations/output": {http.MethodGet},
 	"/api/operations":        {http.MethodGet}, "/api/repositories": {http.MethodGet, http.MethodPost, http.MethodDelete},
@@ -67,6 +60,7 @@ var endpointMethods = map[string][]string{
 	"/api/repository/ownership":          {http.MethodGet, http.MethodPost},
 	"/api/repository/password":           {http.MethodGet, http.MethodPost},
 	"/api/repository/password/retry":     {http.MethodPost},
+	"/api/repository/password/statuses":  {http.MethodGet},
 	"/api/repository/credentials":        {http.MethodPut},
 	"/api/repository/check":              {http.MethodPost}, "/api/repository/maintenance": {http.MethodPost},
 	"/api/repository/vault-size": {http.MethodGet}, "/api/repository/vault-size/prepare": {http.MethodPost}, "/api/repository/snapshots": {http.MethodGet},
@@ -83,7 +77,6 @@ var endpointMethods = map[string][]string{
 	"/api/vault-profile-sync": {http.MethodGet, http.MethodPost},
 	"/api/engine":             {http.MethodGet}, "/api/logs": {http.MethodGet, http.MethodDelete},
 	"/api/settings": {http.MethodGet, http.MethodPost},
-	"/api/activate": {http.MethodPost},
 }
 
 func secureAPIRequest(w http.ResponseWriter, r *http.Request) bool {
@@ -161,8 +154,9 @@ func approvedFetchMetadata(r *http.Request, security requestSecurity) bool {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return true
 	}
-	// An explicitly constructed development handler may use Vite on one exact
-	// loopback origin. The already validated Origin keeps that usable.
+	// A browser can label a write cross-site when the page and the API use
+	// different accepted origins, for example two configured LAN origins for
+	// the same machine. Allow it only from an origin approvedOrigin accepts.
 	return approvedOrigin(strings.TrimSpace(r.Header.Get("Origin")), security)
 }
 
@@ -180,12 +174,6 @@ func contentSecurityPolicy(security requestSecurity) string {
 		"http://127.0.0.1:" + port,
 		"http://localhost:" + port,
 	}
-	if security.mode == SecurityModeDevelopment {
-		connectSources = append(connectSources,
-			"http://127.0.0.1:5173",
-			"http://localhost:5173",
-		)
-	}
 	return "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src " + strings.Join(connectSources, " ")
 }
 
@@ -199,14 +187,13 @@ func approvedHost(host string, security requestSecurity) bool {
 	return host != "" && (security.endpoint.HostAllowed(host) || security.lanOrigins.HostAllowed(host))
 }
 
-// approvedOrigin accepts the loopback (and explicit development) origins, or
-// exactly one of the configured LAN origins. Fetch Metadata's cross-site write
-// fallback and the Access-Control-Allow-Origin echo both go through here, so
-// with two LAN origins configured a page on one may write through the other
-// (for example an IP-address origin and a hostname origin for the same
-// machine). That widening is intended: every configured origin is the user's
-// own proxy in front of this same Replicaro. Unconfigured origins are still
-// rejected.
+// approvedOrigin accepts the loopback origins, or exactly one of the
+// configured LAN origins. Fetch Metadata's cross-site write fallback and the
+// Access-Control-Allow-Origin echo both go through here, so with two LAN
+// origins configured a page on one may write through the other (for example
+// an IP-address origin and a hostname origin for the same machine). That
+// widening is intended: every configured origin is the user's own proxy in
+// front of this same Replicaro. Unconfigured origins are still rejected.
 func approvedOrigin(origin string, security requestSecurity) bool {
 	if security.lanOrigins.OriginAllowed(origin) {
 		return true
@@ -223,17 +210,14 @@ func approvedOrigin(origin string, security requestSecurity) bool {
 	if port == "" {
 		return false
 	}
-	if port == strconv.Itoa(security.endpoint.Port()) {
-		return true
-	}
-	return security.mode == SecurityModeDevelopment && port == "5173"
+	return port == strconv.Itoa(security.endpoint.Port())
 }
 
 func securityFromRequest(r *http.Request) requestSecurity {
 	if value, ok := r.Context().Value(securityContextKey{}).(requestSecurity); ok && value.endpoint.Port() > 0 {
 		return value
 	}
-	return requestSecurity{endpoint: runtimeendpoint.Preferred(), mode: SecurityModeProduction}
+	return requestSecurity{endpoint: runtimeendpoint.Preferred()}
 }
 
 func withSecurity(r *http.Request, security requestSecurity) *http.Request {

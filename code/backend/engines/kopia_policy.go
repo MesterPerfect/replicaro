@@ -107,15 +107,28 @@ func readKopiaPolicyDocument(reader io.Reader) ([]byte, error) {
 // KopiaManagedPolicySource is the only job-specific native policy Replicaro
 // owns. Source is an absolute local path; Excludes are Kopia ignore patterns.
 type KopiaManagedPolicySource struct {
-	JobUUID     string   `json:"job_uuid"`
-	Source      string   `json:"source"`
-	Excludes    []string `json:"excludes"`
-	KeepLatest  int      `json:"keep_latest"`
-	KeepHourly  int      `json:"keep_hourly"`
-	KeepDaily   int      `json:"keep_daily"`
-	KeepWeekly  int      `json:"keep_weekly"`
-	KeepMonthly int      `json:"keep_monthly"`
-	KeepAnnual  int      `json:"keep_annual"`
+	JobUUID  string   `json:"job_uuid"`
+	Source   string   `json:"source"`
+	Excludes []string `json:"excludes"`
+	// DotIgnore is the job's dot-ignore file list: always .kopiaignore, plus
+	// .nobackup and the custom marker name when the job skips those. Every
+	// managed job policy also sets ignoreCacheDirs to true. Both are written
+	// explicitly instead of inherited, so a connected repository whose global
+	// policy turned cache folders back on, or listed other dot-ignore files,
+	// can't change what the job's checkboxes say. Setting the list replaces
+	// the inherited one, which is why .kopiaignore is always in it (see
+	// NormalizeKopiaManagedPolicyDesired).
+	DotIgnore []string `json:"dot_ignore"`
+	// IgnoreCacheDirs is only filled in when a job policy is read back; the
+	// desired value is always true and isn't part of the digest. A policy
+	// written before these settings were managed reads back false.
+	IgnoreCacheDirs bool `json:"-"`
+	KeepLatest      int  `json:"keep_latest"`
+	KeepHourly      int  `json:"keep_hourly"`
+	KeepDaily       int  `json:"keep_daily"`
+	KeepWeekly      int  `json:"keep_weekly"`
+	KeepMonthly     int  `json:"keep_monthly"`
+	KeepAnnual      int  `json:"keep_annual"`
 }
 
 // KopiaManagedPolicyDesiredState is intentionally Kopia-specific. Do not turn
@@ -260,8 +273,14 @@ func NormalizeKopiaManagedPolicyDesired(value KopiaManagedPolicyDesiredState) (K
 			source.KeepHourly, source.KeepDaily, source.KeepWeekly = 0, 0, 0
 			source.KeepMonthly, source.KeepAnnual = 0, 0
 		}
+		// .kopiaignore is always in the list: the "Follow the ignore rules in
+		// .kopiaignore files" box is locked on for Kopia vaults, and an empty
+		// list can't be written anyway (Kopia then inherits the global one).
+		dotIgnore := append(normalizedKopiaExcludes(source.DotIgnore), models.KopiaIgnoreFileName)
+		sort.Strings(dotIgnore)
+		dotIgnore = compactStrings(dotIgnore)
 		normalizedSource := KopiaManagedPolicySource{
-			JobUUID: jobUUID, Source: absolute, Excludes: excludes,
+			JobUUID: jobUUID, Source: absolute, Excludes: excludes, DotIgnore: dotIgnore,
 			KeepLatest: source.KeepLatest, KeepHourly: source.KeepHourly,
 			KeepDaily: source.KeepDaily, KeepWeekly: source.KeepWeekly,
 			KeepMonthly: source.KeepMonthly, KeepAnnual: source.KeepAnnual,
@@ -279,6 +298,7 @@ func NormalizeKopiaManagedPolicyDesired(value KopiaManagedPolicyDesiredState) (K
 	for _, jobUUID := range jobs {
 		entry := byJob[jobUUID]
 		entry.Excludes = append([]string(nil), entry.Excludes...)
+		entry.DotIgnore = append([]string(nil), entry.DotIgnore...)
 		result.Sources = append(result.Sources, entry)
 	}
 	return result, nil
@@ -286,7 +306,8 @@ func NormalizeKopiaManagedPolicyDesired(value KopiaManagedPolicyDesiredState) (K
 
 func equalKopiaManagedSource(left, right KopiaManagedPolicySource) bool {
 	return left.JobUUID == right.JobUUID && left.Source == right.Source &&
-		equalStrings(left.Excludes, right.Excludes) && left.KeepLatest == right.KeepLatest &&
+		equalStrings(left.Excludes, right.Excludes) && equalStrings(left.DotIgnore, right.DotIgnore) &&
+		left.KeepLatest == right.KeepLatest &&
 		left.KeepHourly == right.KeepHourly && left.KeepDaily == right.KeepDaily &&
 		left.KeepWeekly == right.KeepWeekly && left.KeepMonthly == right.KeepMonthly &&
 		left.KeepAnnual == right.KeepAnnual
@@ -327,39 +348,35 @@ func ReconcileKopiaManagedPolicies(
 	repo models.Repository,
 	desired KopiaManagedPolicyDesiredState,
 ) (KopiaManagedPolicyResult, string, error) {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return KopiaManagedPolicyResult{}, "", err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	result, output, err := target.reconcileManagedPolicies(ctx, repo, desired)
 	return result, output, err
 }
 
-func concreteKopiaEngine(engine Engine) (*kopiaEngine, RepositoryAvailabilityCheck, error) {
-	var check RepositoryAvailabilityCheck
+func concreteKopiaEngine(engine Engine) (*kopiaEngine, error) {
 	if public, ok := engine.(*publicEngine); ok {
-		check = public.availabilityCheck
 		engine = public.Engine
 	}
 	target, ok := engine.(*kopiaEngine)
 	if !ok {
-		return nil, nil, fmt.Errorf("Kopia managed-policy reconciliation requires the Kopia engine")
+		return nil, fmt.Errorf("Kopia managed-policy reconciliation requires the Kopia engine")
 	}
-	return target, check, nil
+	return target, nil
 }
 
 // EnsureKopiaClientIdentity assigns and reads back the stable Replicaro client
 // identity in this vault's isolated Kopia configuration.
 func EnsureKopiaClientIdentity(ctx context.Context, engine Engine, repo models.Repository) (string, error) {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return "", err
 	}
 	if parsed, parseErr := uuid.Parse(repo.ClientUUID); parseErr != nil || parsed == uuid.Nil || parsed.String() != repo.ClientUUID {
 		return "", fmt.Errorf("client_uuid is invalid")
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	session, _, err := target.openRepositorySession(ctx, repo, false)
 	if err != nil {
 		return "", err
@@ -471,11 +488,10 @@ func ExplainKopiaObjectLockProviderRequirement(connector string, err error) erro
 // EnsureKopiaMaintenanceOwner aligns native maintenance with the freshly
 // authorized Replicaro owner and keeps Kopia automatic maintenance disabled.
 func EnsureKopiaMaintenanceOwner(ctx context.Context, engine Engine, repo models.Repository) (string, error) {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return "", err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	session, _, err := target.openRepositorySession(ctx, repo, false)
 	if err != nil {
 		return "", err
@@ -540,11 +556,10 @@ func ConfigureKopiaObjectLockForEnrollment(ctx context.Context, engine Engine, r
 	if !repo.ObjectLock.Enrolled || repo.ObjectLock.Paused {
 		return "", fmt.Errorf("initial object lock enrollment must be active")
 	}
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return "", err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	session, _, err := target.openRepositorySession(ctx, repo, false)
 	if err != nil {
 		return "", err
@@ -606,11 +621,10 @@ func verifyKopiaObjectLockEnrollmentReadback(statusData, maintenanceData []byte,
 }
 
 func VerifyKopiaMaintenanceOwner(ctx context.Context, engine Engine, repo models.Repository) error {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	session, _, err := target.openRepositorySession(ctx, repo, false)
 	if err != nil {
 		return err
@@ -648,12 +662,15 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 	if err != nil {
 		return "", err
 	}
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return "", err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
-	before, err := target.inspectManagedPoliciesScoped(ctx, repo, desired.Sources)
+	session, _, err := target.openRepositorySession(ctx, repo, false)
+	if err != nil {
+		return "", err
+	}
+	before, err := inspectManagedPolicies(ctx, session, repo, desired.Sources)
 	if err != nil {
 		return "", err
 	}
@@ -662,10 +679,6 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 	}
 	if !globalPolicyMatches(before.Global) {
 		return "", fmt.Errorf("Kopia global policy is not the managed retention safety ceiling")
-	}
-	session, _, err := target.openRepositorySession(ctx, repo, false)
-	if err != nil {
-		return "", err
 	}
 	if err := validateKopiaPathArtifacts(before.Policies, desired.Sources); err != nil {
 		return "", err
@@ -676,7 +689,7 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 	if !exists {
 		// A retry after a conclusive delete validates that SourceInfo now
 		// inherits the managed global ceiling instead of recreating job policy.
-		pathOutput, pathErr := validateEffectiveKopiaPathArtifacts(ctx, session, before.Policies, desired.Sources,
+		pathOutput, pathErr := validateEffectiveKopiaPathArtifacts(ctx, session, desired.Sources,
 			map[string]KopiaManagedPolicySource{policyTarget: {
 				KeepLatest: KopiaManagedRetentionCeiling, KeepHourly: KopiaManagedRetentionCeiling,
 				KeepDaily: KopiaManagedRetentionCeiling, KeepWeekly: KopiaManagedRetentionCeiling,
@@ -700,11 +713,23 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 			return "", fmt.Errorf("Kopia job policy %s is not the exact managed user policy", policyTarget)
 		}
 		managed.Excludes = excludes
+		// The effective check compares against what the stored job policy
+		// actually sets, not what the job would be given today. Normalizing
+		// the source above always adds .kopiaignore, so clear it first: a job
+		// policy that doesn't set ignoreCacheDirs (written before the marker
+		// file settings were managed and not rewritten since) leaves DotIgnore
+		// nil and the effective check skips the files settings. Kopia omits
+		// an inherited ignoreCacheDirs from `policy show --json`, so checking
+		// it for such a policy would block deleting the job.
+		managed.DotIgnore = nil
+		if retention.IgnoreCacheDirs {
+			managed.DotIgnore = retention.DotIgnore
+		}
 		managed.KeepLatest, managed.KeepHourly = retention.KeepLatest, retention.KeepHourly
 		managed.KeepDaily, managed.KeepWeekly = retention.KeepDaily, retention.KeepWeekly
 		managed.KeepMonthly, managed.KeepAnnual = retention.KeepMonthly, retention.KeepAnnual
 	}
-	pathOutput, err := validateEffectiveKopiaPathArtifacts(ctx, session, before.Policies, desired.Sources,
+	pathOutput, err := validateEffectiveKopiaPathArtifacts(ctx, session, desired.Sources,
 		map[string]KopiaManagedPolicySource{policyTarget: managed})
 	if err != nil {
 		return pathOutput, err
@@ -721,7 +746,7 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 	if err != nil {
 		return output, err
 	}
-	after, err := target.inspectManagedPoliciesScoped(ctx, repo, desired.Sources)
+	after, err := inspectManagedPolicies(ctx, session, repo, desired.Sources)
 	if err != nil {
 		return output, err
 	}
@@ -734,7 +759,7 @@ func DeleteKopiaManagedJobPolicy(ctx context.Context, engine Engine, repo models
 	if err := validateKopiaPathArtifacts(after.Policies, desired.Sources); err != nil {
 		return output, err
 	}
-	pathOutput, err = validateEffectiveKopiaPathArtifacts(ctx, session, after.Policies, desired.Sources,
+	pathOutput, err = validateEffectiveKopiaPathArtifacts(ctx, session, desired.Sources,
 		map[string]KopiaManagedPolicySource{policyTarget: {
 			KeepLatest: KopiaManagedRetentionCeiling, KeepHourly: KopiaManagedRetentionCeiling,
 			KeepDaily: KopiaManagedRetentionCeiling, KeepWeekly: KopiaManagedRetentionCeiling,
@@ -934,10 +959,6 @@ func applyKopiaObjectLockSettings(
 	return err
 }
 
-func verifyKopiaMaintenanceOwner(data []byte, expected string) error {
-	return verifyKopiaMaintenanceConfiguration(data, models.Repository{}, expected, false)
-}
-
 func verifyKopiaMaintenanceConfiguration(data []byte, repo models.Repository, expected string, verifyListParallelism bool) error {
 	var maintenance kopiaMaintenancePolicy
 	if err := strictJSON(data, &maintenance); err != nil {
@@ -966,15 +987,15 @@ func verifyKopiaMaintenanceConfiguration(data []byte, repo models.Repository, ex
 	return nil
 }
 
-func (e *kopiaEngine) inspectManagedPolicies(ctx context.Context, repo models.Repository) (kopiaPolicySnapshot, error) {
-	return e.inspectManagedPoliciesScoped(ctx, repo, nil)
-}
-
-func (e *kopiaEngine) inspectManagedPoliciesScoped(ctx context.Context, repo models.Repository, sources []KopiaManagedPolicySource) (kopiaPolicySnapshot, error) {
-	session, _, err := e.openRepositorySession(ctx, repo, false)
-	if err != nil {
-		return kopiaPolicySnapshot{}, err
-	}
+// inspectManagedPolicies reads the policy state through the caller's session,
+// so one reconciliation or deletion opens (and binding-checks) the repository
+// once instead of once per read.
+func inspectManagedPolicies(
+	ctx context.Context,
+	session *kopiaRepositorySession,
+	repo models.Repository,
+	sources []KopiaManagedPolicySource,
+) (kopiaPolicySnapshot, error) {
 	statusOutput, err := session.run(ctx, []string{"repository", "status", "--json"}, command.NoTotalDeadline)
 	if err != nil {
 		return kopiaPolicySnapshot{}, fmt.Errorf("read Kopia client identity: %w", err)
@@ -998,13 +1019,11 @@ func (e *kopiaEngine) inspectManagedPoliciesScoped(ctx context.Context, repo mod
 		return kopiaPolicySnapshot{}, fmt.Errorf("Kopia maintenance policy is missing quick or full state")
 	}
 	var entries []kopiaPolicyListEntry
-	listOutput, err := runCapturedKopiaPolicyOutput(ctx, session, []string{"policy", "list", "--json"}, func(reader io.Reader) error {
+	if _, err := runCapturedKopiaPolicyOutput(ctx, session, []string{"policy", "list", "--json"}, func(reader io.Reader) error {
 		return strictJSONReader(reader, &entries)
-	})
-	if err != nil {
+	}); err != nil {
 		return kopiaPolicySnapshot{}, fmt.Errorf("list Kopia policies: %w", err)
 	}
-	_ = listOutput
 	targetNames, err := uniqueKopiaPolicyTargets(entries)
 	if err != nil {
 		return kopiaPolicySnapshot{}, err
@@ -1102,11 +1121,24 @@ func uniqueKopiaPolicyTargets(entries []kopiaPolicyListEntry) ([]string, error) 
 			globalCount++
 			continue
 		}
+		// Only targets on the replicaro host apply to Replicaro's sources.
+		// Every other host is foreign and only listed, including the empty
+		// host Kopia accepts for user@: and user@:path targets.
 		user := entry.Target.UserName
 		host := entry.Target.Host
 		targetPath := entry.Target.Path
-		if strings.TrimSpace(user) == "" || strings.TrimSpace(host) == "" {
-			return nil, fmt.Errorf("Kopia policy list contains an ambiguous target")
+		if strings.TrimSpace(user) == "" {
+			// A host-level policy (@host) applies to every user on that host.
+			// For another computer's host name it is foreign and left alone,
+			// like any other foreign policy. The replicaro host policy would
+			// sit between the global policy and every job policy and change
+			// what they inherit, so it is refused rather than accepted.
+			if targetPath != "" {
+				return nil, fmt.Errorf("Kopia policy list contains an ambiguous target")
+			}
+			if strings.TrimSpace(host) == "replicaro" {
+				return nil, fmt.Errorf("Kopia host policy @%s would apply to every Replicaro job; remove it with Kopia", host)
+			}
 		}
 		target := user + "@" + host
 		if targetPath != "" {
@@ -1158,7 +1190,11 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 			DesiredDigest: digest, Mutated: mutated, DriftObserved: driftObserved,
 		}
 	}
-	before, err := e.inspectManagedPoliciesScoped(ctx, repo, normalized.Sources)
+	session, _, err := e.openRepositorySession(ctx, repo, false)
+	if err != nil {
+		return currentResult(), "", err
+	}
+	before, err := inspectManagedPolicies(ctx, session, repo, normalized.Sources)
 	if err != nil {
 		return currentResult(), "", err
 	}
@@ -1174,10 +1210,6 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 		desiredPolicies[target] = source
 	}
 	if err := validateKopiaPathArtifacts(before.Policies, normalized.Sources); err != nil {
-		return currentResult(), "", err
-	}
-	session, _, err := e.openRepositorySession(ctx, repo, false)
-	if err != nil {
 		return currentResult(), "", err
 	}
 	var output strings.Builder
@@ -1205,9 +1237,8 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 	}
 	driftObserved = maintenanceDrift || objectLockDrift || globalDrift || policyDrift
 	if driftObserved {
-		// The snapshot above validated its own session, but reconciliation mutates
-		// through this separately prepared session. Bind its exact native repository
-		// immediately before the first command that can change policy.
+		// Check the native repository's identity again immediately before the
+		// first command that can change policy.
 		status, statusErr := session.run(ctx, []string{"repository", "status", "--json"}, command.NoTotalDeadline)
 		if statusErr != nil {
 			return currentResult(), output.String(), statusErr
@@ -1260,7 +1291,11 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 		}
 		mutated = true
 		source := desiredPolicies[target]
-		value, runErr := session.run(ctx, []string{"policy", "set", "--clear-ignore",
+		// The clears and the adds are two commands on purpose: pinned Kopia
+		// applies --clear-dot-ignore after --add-dot-ignore within one
+		// command, which would leave the list empty.
+		value, runErr := session.run(ctx, []string{"policy", "set", "--clear-ignore", "--clear-dot-ignore",
+			"--ignore-cache-dirs=true",
 			"--keep-latest=" + fmt.Sprint(source.KeepLatest),
 			"--keep-hourly=" + fmt.Sprint(source.KeepHourly),
 			"--keep-daily=" + fmt.Sprint(source.KeepDaily),
@@ -1271,10 +1306,16 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 		if runErr != nil {
 			return currentResult(), output.String(), runErr
 		}
-		if excludes := source.Excludes; len(excludes) > 0 {
+		if len(source.Excludes) > 0 || len(source.DotIgnore) > 0 {
 			args := []string{"policy", "set"}
-			for _, exclude := range excludes {
-				args = append(args, "--add-ignore", exclude)
+			for _, exclude := range source.Excludes {
+				// Keep the flag and pattern in one argument. Kopia's parser reads a
+				// separate pattern that starts with "-" (such as "-tmp") as another
+				// flag and rejects the whole command after --clear-ignore already ran.
+				args = append(args, "--add-ignore="+exclude)
+			}
+			for _, name := range source.DotIgnore {
+				args = append(args, "--add-dot-ignore="+name)
 			}
 			args = append(args, target)
 			value, runErr = session.run(ctx, args, command.NoTotalDeadline)
@@ -1284,17 +1325,24 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 			}
 		}
 	}
-	after, err := e.inspectManagedPoliciesScoped(ctx, repo, normalized.Sources)
-	if err != nil {
-		return currentResult(), output.String(), fmt.Errorf("verify Kopia managed policies: %w", err)
-	}
-	if err := verifyManagedPolicySnapshot(
-		after, normalized, desiredPolicies, expectedKopiaMaintenanceOwner(repo),
-	); err != nil {
-		return currentResult(), output.String(), err
-	}
-	if err := validateKopiaPathArtifacts(after.Policies, normalized.Sources); err != nil {
-		return currentResult(), output.String(), err
+	if driftObserved {
+		// Only a reconciliation that found drift reads every defined policy
+		// again. With no drift the first inspection already is that readback:
+		// it found the global policy, maintenance, Object Lock and job policies
+		// as desired and nothing has been written since. The effective policy
+		// checks below run either way.
+		after, err := inspectManagedPolicies(ctx, session, repo, normalized.Sources)
+		if err != nil {
+			return currentResult(), output.String(), fmt.Errorf("verify Kopia managed policies: %w", err)
+		}
+		if err := verifyManagedPolicySnapshot(
+			after, normalized, desiredPolicies, expectedKopiaMaintenanceOwner(repo),
+		); err != nil {
+			return currentResult(), output.String(), err
+		}
+		if err := validateKopiaPathArtifacts(after.Policies, normalized.Sources); err != nil {
+			return currentResult(), output.String(), err
+		}
 	}
 	for _, target := range targets {
 		var effectiveDocument []byte
@@ -1314,7 +1362,7 @@ func (e *kopiaEngine) reconcileManagedPolicies(
 		}
 	}
 	pathOutput, pathErr := validateEffectiveKopiaPathArtifacts(
-		ctx, session, after.Policies, normalized.Sources, desiredPolicies,
+		ctx, session, normalized.Sources, desiredPolicies,
 	)
 	appendOutput(pathOutput)
 	if pathErr != nil {
@@ -1398,7 +1446,19 @@ func effectiveSourcePolicyMatches(raw json.RawMessage, source KopiaManagedPolicy
 	sort.Strings(actual)
 	expected := append([]string(nil), source.Excludes...)
 	sort.Strings(expected)
-	return equalStrings(actual, expected)
+	if !equalStrings(actual, expected) {
+		return false
+	}
+	if source.DotIgnore == nil {
+		// Nothing of the job's own to check: the retention ceiling check
+		// after a job policy is deleted, or a policy read back from before
+		// the dot-ignore list was managed.
+		return true
+	}
+	dotIgnore := normalizedKopiaExcludes(policy.Files.IgnoreDotFiles)
+	sort.Strings(dotIgnore)
+	return equalStrings(compactStrings(dotIgnore), source.DotIgnore) &&
+		policy.Files.IgnoreCacheDirs != nil && *policy.Files.IgnoreCacheDirs
 }
 
 func knownKopiaPolicyDocument(raw json.RawMessage) bool {
@@ -1427,7 +1487,12 @@ func localSourcePolicyMatches(raw json.RawMessage, source KopiaManagedPolicySour
 	}
 	expected := normalizedKopiaExcludes(source.Excludes)
 	sort.Strings(expected)
-	return equalStrings(actual, expected) && retention.KeepLatest == source.KeepLatest &&
+	// A policy written before the dot-ignore list and ignoreCacheDirs were
+	// managed reads back without ignoreCacheDirs, doesn't match, and is
+	// rewritten once.
+	return equalStrings(actual, expected) && retention.IgnoreCacheDirs &&
+		equalStrings(retention.DotIgnore, source.DotIgnore) &&
+		retention.KeepLatest == source.KeepLatest &&
 		retention.KeepHourly == source.KeepHourly && retention.KeepDaily == source.KeepDaily &&
 		retention.KeepWeekly == source.KeepWeekly && retention.KeepMonthly == source.KeepMonthly &&
 		retention.KeepAnnual == source.KeepAnnual
@@ -1472,12 +1537,32 @@ func localSourcePolicyValues(raw json.RawMessage) ([]string, KopiaManagedPolicyS
 		return nil, KopiaManagedPolicySource{}, false
 	}
 	var files map[string]json.RawMessage
-	if strictJSON(filesRaw, &files) != nil || files == nil || len(files) > 1 {
+	if strictJSON(filesRaw, &files) != nil || files == nil {
 		return nil, KopiaManagedPolicySource{}, false
+	}
+	for key := range files {
+		if key != "ignore" && key != "ignoreDotFiles" && key != "ignoreCacheDirs" {
+			return nil, KopiaManagedPolicySource{}, false
+		}
 	}
 	var actual []string
 	if ignore, exists := files["ignore"]; exists {
 		if strictJSON(ignore, &actual) != nil || actual == nil {
+			return nil, KopiaManagedPolicySource{}, false
+		}
+	}
+	values.DotIgnore = []string{}
+	if dotIgnore, exists := files["ignoreDotFiles"]; exists {
+		var names []string
+		if strictJSON(dotIgnore, &names) != nil || names == nil {
+			return nil, KopiaManagedPolicySource{}, false
+		}
+		names = normalizedKopiaExcludes(names)
+		sort.Strings(names)
+		values.DotIgnore = compactStrings(names)
+	}
+	if cacheDirs, exists := files["ignoreCacheDirs"]; exists {
+		if strictJSON(cacheDirs, &values.IgnoreCacheDirs) != nil {
 			return nil, KopiaManagedPolicySource{}, false
 		}
 	}
@@ -1527,11 +1612,9 @@ func validateKopiaPathArtifacts(policies map[string]json.RawMessage, sources []K
 func validateEffectiveKopiaPathArtifacts(
 	ctx context.Context,
 	session *kopiaRepositorySession,
-	policies map[string]json.RawMessage,
 	sources []KopiaManagedPolicySource,
 	desiredPolicies map[string]KopiaManagedPolicySource,
 ) (string, error) {
-	_ = policies // Defined path artifacts are validated separately above.
 	targets := make([]string, 0, len(sources))
 	for _, source := range sources {
 		targets = append(targets, source.JobUUID+"@replicaro:"+filepath.Clean(source.Source))
@@ -1612,22 +1695,6 @@ func kopiaClientIdentity(output string) (string, string, error) {
 		return "", "", fmt.Errorf("Kopia repository status has an incomplete client identity")
 	}
 	return user, host, nil
-}
-
-func kopiaSourceTarget(user, host, source string) (string, error) {
-	absolute, err := filepath.Abs(source)
-	if err != nil {
-		return "", err
-	}
-	return user + "@" + host + ":" + filepath.Clean(absolute), nil
-}
-
-func kopiaTargetPath(target string) string {
-	index := strings.Index(target, ":")
-	if index < 1 || index == len(target)-1 {
-		return ""
-	}
-	return target[index+1:]
 }
 
 func strictJSON(data []byte, target any) error {

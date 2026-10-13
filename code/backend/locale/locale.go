@@ -86,8 +86,9 @@ func Supported() []string {
 // MatchPreferred respects OS preference order. A regional catalog takes
 // precedence over its base language; unsupported languages fall through.
 // en-GB and en-US share en, and Spanish regions share es. pt-PT and pt-BR
-// retain their own catalogs. This chooses a catalog, not a separate formatting
-// region: the UI formats values using the selected catalog's locale.
+// retain their own catalogs. Mandarin and Cantonese are resolved by script
+// first (see chineseScriptCatalog). This chooses a catalog, not a separate
+// formatting region: the UI formats values using the selected catalog's locale.
 func MatchPreferred(preferred []string, supported []string) string {
 	available := make(map[string]string, len(supported))
 	for _, value := range supported {
@@ -97,6 +98,15 @@ func MatchPreferred(preferred []string, supported []string) string {
 		value = normalizeTag(value)
 		if value == "" {
 			continue
+		}
+		if catalog := chineseScriptCatalog(value); catalog != "" {
+			if match, ok := available[strings.ToLower(catalog)]; ok {
+				return match
+			}
+			// The script catalog for this tag isn't loaded. Packaged builds
+			// always ship both scripts, so this only happens with a partial
+			// catalog set; the generic matching below then still prefers the
+			// same language in the other script over an unrelated language.
 		}
 		for candidate := value; candidate != ""; {
 			if match, ok := available[strings.ToLower(candidate)]; ok {
@@ -111,8 +121,11 @@ func MatchPreferred(preferred []string, supported []string) string {
 		// A regional translation of the same language is still closer than
 		// an unrelated later OS preference when no neutral catalog exists.
 		// Supported sorts the catalog names, so this fallback is deterministic
-		// (currently pt or pt-AO selects pt-BR). It does not infer dialects;
-		// Cantonese requires yue, while zh selects the Mandarin catalog.
+		// (currently pt or pt-AO selects pt-BR). It does not infer dialects:
+		// Cantonese requires yue, while zh selects a Mandarin catalog. zh and
+		// yue tags only get here when chineseScriptCatalog's choice isn't
+		// loaded, because alphabetical order would otherwise pick the wrong
+		// script.
 		base := strings.SplitN(value, "-", 2)[0]
 		for _, supported := range supported {
 			if strings.HasPrefix(strings.ToLower(supported), strings.ToLower(base)+"-") {
@@ -121,6 +134,58 @@ func MatchPreferred(preferred []string, supported []string) string {
 		}
 	}
 	return models.LanguageEnglish
+}
+
+// chineseScriptCatalog maps a normalized zh or yue tag to the catalog in the
+// script the OS asked for, and returns "" for every other language.
+//
+// Mandarin and Cantonese each have a Simplified and a Traditional catalog, and
+// the right one depends on the script, not just the language. The generic
+// matching in MatchPreferred can't express that: truncating zh-TW gives zh,
+// which isn't a catalog, and the prefix fallback then takes whichever zh-*
+// catalog sorts first. That would put Taiwan and Hong Kong on Simplified, and
+// because yue-Hans sorts before yue-Hant it would also move every yue-HK user
+// from Traditional to Simplified. So these two languages use a fixed table:
+//
+//   - An explicit script subtag wins: zh-Hant*, zh-Hans*, yue-Hant*, yue-Hans*
+//     select that script whatever the region (zh-Hans-HK stays Simplified).
+//   - Otherwise the region decides, following the script normally used there:
+//     zh-TW, zh-HK and zh-MO select zh-Hant and any other zh selects zh-Hans;
+//     yue-CN selects yue-Hans and any other yue (including plain yue, yue-HK
+//     and yue-MO) selects yue-Hant, since Cantonese is mostly written in
+//     Traditional characters.
+//
+// The table is deliberately small and explicit rather than general BCP 47
+// script inference. Other script subtags (zh-Latn and so on) are treated as
+// if absent and the region decides.
+func chineseScriptCatalog(tag string) string {
+	subtags := strings.Split(strings.ToLower(tag), "-")
+	language := subtags[0]
+	if language != "zh" && language != "yue" {
+		return ""
+	}
+	script, region := "", ""
+	for _, subtag := range subtags[1:] {
+		switch {
+		case script == "" && region == "" && (subtag == "hans" || subtag == "hant"):
+			script = subtag
+		case region == "" && len(subtag) == 2:
+			region = subtag
+		}
+	}
+	if script == "" {
+		script = "hans"
+		switch {
+		case language == "zh" && (region == "tw" || region == "hk" || region == "mo"):
+			script = "hant"
+		case language == "yue" && region != "cn":
+			script = "hant"
+		}
+	}
+	if script == "hant" {
+		return language + "-Hant"
+	}
+	return language + "-Hans"
 }
 
 func normalizeTag(value string) string {

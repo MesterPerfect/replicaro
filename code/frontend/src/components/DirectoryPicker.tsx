@@ -77,6 +77,10 @@ function DirectoryPicker({
 	const [notResponding, setNotResponding] = useState(false);
 	const requestRef = useRef<{ controller: AbortController; generation: number } | null>(null);
 	const generationRef = useRef(0);
+	// The last folder that loaded. After a failed load it stays on screen under
+	// the error, so the roots, Up one level, its subfolders and the footer are
+	// still there to move on from.
+	const loadedRef = useRef<DirectoryListing | null>(null);
 
 	const cancelLoad = useCallback(() => {
 		generationRef.current += 1;
@@ -84,28 +88,51 @@ function DirectoryPicker({
 		requestRef.current = null;
 	}, []);
 
-    const load = useCallback(async (requested: string) => {
-		cancelLoad();
-		const controller = new AbortController();
-		const generation = ++generationRef.current;
-		requestRef.current = { controller, generation };
-		await Promise.resolve();
-		if (generationRef.current !== generation || controller.signal.aborted) return;
-        setListing(null);
-        setError("");
-		setNotResponding(false);
-        try {
-			const next = await browseDirectories(requested, controller.signal);
+	const load = useCallback(async (requested: string) => {
+		// keepError is set only for the fallback below, which must not clear the
+		// error that caused it.
+		const run = async (target: string, keepError: boolean): Promise<void> => {
+			cancelLoad();
+			const controller = new AbortController();
+			const generation = ++generationRef.current;
+			requestRef.current = { controller, generation };
+			await Promise.resolve();
 			if (generationRef.current !== generation || controller.signal.aborted) return;
-            setListing(next);
-            setPath(next.current);
-        } catch (reason) {
-			if (generationRef.current !== generation || controller.signal.aborted || (reason as { name?: string })?.name === "AbortError") return;
-			if (reason instanceof APIError && reason.code === "directory_not_responding") setNotResponding(true);
-            else setError((reason as Error).message);
-		} finally {
-			if (requestRef.current?.generation === generation) requestRef.current = null;
-        }
+			setListing(null);
+			if (!keepError) {
+				setError("");
+				setNotResponding(false);
+			}
+			let fallback = false;
+			try {
+				const next = await browseDirectories(target, controller.signal);
+				if (generationRef.current !== generation || controller.signal.aborted) return;
+				loadedRef.current = next;
+				setListing(next);
+				setPath(next.current);
+			} catch (reason) {
+				if (generationRef.current !== generation || controller.signal.aborted || (reason as { name?: string })?.name === "AbortError") return;
+				// The fallback's own failure keeps the first error, which names
+				// the folder the user asked for.
+				if (!keepError) {
+					if (reason instanceof APIError && reason.code === "directory_not_responding") setNotResponding(true);
+					else setError((reason as Error).message);
+				}
+				// When the very first folder fails there is nothing to keep, so
+				// the default start folder (home, or / in Docker) is loaded once,
+				// with the error still shown. Its own failure ends there. A kept
+				// folder also goes back into the path box, since that is the
+				// folder "Select this folder" returns.
+				if (loadedRef.current) {
+					setListing(loadedRef.current);
+					setPath(loadedRef.current.current);
+				} else fallback = target !== "";
+			} finally {
+				if (requestRef.current?.generation === generation) requestRef.current = null;
+			}
+			if (fallback) await run("", true);
+		};
+		await run(requested, false);
 	}, [cancelLoad]);
 
     useEffect(() => {

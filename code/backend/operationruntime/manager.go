@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 type managerContextKey struct{}
@@ -341,4 +342,64 @@ func (m *Manager) Remove(operationID string) {
 		m.evict(entry.entries.Front().Value.(*storedEntry))
 	}
 	delete(m.entries, operationID)
+}
+
+// TerminalStatus is the final status of an operation that ended with err:
+// success, failed, or interrupted. ctx must be the operation's own context,
+// the one an accepted cancel and application shutdown end.
+//
+// Only that context ending makes an operation interrupted. Work inside an
+// operation also runs under shorter internal deadlines (a native command
+// timeout, a sidecar read or publication bound), and those surface as the
+// same context.DeadlineExceeded or context.Canceled errors. Such a timeout is
+// a failure the user has to hear about: interrupted operations send no
+// notification. So a context error counts only when it is the error of ctx
+// itself, not just any context error somewhere in the chain.
+//
+// The work's own result decides. A cancel or shutdown that arrives after the
+// work already returned success, or failed for another reason, does not turn
+// that result into interrupted.
+func TerminalStatus(ctx context.Context, err error) string {
+	switch {
+	case err == nil:
+		return "success"
+	case endedByOwnContext(ctx, err):
+		return "interrupted"
+	default:
+		return "failed"
+	}
+}
+
+func endedByOwnContext(ctx context.Context, err error) bool {
+	if ctx == nil || ctx.Err() == nil {
+		return false
+	}
+	// Operation contexts are plain cancel contexts, so their error is
+	// context.Canceled. The cause is checked too in case a caller cancels
+	// with one. An internal deadline under a cancelled operation still
+	// reports DeadlineExceeded and stays a failure.
+	return errors.Is(err, ctx.Err()) || errors.Is(err, context.Cause(ctx))
+}
+
+// RetryWrite runs write up to attempts times and stops early when it succeeds
+// or when final reports its error as one another attempt can't fix (final may
+// be nil). It waits n*step before attempt n+1, which absorbs short SQLite
+// contention, and doesn't wait after the last attempt. Cancelling ctx ends a
+// wait with ctx.Err(); it never skips the first attempt.
+func RetryWrite(ctx context.Context, attempts int, step time.Duration, write func() error, final func(error) bool) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = write()
+		if err == nil || (final != nil && final(err)) || attempt == attempts {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt) * step)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
 }

@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router-dom";
-import { useId, useState, useSyncExternalStore } from "react";
-import { englishText, getEffectiveLocale, subscribeLocale } from "./i18n";
+import { Component, useId, useState, useSyncExternalStore } from "react";
+import type { ErrorInfo, ReactNode } from "react";
+import { englishText, getEffectiveLocale, subscribeLocale, t } from "./i18n";
 import { reloadPage } from "./reloadPage";
 
 import MainLayout from "./layouts/MainLayout";
@@ -79,6 +80,32 @@ function LanguageLoadFailedDialog({ locale }: { locale: string }) {
             </div>
         </div>
     </Modal>;
+}
+
+// A render error anywhere in the app would otherwise unmount the whole tree
+// and leave an empty page. This shows a short explanation and a reload
+// instead. It is a class because React offers error boundaries only as class
+// components. main.tsx puts it around App, outside the toast provider and the
+// router, so it still works when one of those is what failed.
+export class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+    state = { failed: false };
+
+    static getDerivedStateFromError() {
+        return { failed: true };
+    }
+
+    componentDidCatch(error: unknown, info: ErrorInfo) {
+        console.error("Replicaro could not render the page", error, info.componentStack);
+    }
+
+    render() {
+        if (!this.state.failed) return this.props.children;
+        return <main className="app-error" role="alert">
+            <h1>{t("ui.app.pageErrorTitle")}</h1>
+            <p>{t("ui.app.pageErrorBody")}</p>
+            <button type="button" className="btn primary" onClick={() => reloadPage()}>{t("system.language.reloadPage")}</button>
+        </main>;
+    }
 }
 
 // failedLocale is the saved language whose catalog main.tsx couldn't load.

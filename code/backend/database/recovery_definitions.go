@@ -126,6 +126,9 @@ func portableDefinitionFromModel(job models.BackupJob) portableJobDefinition {
 			RetentionDaily: job.RetentionDaily, RetentionWeekly: job.RetentionWeekly,
 			RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
 			Exclusions: job.Excludes, Tag: job.Tag,
+			SkipNoBackupFolders:     job.SkipNoBackupFolders,
+			SkipCacheDirFolders:     job.SkipCacheDirFolders,
+			SkipMarkerFileName:      job.SkipMarkerFileName,
 			BeforeScriptPath:        job.BeforeScriptPath,
 			BeforeScriptMustSucceed: job.BeforeScriptMustSucceed,
 			AfterScriptPath:         job.AfterScriptPath,
@@ -196,7 +199,7 @@ func reconcileDormantWithActiveJobs(tx *sql.Tx, jobs []models.BackupJob) ([]stri
 			dormantOwners = append(dormantOwners, dormantOwner{repositoryID: repositoryID, enabled: dormant.Enabled, definition: dormant})
 			affected = append(affected, repositoryID)
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return nil, err
 		}
 		if len(dormantOwners) == 0 {
@@ -295,24 +298,28 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 			existingDormantRows = append(existingDormantRows, existingDormant{repositoryID: ownerID, enabled: existing.Enabled})
 			affected = append(affected, ownerID)
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return nil, err
 		}
 		var activeJSON, portableJSON, alias string
 		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, beforeScriptPath, afterScriptPath string
+		var skipNoBackup, skipCacheDir bool
+		var skipMarkerName string
 		var beforeScriptMustSucceed, afterScriptMustSucceed bool
 		var retention, enabled int
 		var retentionHourly, retentionDaily, retentionWeekly, retentionMonthly, retentionYearly sql.NullInt64
 		err = tx.QueryRow(`SELECT name,source,source_storage_version,source_storage_key,
 			source_storage_json,source_binding_state,schedule,retention,retention_hourly,retention_daily,
-			retention_weekly,retention_monthly,retention_yearly,excludes,tag,
+			retention_weekly,retention_monthly,retention_yearly,excludes,
+			skip_nobackup_folders,skip_cachedir_folders,skip_marker_file_name,tag,
 			before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 			engine_settings,
 			portable_target_ids,enabled,resolved_source_path FROM backup_jobs WHERE id=?`, definition.JobID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON, &sourceBindingState,
 			&schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
-			&retentionMonthly, &retentionYearly, &excludes, &tag, &beforeScriptPath, &beforeScriptMustSucceed,
+			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
+			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
 			&afterScriptPath, &afterScriptMustSucceed, &activeJSON, &portableJSON, &enabled, &alias)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
@@ -330,6 +337,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 					RetentionDaily: nullableRetentionValue(retentionDaily), RetentionWeekly: nullableRetentionValue(retentionWeekly),
 					RetentionMonthly: nullableRetentionValue(retentionMonthly), RetentionYearly: nullableRetentionValue(retentionYearly),
 					Exclusions: excludes, Tag: tag,
+					SkipNoBackupFolders: skipNoBackup, SkipCacheDirFolders: skipCacheDir, SkipMarkerFileName: skipMarkerName,
 					BeforeScriptPath: beforeScriptPath, BeforeScriptMustSucceed: beforeScriptMustSucceed,
 					AfterScriptPath: afterScriptPath, AfterScriptMustSucceed: afterScriptMustSucceed,
 					EngineSettings: settings, Enabled: enabled != 0, TargetVaultUUIDs: targets,
@@ -366,7 +374,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 				}
 				affected = append(affected, ownerID)
 			}
-			if closeErr := activeRows.Close(); closeErr != nil {
+			if closeErr := closeRows(activeRows); closeErr != nil {
 				return nil, closeErr
 			}
 		}
@@ -444,7 +452,7 @@ func DiscardDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) error {
 		updates = append(updates, dormantUpdate{ownerID, string(encoded)})
 		affected = append(affected, ownerID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	for _, update := range updates {
@@ -478,7 +486,7 @@ func DiscardDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) error {
 			}
 			affected = append(affected, id)
 		}
-		if err := activeRows.Close(); err != nil {
+		if err := closeRows(activeRows); err != nil {
 			return err
 		}
 	} else if err != sql.ErrNoRows {
@@ -521,7 +529,9 @@ func PrepareDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) (models.B
 		RetentionDaily: saved.RetentionDaily, RetentionWeekly: saved.RetentionWeekly,
 		RetentionMonthly: saved.RetentionMonthly, RetentionYearly: saved.RetentionYearly,
 		Excludes: saved.Exclusions, Tag: saved.Tag, Enabled: false,
-		BeforeScriptPath: saved.BeforeScriptPath, BeforeScriptMustSucceed: saved.BeforeScriptMustSucceed,
+		SkipNoBackupFolders: saved.SkipNoBackupFolders, SkipCacheDirFolders: saved.SkipCacheDirFolders,
+		SkipMarkerFileName: saved.SkipMarkerFileName,
+		BeforeScriptPath:   saved.BeforeScriptPath, BeforeScriptMustSucceed: saved.BeforeScriptMustSucceed,
 		AfterScriptPath: saved.AfterScriptPath, AfterScriptMustSucceed: saved.AfterScriptMustSucceed,
 		SourceStorageVersion: saved.SourceStorageVersion, SourceStorageKey: saved.SourceStorageKey,
 		SourceStorageDescriptorJSON: saved.SourceStorageJSON, SourceBindingState: saved.SourceBindingState,
@@ -646,7 +656,7 @@ func updateDormantTargetIDs(tx *sql.Tx, jobID string, targetIDs []string) ([]str
 		updates = append(updates, update{repositoryID: repositoryID, definition: string(encoded)})
 		affected = append(affected, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	for _, item := range updates {
@@ -694,7 +704,7 @@ func updateDormantDefinitionsForJob(tx *sql.Tx, job models.BackupJob) ([]string,
 		updates = append(updates, update{repositoryID: id, definition: string(data)})
 		repositories = append(repositories, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	for _, item := range updates {
@@ -738,7 +748,7 @@ func deleteDormantRecoveryJobEverywhere(tx *sql.Tx, jobID string) ([]string, err
 		}
 		repositories = append(repositories, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`DELETE FROM dormant_recovery_jobs WHERE job_id = ?`, jobID); err != nil {

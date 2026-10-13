@@ -2,149 +2,29 @@
 
 package appdata
 
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"syscall"
-)
+import "os"
 
-// secureEnsureDirectory creates and validates each component without ever
-// following a symlink. Existing managed components must remain directories
-// owned by the current user; this prevents stale links or replaced ancestors
-// from redirecting state, credentials, or embedded binaries elsewhere.
+// secureEnsureDirectory creates any missing component with mode 0700 and
+// follows symlinks like any other program would. The umask can only clear
+// bits, so every folder created here is owner-only. Folders that already
+// exist keep their owner and mode.
+//
+// There's deliberately no walk from / with Lstat, no refusal of symlinked or
+// foreign-owned ancestors, and no chmod of existing folders. Those checks
+// would only resist anyone with access to the computer (other local users or
+// software running on it), which Replicaro doesn't try to defend against, and
+// they break ordinary setups: /home linked to /var/home on ostree-based
+// Fedora, a dotfile-managed ~/.config or ~/.local, NFS homes that show up as
+// owned by nobody, and macOS's /var and /tmp, which are links into /private.
+// So app-data folder setup makes no ownership or link checks; what it guards
+// against is accidents. Deletion elsewhere uses os.Remove/os.RemoveAll, which
+// never follow links.
+//
+// Running Replicaro as root with a regular user's HOME (for example through
+// sudo) leaves root-owned folders in that user's home, and the user's own next
+// start then fails on them with permission errors. That's a known trade-off;
+// the fix is a chown of those folders back to the user. Don't add a guard for
+// it, or ancestor, link, or owner checks here, without a product decision.
 func secureEnsureDirectory(path string) error {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	managedRoot, err := managedRootForPath(abs)
-	if err != nil {
-		return err
-	}
-	volume := filepath.VolumeName(abs)
-	current := volume + string(filepath.Separator)
-	rel := abs
-	if volume != "" {
-		rel = abs[len(volume):]
-	}
-	for _, part := range splitPathComponents(rel) {
-		current = filepath.Join(current, part)
-		info, statErr := os.Lstat(current)
-		created := false
-		if os.IsNotExist(statErr) {
-			if err := os.Mkdir(current, 0o700); err != nil {
-				return fmt.Errorf("create managed directory %s: %w", current, err)
-			}
-			created = true
-			info, statErr = os.Lstat(current)
-		}
-		if statErr != nil {
-			return statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("managed directory ancestor is a symlink: %s", current)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("managed directory ancestor is not a directory: %s", current)
-		}
-		// System-owned ancestors (for example /home or /tmp) are expected;
-		// managed components may be owned by the user or root, but never an
-		// unrelated account.
-		if uid := fileOwner(info); uid >= 0 && uid != os.Geteuid() && uid != 0 {
-			return fmt.Errorf("managed directory %s has unexpected owner", current)
-		}
-		// Enforce the managed-directory mode on every reconciliation, including
-		// directories that predate this process. System-owned ancestors are not
-		// managed state and are left unchanged.
-		owner := fileOwner(info)
-		if pathWithin(managedRoot, current) && (created || owner == os.Geteuid()) && current != string(filepath.Separator) {
-			if err := os.Chmod(current, 0o700); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func managedRootForPath(path string) (string, error) {
-	stateRoot, err := rootDirectory()
-	if err != nil {
-		return "", err
-	}
-	stateRoot, err = filepath.Abs(stateRoot)
-	if err != nil {
-		return "", err
-	}
-	if pathWithin(stateRoot, path) {
-		return stateRoot, nil
-	}
-	// macOS cache data intentionally lives outside Application Support.
-	if home, homeErr := os.UserHomeDir(); homeErr == nil {
-		cacheRoot, cacheErr := filepath.Abs(filepath.Join(home, "Library", "Caches", "Replicaro"))
-		if cacheErr == nil && pathWithin(cacheRoot, path) {
-			return cacheRoot, nil
-		}
-	}
-	// Isolated callers still own the exact directory they asked us to secure.
-	return path, nil
-}
-
-func pathWithin(root, target string) bool {
-	rel, err := filepath.Rel(root, target)
-	return err == nil && rel != ".." && !filepath.IsAbs(rel) && (len(rel) < 3 || rel[:3] != ".."+string(filepath.Separator))
-}
-
-func validateManagedAncestors(path string) error {
-	root, err := rootDirectory()
-	if err != nil {
-		return err
-	}
-	root, _ = filepath.Abs(root)
-	target, _ := filepath.Abs(filepath.Dir(path))
-	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
-		return nil // AtomicReplace also serves isolated temporary test files.
-	}
-	current := root
-	for _, part := range splitPathComponents(rel) {
-		current = filepath.Join(current, part)
-		info, statErr := os.Lstat(current)
-		if statErr != nil {
-			return statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("managed path ancestor is unsafe: %s", current)
-		}
-		if uid := fileOwner(info); uid >= 0 && uid != os.Geteuid() && uid != 0 {
-			return fmt.Errorf("managed path ancestor has unexpected owner: %s", current)
-		}
-	}
-	return nil
-}
-
-func splitPathComponents(path string) []string {
-	parts := make([]string, 0)
-	clean := filepath.Clean(path)
-	for clean != "." && clean != string(filepath.Separator) {
-		base := filepath.Base(clean)
-		if base == string(filepath.Separator) || base == "." || base == "" {
-			break
-		}
-		parts = append([]string{base}, parts...)
-		parent := filepath.Dir(clean)
-		if parent == clean {
-			break
-		}
-		clean = parent
-	}
-	return parts
-}
-
-func fileOwner(info os.FileInfo) int {
-	// Sys() is platform-specific; Unix stat implementations expose Uid.
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		return int(stat.Uid)
-	}
-	return -1
+	return os.MkdirAll(path, 0o700)
 }

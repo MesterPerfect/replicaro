@@ -1,6 +1,9 @@
 // Storage types whose behavior is fixed by connector ID. Each list below
-// mirrors a fixed list in the backend; storageConnectors.test.ts reads those
-// backend lists from their Go sources and fails when the two drift apart.
+// mirrors a fixed list in the backend. A backend test reads this file
+// (api/frontend_connector_lists_test.go) and fails when the two drift apart,
+// so keep the lists in their current form: string literals, constants and
+// spread lists, plus object keys (plain or a bracketed constant, as in
+// limitedSpeedProviders) whose values are display names.
 
 export const RCLONE_REMOTE_CONNECTOR = "rclone_remote";
 
@@ -11,8 +14,7 @@ export const rcloneSignInConnectors: readonly string[] = ["dropbox", "google_dri
 
 // A vault keeps exactly one profile, so Connect reuses or takes over that
 // profile rather than offering Join or a choice of profiles
-// (automaticSoleProfileConnector in api/repository_recovery.go and
-// profilebinding/repair.go). WebDAV is not listed: it is an ordinary server
+// (models.SoleProfileConnector). WebDAV is not listed: it is an ordinary server
 // connector like SFTP and keeps Join and multiple profiles.
 export const singleProfileConnectors: readonly string[] = [...rcloneSignInConnectors, RCLONE_REMOTE_CONNECTOR];
 

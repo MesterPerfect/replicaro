@@ -158,67 +158,25 @@ func lockOperations(operationIDs []string) func() {
 	}
 }
 
-// StageNativeOutput copies stdout and stderr unchanged into owner-only
-// operation-log staging files without holding either stream in memory. It is
-// for display only: callers deliberately ignore its error so a failure to
-// save diagnostics never changes the operation's result.
-func StageNativeOutput(operationID, engine, kind, status, diagnostic string, stdout, stderr io.Reader) error {
+// StageNativeOutput takes over one native command's stdout and stderr
+// capture files (see command.CapturedOutputPublisher) and remembers them for
+// the operation's log. It does no file I/O: the files are appended to the log
+// unchanged when the step or operation is finalized, and deleted right after,
+// so each stream is written to disk once by the capture and once into the
+// log. Don't go back to copying them into a staging file here; that was a
+// third full write of every stream for nothing. It is for display only:
+// callers ignore its error, and a refused stage leaves the files with the
+// capture, which deletes them on Close.
+func StageNativeOutput(operationID, engine, kind, status, diagnostic, stdoutPath, stderrPath string) error {
 	if _, err := canonicalID(operationID); err != nil {
 		return err
 	}
 	if (engine != "restic" && engine != "kopia") || strings.TrimSpace(kind) == "" {
 		return fmt.Errorf("native operation-log stage is incomplete")
 	}
-	directory, err := operationLogDirectory()
-	if err != nil {
-		return err
+	if !filepath.IsAbs(stdoutPath) || !filepath.IsAbs(stderrPath) {
+		return fmt.Errorf("native operation-log stage needs both capture files")
 	}
-	stdoutFile, err := createStageFile(directory, operationID, kind, "stdout")
-	if err != nil {
-		return err
-	}
-	stdoutPath := stdoutFile.Name()
-	cleanup := func() {
-		_ = stdoutFile.Close()
-		_ = removeOperationLogFile(stdoutPath)
-	}
-	if _, err := io.Copy(stdoutFile, stdout); err != nil {
-		cleanup()
-		return err
-	}
-	if err := stdoutFile.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := stdoutFile.Close(); err != nil {
-		_ = removeOperationLogFile(stdoutPath)
-		return err
-	}
-
-	stderrFile, err := createStageFile(directory, operationID, kind, "stderr")
-	if err != nil {
-		_ = removeOperationLogFile(stdoutPath)
-		return err
-	}
-	stderrPath := stderrFile.Name()
-	if _, err := io.Copy(stderrFile, stderr); err != nil {
-		_ = stderrFile.Close()
-		_ = removeOperationLogFile(stdoutPath)
-		_ = removeOperationLogFile(stderrPath)
-		return err
-	}
-	if err := stderrFile.Sync(); err != nil {
-		_ = stderrFile.Close()
-		_ = removeOperationLogFile(stdoutPath)
-		_ = removeOperationLogFile(stderrPath)
-		return err
-	}
-	if err := stderrFile.Close(); err != nil {
-		_ = removeOperationLogFile(stdoutPath)
-		_ = removeOperationLogFile(stderrPath)
-		return err
-	}
-
 	stage := &nativeStage{operationID: operationID, engine: engine, kind: kind,
 		status: status, diagnostic: diagnostic,
 		stdoutPath: stdoutPath, stderrPath: stderrPath}
@@ -249,8 +207,11 @@ func removeOperationStagesLocked(operationID string) {
 }
 
 // CleanupStagedOutput removes only abandoned native-stream staging files after
-// the application has acquired its single-instance guard. It does not inspect
-// capacity, rotate logs, impose quotas, or adapt to available disk space.
+// the application has acquired its single-instance guard. Current versions no
+// longer write staging files into the logs folder (native output is staged in
+// place in the command-output folder), but keep this so leftovers from older
+// versions still go away. It does not inspect capacity, rotate logs, impose
+// quotas, or adapt to available disk space.
 func CleanupStagedOutput() error {
 	directory, err := operationLogDirectory()
 	if err != nil {

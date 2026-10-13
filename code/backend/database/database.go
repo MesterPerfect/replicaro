@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/local/replicaro/appdata"
 	_ "modernc.org/sqlite"
 )
 
@@ -27,79 +26,36 @@ func Open(path string) (*sql.DB, error) {
 }
 
 func openSQLiteWriter(path string) (*sql.DB, error) {
-	if runtime.GOOS != "windows" {
-		if directory := filepath.Dir(path); directory != "." {
-			if err := os.MkdirAll(directory, 0o700); err != nil {
-				return nil, err
-			}
-			// Validate all ancestors without following a stale symlink. The
-			// database path is a managed file and must not be redirected outside
-			// its intended directory tree.
-			current, _ := filepath.Abs(directory)
-			for {
-				info, statErr := os.Lstat(current)
-				if statErr != nil {
-					return nil, statErr
-				}
-				if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-					return nil, fmt.Errorf("database parent is not a real directory: %s", current)
-				}
-				if current == filepath.Dir(current) {
-					break
-				}
-				current = filepath.Dir(current)
-			}
-			if err := os.Chmod(directory, 0o700); err != nil {
-				return nil, err
-			}
-		}
-		if info, statErr := os.Lstat(path); statErr == nil {
-			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-				return nil, fmt.Errorf("database path must be a regular file")
-			}
-		} else if !os.IsNotExist(statErr) {
-			return nil, statErr
-		}
-		file, err := os.OpenFile(path, os.O_CREATE, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		if err := file.Close(); err != nil {
-			return nil, err
-		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			return nil, err
-		}
-	}
-	if runtime.GOOS == "windows" {
-		directory := filepath.Dir(path)
+	// The database is opened through whatever path the app-data root
+	// resolves to, symlinked folders included. There's deliberately no
+	// ancestor walk and no link refusal on the database or its -wal/-shm
+	// files. Those checks would only stop anyone with access to the
+	// computer (other local users or software running on it) from
+	// redirecting the files, which Replicaro doesn't try to defend
+	// against, and they break ordinary setups such as a symlinked /home
+	// or ~/.local. What matters for accidents is that a missing folder is
+	// created owner-only and the files are 0600. Don't add link checks
+	// back here without a product decision.
+	//
+	// On Windows the database lives under the application folder, so it and
+	// SQLite's -wal/-shm files inherit that folder's protected DACL when
+	// they're created. Nothing re-applies an ACL on open; that would only
+	// matter if someone changed it, which is the same tampering case.
+	if directory := filepath.Dir(path); directory != "." {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			return nil, err
 		}
-		if err := appdata.SecurePath(directory, true); err != nil {
-			return nil, err
-		}
-		file, err := os.OpenFile(path, os.O_CREATE, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		if err := file.Close(); err != nil {
-			return nil, err
-		}
-		if err := appdata.SecurePath(path, false); err != nil {
-			return nil, err
-		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
 	}
 	if runtime.GOOS != "windows" {
-		if info, err := os.Stat(path); err == nil && info.Mode().Perm() != 0o600 {
-			if err := os.Chmod(path, 0o600); err != nil {
-				return nil, err
-			}
-		}
-		for _, sidecar := range []string{path + "-wal", path + "-shm"} {
-			if info, statErr := os.Lstat(sidecar); statErr == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
-				return nil, fmt.Errorf("database sidecar path is unsafe")
-			}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return nil, err
 		}
 	}
 	absolutePath, err := filepath.Abs(path)
@@ -133,16 +89,13 @@ func openSQLiteWriter(path string) (*sql.DB, error) {
 		}
 	}
 	if runtime.GOOS != "windows" {
-		for _, sidecar := range []string{path, path + "-wal", path + "-shm"} {
-			if err := os.Chmod(sidecar, 0o600); err != nil && !os.IsNotExist(err) {
-				_ = db.Close()
-				return nil, err
-			}
+		base, err := sqliteSidecarBase(path)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
 		}
-	}
-	if runtime.GOOS == "windows" {
-		for _, sidecar := range []string{path, path + "-wal", path + "-shm"} {
-			if err := secureOptionalDatabaseFile(sidecar); err != nil {
+		for _, sidecar := range []string{path, base + "-wal", base + "-shm"} {
+			if err := os.Chmod(sidecar, 0o600); err != nil && !os.IsNotExist(err) {
 				_ = db.Close()
 				return nil, err
 			}
@@ -185,51 +138,50 @@ func OpenReadPool(path string) (*sql.DB, error) {
 	return readOnly, nil
 }
 
-func preflightExistingDatabase(path string) error {
-	info, err := os.Lstat(path)
+// sqliteSidecarBase returns the path SQLite names a database's -wal and -shm
+// files after. On Unix, SQLite resolves symlinks in the database path when it
+// opens it, so a database file that is itself a link keeps its sidecars next
+// to the link's target, not next to the link. Resolving the path the same way
+// keeps our pending-WAL checks and 0600 chmods on the files SQLite really
+// uses. Windows SQLite doesn't resolve links, and a path that doesn't exist
+// yet has nothing to resolve, so both keep the path as given.
+func sqliteSidecarBase(path string) (string, error) {
+	if runtime.GOOS == "windows" {
+		return path, nil
+	}
+	resolved, err := filepath.EvalSymlinks(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func preflightExistingDatabase(path string) error {
+	// os.Stat follows links on purpose; see openSQLiteWriter. The regular-file
+	// check is only there so a folder left at the database path fails with a
+	// clear message instead of an SQLite error.
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return preflightMissingDatabase(path)
 	}
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() {
 		return fmt.Errorf("database path must be a regular file")
 	}
-	if runtime.GOOS != "windows" {
-		if directory := filepath.Dir(path); directory != "." {
-			current, _ := filepath.Abs(directory)
-			for {
-				ancestor, statErr := os.Lstat(current)
-				if statErr != nil {
-					return statErr
-				}
-				if ancestor.Mode()&os.ModeSymlink != 0 || !ancestor.IsDir() {
-					return fmt.Errorf("database parent is not a real directory: %s", current)
-				}
-				if current == filepath.Dir(current) {
-					break
-				}
-				current = filepath.Dir(current)
-			}
-		}
+	base, err := sqliteSidecarBase(path)
+	if err != nil {
+		return err
 	}
-	hasPendingWAL := false
-	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
-		sidecarInfo, statErr := os.Lstat(sidecar)
-		if errors.Is(statErr, os.ErrNotExist) {
-			continue
-		}
-		if statErr != nil {
-			return statErr
-		}
-		if sidecarInfo.Mode()&os.ModeSymlink != 0 || !sidecarInfo.Mode().IsRegular() {
-			return fmt.Errorf("database sidecar path is unsafe")
-		}
-		if sidecar == path+"-wal" && sidecarInfo.Size() > 0 {
-			hasPendingWAL = true
-		}
+	walInfo, err := os.Stat(base + "-wal")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
+	hasPendingWAL := err == nil && walInfo.Size() > 0
 	if info.Size() == 0 {
 		if hasPendingWAL {
 			return ErrDatabaseResetRequired
@@ -248,27 +200,34 @@ func preflightExistingDatabase(path string) error {
 	}
 	readOnly.SetMaxOpenConns(1)
 	defer readOnly.Close()
+	return checkSchemaVersion(readOnly)
+}
 
-	var version int
-	if err := readOnly.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return err
-	}
-	if version == 0 {
-		var existing int
-		if err := readOnly.QueryRow(`SELECT COUNT(*) FROM sqlite_schema
-			WHERE name NOT GLOB 'sqlite_*'`).Scan(&existing); err != nil {
-			return err
-		}
-		if existing > 0 {
-			return ErrDatabaseResetRequired
-		}
+// preflightMissingDatabase refuses to create a new database next to a
+// leftover non-empty -wal file. Opening a new database there makes SQLite
+// discard that WAL, and it can hold changes that were never checkpointed into
+// the database file, for example after someone moved replicaro.db aside but
+// not its -wal and -shm files. Nothing is created or opened here, so the
+// files stay as they are until the user puts them back together.
+func preflightMissingDatabase(path string) error {
+	walInfo, err := os.Stat(path + "-wal")
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if version != CurrentSchemaVersion {
-		return fmt.Errorf("%w (found version %d, expected %d)",
-			ErrDatabaseResetRequired, version, CurrentSchemaVersion)
+	if err != nil {
+		return err
 	}
-	return nil
+	if walInfo.Size() == 0 {
+		return nil
+	}
+	name := filepath.Base(path)
+	directory := filepath.Dir(path)
+	if absolute, err := filepath.Abs(directory); err == nil {
+		directory = absolute
+	}
+	return fmt.Errorf("%s is missing, but its %s-wal file is still in %s. It may hold recent changes. "+
+		"Move %s-wal and %s-shm to the same place as %s, or put %s back, then start Replicaro again.",
+		name, name, directory, name, name, name, name)
 }
 
 func sqliteReadOnlyDSN(absolutePath, goos string) string {
@@ -312,10 +271,16 @@ func sqliteReadPoolDSN(absolutePath, goos string) (string, error) {
 	return parsed.String(), nil
 }
 
-func secureOptionalDatabaseFile(path string) error {
-	err := appdata.SecurePath(path, false)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+// closeRows ends a rows.Next loop. Next returns false both at the end of the
+// result set and when reading the next row failed (a SQLite I/O error part-way
+// through, for example), and Close reports neither: the read error is only
+// available from rows.Err. Callers use this instead of a bare rows.Close so a
+// failed read can't pass for a shorter, complete result. That matters most
+// where the list decides what gets deleted or rewritten next.
+func closeRows(rows *sql.Rows) error {
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
 	}
-	return nil
+	return rows.Close()
 }

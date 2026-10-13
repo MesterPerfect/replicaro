@@ -22,10 +22,6 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/api/cors.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/api/directories.go",
       "mode": "100644"
     },
@@ -162,6 +158,18 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/appdata/executable.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/open_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/open_windows.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/appdata/path_other.go",
       "mode": "100644"
     },
@@ -206,14 +214,6 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/command/captured_output_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/command/captured_output_windows.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/command/command.go",
       "mode": "100644"
     },
@@ -226,23 +226,15 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/command/command_deathsig_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_deathsig_other.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/command/command_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/command/command_pipe_linux.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/command/command_pipe_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/command/command_reap_linux.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/command/command_reap_other.go",
       "mode": "100644"
     },
     {
@@ -307,6 +299,10 @@
     },
     {
       "path": "code/backend/database/dashboard.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/dashboard_timeline.go",
       "mode": "100644"
     },
     {
@@ -427,10 +423,6 @@
     },
     {
       "path": "code/backend/database/settings.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/database/settings_helpers.go",
       "mode": "100644"
     },
     {
@@ -672,27 +664,11 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/engines/mount_boundary_linux.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/mount_boundary_mountpoint_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/mount_boundary_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/mount_boundary_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/mount_boundary_windows.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/engines/options.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/out_of_space.go",
       "mode": "100644"
     },
     {
@@ -712,27 +688,15 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/engines/rclone_authorization_browser_environment_linux.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_authorization_browser_environment_other.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/engines/rclone_config_activation.go",
       "mode": "100644"
     },
     {
-      "path": "code/backend/engines/rclone_config_activation_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_config_activation_windows.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/engines/rclone_native.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_private_config.go",
       "mode": "100644"
     },
     {
@@ -760,27 +724,7 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/engines/rclone_session_case.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_session_path.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_session_path_windows.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/engines/rclone_session_remove.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_session_remove_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_session_remove_windows.go",
       "mode": "100644"
     },
     {
@@ -788,23 +732,7 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/engines/rclone_vault_config_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/rclone_vault_config_windows.go",
-      "mode": "100644"
-    },
-    {
       "path": "code/backend/engines/registry.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/reparse_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/engines/reparse_windows.go",
       "mode": "100644"
     },
     {
@@ -1020,6 +948,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/models/marker_files.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/models/operation.go",
       "mode": "100644"
     },
@@ -1048,11 +980,7 @@
       "mode": "100644"
     },
     {
-      "path": "code/backend/operationlog/file_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/operationlog/file_windows.go",
+      "path": "code/backend/operationlog/file.go",
       "mode": "100644"
     },
     {
@@ -1137,15 +1065,15 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/rendezvous/process_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rendezvous/process_windows.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/rendezvous/rendezvous.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/rendezvous/security_other.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/rendezvous/security_windows.go",
       "mode": "100644"
     },
     {
@@ -1165,6 +1093,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/runner/password_change_recovery.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/runner/repository_relocation.go",
       "mode": "100644"
     },
@@ -1178,10 +1110,6 @@
     },
     {
       "path": "code/backend/runtimeendpoint/address_windows.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/runtimeendpoint/client_uuid.go",
       "mode": "100644"
     },
     {
@@ -1206,6 +1134,18 @@
     },
     {
       "path": "code/backend/schedulevalue/schedule.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/startup_log.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/startup_log_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/startup_log_windows.go",
       "mode": "100644"
     },
     {
@@ -1242,14 +1182,6 @@
     },
     {
       "path": "code/backend/storagehelper/runner.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/storagehelper/security_unix.go",
-      "mode": "100644"
-    },
-    {
-      "path": "code/backend/storagehelper/security_windows.go",
       "mode": "100644"
     },
     {
@@ -1321,6 +1253,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/tzdata_linux.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/vaultidentity/identity.go",
       "mode": "100644"
     },
@@ -1337,6 +1273,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/vaultprofile/kopia_format.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/vaultprofile/password_rotation.go",
       "mode": "100644"
     },
@@ -1346,6 +1286,10 @@
     },
     {
       "path": "code/backend/vaultprofile/password_rotation_fs_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/password_rotation_record.go",
       "mode": "100644"
     },
     {
@@ -1645,11 +1589,19 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/public/locales/yue-Hans.json",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/public/locales/yue-Hant.json",
       "mode": "100644"
     },
     {
       "path": "code/frontend/public/locales/zh-Hans.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/zh-Hant.json",
       "mode": "100644"
     },
     {
@@ -1745,6 +1697,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/src/components/MarkerFileFields.tsx",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/src/components/MetadataIndexNotice.tsx",
       "mode": "100644"
     },
@@ -1754,6 +1710,10 @@
     },
     {
       "path": "code/frontend/src/components/UpdateJobSourceDialog.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/markerFileName.ts",
       "mode": "100644"
     },
     {

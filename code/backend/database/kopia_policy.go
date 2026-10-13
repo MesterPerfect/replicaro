@@ -5,16 +5,88 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
 )
 
 var ErrKopiaPolicyNotReady = errors.New("Kopia policy reconciliation is not ready")
 var ErrKopiaPolicyRetryUnavailable = errors.New("Kopia policy reconciliation is not in an error state")
+
+// ErrKopiaPolicyFenceHeld means the process of an earlier policy application
+// still holds its fence, so no new policy command may start yet.
+var ErrKopiaPolicyFenceHeld = errors.New("prior Kopia policy process is not proven inactive")
+
+// KopiaPolicyStuckAfter is how long the process of an earlier policy
+// application may keep its fence before the vault gets a dashboard issue. It
+// matches the reconnect escalation, which leaves a held fence out on purpose:
+// a stuck process is not something reconnecting fixes.
+const KopiaPolicyStuckAfter = 6 * time.Hour
+
+// StuckKopiaPolicy is a Kopia vault whose policy application is parked
+// behind a fence the earlier process has held for KopiaPolicyStuckAfter.
+type StuckKopiaPolicy struct {
+	RepositoryID string
+	Name         string
+	// StuckAt is when the fence had been held for KopiaPolicyStuckAfter.
+	StuckAt time.Time
+}
+
+// kopiaPolicyFenceInactive is replaced in tests.
+var kopiaPolicyFenceInactive = command.NativeProcessFenceInactive
+
+// StuckKopiaPolicies lists the Kopia vaults whose policy reconciler found the
+// earlier policy process still holding its fence (ErrKopiaPolicyFenceHeld)
+// and whose fence has been held for more than KopiaPolicyStuckAfter. The age
+// comes from the fence file, which is created when the process starts, so no
+// extra state is kept. The fence is checked again here, so the issue goes away
+// as soon as the process ends, before the reconciler's next retry clears the
+// row. A fence that can't be read or checked is left out.
+func StuckKopiaPolicies(db queryer, now time.Time) ([]StuckKopiaPolicy, error) {
+	rows, err := db.Query(`SELECT k.repository_id, r.name, k.active_fence_path
+		FROM kopia_policy_state k JOIN repositories r ON r.id = k.repository_id
+		WHERE k.state = 'error' AND k.active_fence_path != '' AND k.last_error = ?
+		ORDER BY k.repository_id`, ErrKopiaPolicyFenceHeld.Error())
+	if err != nil {
+		return nil, err
+	}
+	type held struct{ id, name, fence string }
+	var candidates []held
+	for rows.Next() {
+		var row held
+		if err := rows.Scan(&row.id, &row.name, &row.fence); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		candidates = append(candidates, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	var stuck []StuckKopiaPolicy
+	for _, row := range candidates {
+		info, err := os.Stat(row.fence)
+		if err != nil || now.Sub(info.ModTime()) <= KopiaPolicyStuckAfter {
+			continue
+		}
+		if inactive, err := kopiaPolicyFenceInactive(row.fence); err != nil || inactive {
+			continue
+		}
+		stuck = append(stuck, StuckKopiaPolicy{
+			RepositoryID: row.id, Name: row.name, StuckAt: info.ModTime().Add(KopiaPolicyStuckAfter),
+		})
+	}
+	return stuck, nil
+}
 
 type KopiaPolicyState struct {
 	RepositoryID     string
@@ -43,7 +115,8 @@ func DeriveKopiaPolicyDesired(db queryer, repositoryID string) (engines.KopiaMan
 	}
 	rows, err := db.Query(`
 		SELECT j.id,j.source,j.excludes,j.retention,j.retention_hourly,
-		       j.retention_daily,j.retention_weekly,j.retention_monthly,j.retention_yearly
+		       j.retention_daily,j.retention_weekly,j.retention_monthly,j.retention_yearly,
+		       j.skip_nobackup_folders,j.skip_marker_file_name
 		FROM backup_jobs j
 		JOIN backup_job_targets t ON t.job_id=j.id
 		WHERE t.repository_id=?
@@ -63,12 +136,23 @@ func DeriveKopiaPolicyDesired(db queryer, repositoryID string) (engines.KopiaMan
 	desired := engines.KopiaManagedPolicyDesiredState{Version: 1,
 		MaintenanceSchedule: maintenanceSchedule, ObjectLock: objectLock}
 	for rows.Next() {
-		var jobUUID, source, exclusions string
+		var jobUUID, source, exclusions, markerName string
 		var latest int
 		var hourly, daily, weekly, monthly, yearly sql.NullInt64
+		var skipNoBackup bool
 		if err := rows.Scan(&jobUUID, &source, &exclusions, &latest, &hourly,
-			&daily, &weekly, &monthly, &yearly); err != nil {
+			&daily, &weekly, &monthly, &yearly, &skipNoBackup, &markerName); err != nil {
 			return engines.KopiaManagedPolicyDesiredState{}, err
+		}
+		// .kopiaignore is always listed (the box is locked on for Kopia
+		// vaults), and the CACHEDIR.TAG box needs nothing here: every managed
+		// job policy sets ignoreCacheDirs.
+		dotIgnore := []string{models.KopiaIgnoreFileName}
+		if skipNoBackup {
+			dotIgnore = append(dotIgnore, models.NoBackupMarkerFile)
+		}
+		if markerName != "" {
+			dotIgnore = append(dotIgnore, markerName)
 		}
 		value := func(field sql.NullInt64) int {
 			if latest == 0 || !field.Valid {
@@ -77,7 +161,7 @@ func DeriveKopiaPolicyDesired(db queryer, repositoryID string) (engines.KopiaMan
 			return int(field.Int64)
 		}
 		desired.Sources = append(desired.Sources, engines.KopiaManagedPolicySource{
-			JobUUID: jobUUID, Source: source, Excludes: strings.Split(exclusions, "\n"),
+			JobUUID: jobUUID, Source: source, Excludes: strings.Split(exclusions, "\n"), DotIgnore: dotIgnore,
 			KeepLatest: latest, KeepHourly: value(hourly), KeepDaily: value(daily),
 			KeepWeekly: value(weekly), KeepMonthly: value(monthly), KeepAnnual: value(yearly),
 		})
@@ -162,7 +246,7 @@ func MarkAllKopiaPoliciesVerificationRequired(db *sql.DB) ([]string, error) {
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	for _, id := range ids {
@@ -333,6 +417,35 @@ func MarkKopiaPolicyFenceCleanupError(
 	return nil
 }
 
+// MarkKopiaPolicyErrorKeepingFence records an error on a row that still
+// carries the fence of an earlier policy application: that process still
+// holds the fence, or the reconciliation that should check it failed before
+// it could (the vault lock or the vault check failed). The row keeps the
+// fence, like a fence cleanup error, so the reconciler's retry backoff
+// decides when to look again and the retry reopens it as applying to check
+// the same fence.
+func MarkKopiaPolicyErrorKeepingFence(
+	db *sql.DB,
+	repositoryID, desiredDigest, fencePath string,
+	cause error,
+) error {
+	if cause == nil || fencePath == "" {
+		return fmt.Errorf("Kopia fence-keeping error record is incomplete")
+	}
+	result, err := db.Exec(`UPDATE kopia_policy_state
+		SET state='error',applied_digest='',last_error=?
+		WHERE repository_id=? AND desired_digest=? AND active_fence_path=?
+			AND state IN ('applying','dirty','error')`,
+		cause.Error(), repositoryID, desiredDigest, fencePath)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("%w: policy state changed before the fence-keeping error was recorded", ErrKopiaPolicyNotReady)
+	}
+	return nil
+}
+
 func FinishKopiaPolicyApplication(
 	db *sql.DB,
 	repositoryID, desiredDigest string,
@@ -431,23 +544,6 @@ func retryKopiaPolicyForRepositoryTx(tx *sql.Tx, repositoryID string) error {
 		return ErrKopiaPolicyRetryUnavailable
 	}
 	return nil
-}
-
-func ListKopiaRepositories(db *sql.DB) ([]string, error) {
-	rows, err := db.Query(`SELECT id FROM repositories WHERE engine='kopia' ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		result = append(result, id)
-	}
-	return result, rows.Err()
 }
 
 func uniqueSorted(values []string) []string {

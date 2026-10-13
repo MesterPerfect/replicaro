@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,19 @@ const (
 )
 
 var ErrHelperStart = errors.New("storage helper process could not start")
+
+// ErrHelperSlotsExhausted means a probe never got a helper slot because
+// helpers that already timed out still hold slots while the OS finishes them.
+// It says nothing about the storage this probe was asked about.
+var ErrHelperSlotsExhausted = errors.New("storage helper slots are held by helpers that stopped responding")
+
+// mountResponsiveWindow is how long after a helper on a mount answered that
+// further helpers on that mount may run side by side. Outside it, helpers on
+// one mount run one at a time, so a mount that stopped responding catches only
+// one helper instead of every concurrent probe of it. The window only needs to
+// cover the gap between probes in a burst, such as many backups starting at
+// once, which keeps those probes running in parallel.
+const mountResponsiveWindow = 2 * time.Second
 
 // ServeHelper reads one probe request, performs it, and writes one response.
 // Storage that cannot be observed is a normal response (access "missing",
@@ -55,6 +69,15 @@ func ServeHelper(reader io.Reader, writer io.Writer, maxInput, maxOutput int64) 
 	return nil
 }
 
+// ProcessRunner launches one helper process per probe. A helper holds one of
+// the live slots until the OS has reaped it, which bounds the number of helper
+// processes even when some are stuck in a network filesystem call that the OS
+// doesn't let them leave. Helpers are also counted per mount (the recorded
+// mount point, or the path when none is recorded), and a mount with a
+// timed-out helper that is still running gets no new helper until that one is
+// gone. Together with mountResponsiveWindow, this normally keeps a mount that
+// stops answering to one slot, so it can't stop the checks of every other
+// drive or share.
 type ProcessRunner struct {
 	Executable string
 	Args       []string
@@ -63,6 +86,46 @@ type ProcessRunner struct {
 	MaxOutput  int64
 	live       chan struct{}
 	newProcess func([]byte, io.Writer, io.Writer) helperProcess
+
+	mu sync.Mutex
+	// mounts keeps one small entry per mount or path ever probed, which is
+	// bounded by the storage the user has configured.
+	mounts map[string]*mountHelpers
+	// stuck counts helpers past their deadline that the OS hasn't reaped yet.
+	stuck int
+}
+
+type mountHelpers struct {
+	running         int // helpers started on this mount and not yet reaped
+	stuck           int // of those, the ones past their deadline
+	responsiveUntil time.Time
+	// changed is closed and replaced whenever the counts or the window
+	// change, to wake probes waiting for this mount.
+	changed chan struct{}
+}
+
+// helperLaunch is one helper's place in the mount and slot accounting. Its
+// fields are guarded by ProcessRunner.mu.
+type helperLaunch struct {
+	mount    *mountHelpers
+	timedOut bool
+	reaped   bool
+}
+
+// mountKey spells a Windows drive or share the way SameMountPoint compares
+// them, so \\NAS\Photos, \\nas\photos\ and \\?\UNC\nas\photos share one entry.
+func mountKey(request HelperRequest) string {
+	if request.MountPoint != "" {
+		return "mount:" + helperMountSpelling(request.MountPoint)
+	}
+	return "path:" + helperMountSpelling(request.Path)
+}
+
+func helperMountSpelling(value string) string {
+	if windowsShapedMount(value) {
+		return windowsMountKey(value)
+	}
+	return value
 }
 
 func NewProcessRunner(executable string, args []string, timeout time.Duration, maxConcurrent int) (*ProcessRunner, error) {
@@ -74,6 +137,7 @@ func NewProcessRunner(executable string, args []string, timeout time.Duration, m
 		MaxInput: DefaultMaxInput, MaxOutput: DefaultMaxOutput,
 		live: make(chan struct{}, maxConcurrent),
 	}
+	runner.mounts = make(map[string]*mountHelpers)
 	runner.newProcess = func(input []byte, stdout, stderr io.Writer) helperProcess {
 		command := exec.Command(runner.Executable, runner.Args...)
 		configureStorageHelperCommand(command)
@@ -107,10 +171,9 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 	if err := deadlineContext.Err(); err != nil {
 		return HelperResponse{}, err
 	}
-	select {
-	case runner.live <- struct{}{}:
-	case <-deadlineContext.Done():
-		return HelperResponse{}, deadlineContext.Err()
+	launch, err := runner.acquire(deadlineContext, mountKey(request))
+	if err != nil {
+		return HelperResponse{}, err
 	}
 	maxOutput := runner.MaxOutput
 	if maxOutput <= 0 {
@@ -120,17 +183,17 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 	stderr := &boundedBuffer{limit: maxOutput}
 	process := runner.newProcess(encoded, stdout, stderr)
 	if process == nil {
-		<-runner.live
+		runner.release(launch, false)
 		return HelperResponse{}, fmt.Errorf("create storage helper process")
 	}
 	if err := process.Start(); err != nil {
-		<-runner.live
+		runner.release(launch, false)
 		return HelperResponse{}, fmt.Errorf("%w: %w", ErrHelperStart, err)
 	}
 	waited := make(chan error, 1)
 	go func() {
 		err := process.Wait()
-		<-runner.live
+		runner.release(launch, true)
 		waited <- err
 	}()
 	select {
@@ -142,6 +205,10 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 			return HelperResponse{}, fmt.Errorf("storage helper failed")
 		}
 	case <-deadlineContext.Done():
+		// Counted as timed out whether the deadline passed or the caller
+		// cancelled: either way nothing waits for this helper any more, and
+		// if the kill doesn't end it, its mount isn't answering.
+		runner.markTimedOut(launch)
 		_ = process.Kill()
 		// Wait continues in the bounded live-helper goroutine. The caller
 		// returns at its deadline, while the live slot remains held until the
@@ -160,6 +227,110 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 		return HelperResponse{}, err
 	}
 	return response, nil
+}
+
+// acquire waits until a helper may start for the mount and then takes a live
+// slot. Waiting for the mount ends with the context's error, because only that
+// mount's own helper is holding things up; the storage behind it may be the
+// problem. Waiting for a slot while timed-out helpers hold slots ends with
+// ErrHelperSlotsExhausted instead, because the stuck storage is elsewhere.
+func (runner *ProcessRunner) acquire(ctx context.Context, key string) (*helperLaunch, error) {
+	for {
+		if err := runner.waitForMount(ctx, key); err != nil {
+			return nil, err
+		}
+		select {
+		case runner.live <- struct{}{}:
+		case <-ctx.Done():
+			runner.mu.Lock()
+			stuckElsewhere := runner.stuck > runner.mountLocked(key).stuck
+			runner.mu.Unlock()
+			if stuckElsewhere && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrHelperSlotsExhausted
+			}
+			return nil, ctx.Err()
+		}
+		// Another probe of the same mount may have started, or a helper there
+		// may have timed out, while this one waited for a slot.
+		runner.mu.Lock()
+		mount := runner.mountLocked(key)
+		if mountAcceptsHelperLocked(mount, time.Now()) {
+			mount.running++
+			runner.mu.Unlock()
+			return &helperLaunch{mount: mount}, nil
+		}
+		runner.mu.Unlock()
+		<-runner.live
+	}
+}
+
+func (runner *ProcessRunner) waitForMount(ctx context.Context, key string) error {
+	for {
+		runner.mu.Lock()
+		mount := runner.mountLocked(key)
+		if mountAcceptsHelperLocked(mount, time.Now()) {
+			runner.mu.Unlock()
+			return nil
+		}
+		// Only a helper on this mount finishing, timing out or being reaped
+		// can let this probe start; the window closing never does.
+		changed := mount.changed
+		runner.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func mountAcceptsHelperLocked(mount *mountHelpers, now time.Time) bool {
+	return mount.stuck == 0 && (mount.running == 0 || now.Before(mount.responsiveUntil))
+}
+
+func (runner *ProcessRunner) mountLocked(key string) *mountHelpers {
+	mount := runner.mounts[key]
+	if mount == nil {
+		mount = &mountHelpers{changed: make(chan struct{})}
+		runner.mounts[key] = mount
+	}
+	return mount
+}
+
+func (mount *mountHelpers) signalLocked() {
+	close(mount.changed)
+	mount.changed = make(chan struct{})
+}
+
+func (runner *ProcessRunner) markTimedOut(launch *helperLaunch) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if launch.reaped || launch.timedOut {
+		return
+	}
+	launch.timedOut = true
+	launch.mount.stuck++
+	launch.mount.responsiveUntil = time.Time{}
+	runner.stuck++
+	launch.mount.signalLocked()
+}
+
+// release runs once the helper is reaped, or right away when it never
+// started, and frees its mount place and live slot. exited says the helper ran
+// and exited; one that did so before its deadline shows the mount answers.
+func (runner *ProcessRunner) release(launch *helperLaunch, exited bool) {
+	runner.mu.Lock()
+	launch.reaped = true
+	launch.mount.running--
+	if launch.timedOut {
+		launch.mount.stuck--
+		runner.stuck--
+	} else if exited {
+		launch.mount.responsiveUntil = time.Now().Add(mountResponsiveWindow)
+	}
+	launch.mount.signalLocked()
+	runner.mu.Unlock()
+	<-runner.live
 }
 
 type helperProcess interface {

@@ -160,8 +160,6 @@ func capabilitiesFor(id string) Capabilities {
 	return base
 }
 
-type RepositoryAvailabilityCheck func(context.Context, models.Repository) error
-
 func ValidateRestoreCapability(descriptor Descriptor, options RestoreOptions) error {
 	capability := descriptor.Capabilities.Restore
 	if !capability.FullSnapshot {
@@ -196,8 +194,15 @@ type BackupOptions struct {
 	// actual filesystem input is a freshly verified local alias.
 	LogicalSource string
 	Excludes      []string
-	Verify        bool
-	Settings      models.EngineJobSettings
+	// Marker files whose folders' contents Restic skips (see
+	// models.BackupJob). SkipCacheDirFolders is the effective value, already
+	// forced on for a job with a Kopia vault. Kopia takes the same choices
+	// from its managed job policy instead.
+	SkipNoBackupFolders bool
+	SkipCacheDirFolders bool
+	SkipMarkerFileName  string
+	Verify              bool
+	Settings            models.EngineJobSettings
 	// FullSourceRead asks the engine to read every source file instead of
 	// trusting metadata matches against earlier snapshots. The runner sets it
 	// after the job's source alias changed, and for a new (job, vault) pair
@@ -234,7 +239,6 @@ func ApplyNativeRetention(ctx context.Context, engine Engine, repo models.Reposi
 		if repo.Engine != ResticID {
 			return "", fmt.Errorf("%w: separate native retention is unavailable for %s", ErrUnsupported, repo.Engine)
 		}
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 		if err := public.autoUnlockRestic(ctx, repo); err != nil {
 			return "", resticPreparationFailure(err)
 		}

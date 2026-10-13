@@ -186,8 +186,11 @@ function RcloneAuthorizationForProvider({
 		<section className="advanced-panel rclone-authorization">
 			<div className="modal-section-label">{t("ui.rclone.accountTitle", { provider: label })}</div>
 			{showDescription && <p>{renderMessage("ui.rclone.authorizationDescription", { provider: label, rcloneLink: <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">{t("ui.components.rcloneauthorization.rclone")}</a> })}</p>}
-			{busy && <div className="inline-notice" role="status">
-				<span className="spinner" /> {t("ui.rclone.finishInBrowser")}
+			{/* Sending the OneDrive location answer has no browser step, so the
+			    browser notice would send the user looking for a page that isn't
+			    there. The Continue button shows its own spinner meanwhile. */}
+			{busy && value?.question?.id !== "config_driveid" && <div className="inline-notice" role="status">
+				<span className="spinner" /> {t("ui.components.rcloneauthorization.finish.authorization.in.the.browser.then.return.to.replicaro")}
 			</div>}
 			{value?.status === "waiting_browser" && authorizationUrl && <div className="inline-notice" role="status">
 				<a href={authorizationUrl} target="_blank" rel="noreferrer">
@@ -198,8 +201,6 @@ function RcloneAuthorizationForProvider({
 			{value?.status === "ready" && <div className="inline-notice" role="status">
 				{readyAction === "create vault" ? t("ui.rclone.readyCreateVault") : readyAction === "check existing vault" ? t("ui.rclone.readyCheckVault") : t("ui.rclone.readySaveLogin")}
 			</div>}
-			{value?.status === "question" && value.question?.notice &&
-				<div className="inline-error" role="alert">{value.question.notice}</div>}
 			{value?.status === "question" && value.question && <label className="field">
 				<span>{value.question.prompt || t("ui.rclone.chooseNativeOption")}</span>
 				<select

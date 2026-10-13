@@ -21,7 +21,11 @@ var coordinateScheduledAdmission = database.CoordinateScheduledAdmission
 var admitPersistedOperations = runner.AdmitPersistedOperations
 var dueRepositoryChecks = database.DueRepositoryChecks
 var dueRepositoryMaintenance = database.DueRepositoryMaintenance
+var pruneLogs = database.PruneActivity
 
+// unavailableCatchUpInterval stays equal to
+// database.UnavailableStorageRecheckInterval, which the clock-jump check uses
+// so it does not pull a deferred short-interval run back early.
 const unavailableCatchUpInterval = 5 * time.Minute
 
 func catchUpEligible(item database.PendingCatchUp, now time.Time) bool {
@@ -45,7 +49,10 @@ func catchUpEligible(item database.PendingCatchUp, now time.Time) bool {
 			latest = parsed
 		}
 	}
-	return latest.IsZero() || !now.Before(latest.Add(unavailableCatchUpInterval))
+	// A check dated after now was made while the clock ran ahead. Recheck
+	// at once; waiting for that date could hold the catch-up back for as
+	// long as the clock was off.
+	return latest.IsZero() || latest.After(now) || !now.Before(latest.Add(unavailableCatchUpInterval))
 }
 
 func CheckDueJobs(db *sql.DB) {
@@ -82,7 +89,9 @@ func CheckDueJobsContext(ctx context.Context, db *sql.DB, coordinator *repositor
 		}
 	}
 	for _, item := range pending {
-		if !catchUpEligible(item, selectionNow) {
+		// A disabled job keeps its pending catch-up for when it is enabled
+		// again; its source and vaults are not probed meanwhile.
+		if !item.JobEnabled || !catchUpEligible(item, selectionNow) {
 			continue
 		}
 		if pendingTargets[item.JobID] == nil {
@@ -185,6 +194,8 @@ func CheckDueJobsContext(ctx context.Context, db *sql.DB, coordinator *repositor
 	settings, err := database.GetSettings(db)
 
 	if err == nil {
-		_ = database.PruneActivity(db, settings.LogRetentionDays)
+		if err := pruneLogs(db, settings.LogRetentionDays); err != nil {
+			log.Println("scheduler log retention:", err)
+		}
 	}
 }

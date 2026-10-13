@@ -90,6 +90,30 @@ func validPendingRotationName(name string) bool {
 	return err == nil && parsed.String() == name[index+len(marker):]
 }
 
+// pendingPartialUploadBase returns the pending object name that a partial
+// upload belongs to. On backends with partial uploads (local disks and SFTP,
+// for example) rclone writes an upload to "<name>.<8 hex digits>.partial" and
+// renames it to <name> only once the upload is complete. The file stays behind
+// when rclone can't run its own cleanup: a hard kill (TerminateJobObject on
+// Windows, SIGKILL after the grace period elsewhere), a crash, or a lost
+// connection. On Unix the normal cancel sends SIGTERM first, and rclone then
+// removes the partial itself. A partial is never a committed object, so
+// password-change cleanup deletes it without reading it. Any other unexpected
+// name still fails the password change.
+func pendingPartialUploadBase(name string) (string, bool) {
+	trimmed, found := strings.CutSuffix(name, ".partial")
+	if !found || len(trimmed) < 9 || trimmed[len(trimmed)-9] != '.' {
+		return "", false
+	}
+	for _, digit := range trimmed[len(trimmed)-8:] {
+		if (digit < '0' || digit > '9') && (digit < 'a' || digit > 'f') {
+			return "", false
+		}
+	}
+	base := trimmed[:len(trimmed)-9]
+	return base, validPendingRotationName(base)
+}
+
 // CapturePasswordRotationInventory decrypts only the bounded protected root,
 // authoritative profiles and their retained fallbacks. It never enumerates or
 // stages native repository payload.
@@ -110,7 +134,7 @@ func (s Store) CapturePasswordRotationInventory(ctx context.Context, operationUU
 	profiles := map[string]bool{}
 	for name := range objects {
 		if strings.Contains(name, ".pending.") {
-			if !validPendingRotationName(name) {
+			if _, partial := pendingPartialUploadBase(name); !partial && !validPendingRotationName(name) {
 				return inventory, fmt.Errorf("protected metadata contains an invalid pending object")
 			}
 			inventory.Pending = append(inventory.Pending, name)
@@ -254,9 +278,6 @@ func (s Store) writePasswordRotationObject(ctx context.Context, session *storeSe
 	}
 	err = errors.Join(err, file.Close())
 	if err != nil {
-		return err
-	}
-	if err = validatePasswordRotationFile(localPath); err != nil {
 		return err
 	}
 	// Best-effort removal here reduces plaintext lifetime, but the derived
@@ -440,10 +461,17 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 	}
 	defer finishStoreSession(ctx, session, &err)
 	for _, name := range inventory.Pending {
-		if exactOperationOnly && !allowed[name] {
+		// A partial upload holds incomplete ciphertext, so it is removed
+		// without the read-back below. Rollback removes the partial uploads
+		// of its own pending names as well.
+		pendingName, partial := pendingPartialUploadBase(name)
+		if !partial {
+			pendingName = name
+		}
+		if exactOperationOnly && !allowed[pendingName] {
 			continue
 		}
-		if !validPendingRotationName(name) {
+		if !validPendingRotationName(pendingName) {
 			return fmt.Errorf("invalid pending protected object")
 		}
 		before, exists, statErr := statObject(ctx, session, sidecarRemote+name)
@@ -453,21 +481,36 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 		if !exists {
 			continue
 		}
-		scoped, scopeErr := rotationStoreForObject(s, name)
-		if scopeErr != nil {
-			return scopeErr
-		}
-		beforeData, readErr := scoped.readObject(ctx, session, name, before)
-		if readErr != nil {
-			return fmt.Errorf("revalidate pending protected object before cleanup: %w", readErr)
-		}
-		after, exists, statErr := statObject(ctx, session, sidecarRemote+name)
-		if statErr != nil || !exists || before.Size != after.Size || before.Path != after.Path {
-			return fmt.Errorf("pending protected object changed before cleanup")
-		}
-		afterData, readErr := scoped.readObject(ctx, session, name, after)
-		if readErr != nil || !bytesEqual(beforeData, afterData) {
-			return fmt.Errorf("pending protected object changed before cleanup")
+		if !partial {
+			scoped, scopeErr := rotationStoreForObject(s, name)
+			if scopeErr != nil {
+				return scopeErr
+			}
+			beforeData, readErr := scoped.readObject(ctx, session, name, before)
+			if readErr != nil {
+				if !pendingObjectContentInvalid(before, readErr) {
+					return fmt.Errorf("revalidate pending protected object before cleanup: %w", readErr)
+				}
+				// Rollback only reaches names derived from its own operation
+				// UUID, which no other computer writes, so a damaged one is
+				// this change's own cut-off upload and goes at once. Waiting
+				// would hold a resumed rollback back for half an hour behind
+				// a busy error that blames another computer.
+				if !exactOperationOnly {
+					if err := requireAbandonedPendingObject(before, time.Now()); err != nil {
+						return err
+					}
+				}
+			} else {
+				after, exists, statErr := statObject(ctx, session, sidecarRemote+name)
+				if statErr != nil || !exists || before.Size != after.Size || before.Path != after.Path {
+					return fmt.Errorf("pending protected object changed before cleanup")
+				}
+				afterData, readErr := scoped.readObject(ctx, session, name, after)
+				if readErr != nil || !bytesEqual(beforeData, afterData) {
+					return fmt.Errorf("pending protected object changed before cleanup")
+				}
+			}
 		}
 		if _, err := session.run(ctx, "deletefile", sidecarRemote+name); err != nil {
 			return err
@@ -477,6 +520,50 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 		}
 	}
 	return passwordRotationFault("pending_cleanup_completed")
+}
+
+// ErrPasswordChangeVaultBusy refuses a password change while a pending
+// object it can't read was written too recently to be a leftover.
+var ErrPasswordChangeVaultBusy = errors.New("Another computer may be changing this vault right now. Try again in a few minutes.")
+
+// abandonedPendingObjectAge is how long a pending object whose contents fail
+// their check must stay unchanged before password-change cleanup treats it as
+// a leftover.
+const abandonedPendingObjectAge = 30 * time.Minute
+
+// pendingObjectContentInvalid reports whether a pending object's contents
+// fail rclone crypt's own check. Pending names carry no checksum (the suffix
+// is a UUID derived from the operation), so the check is the one crypt keeps
+// with every block: a truncated or otherwise damaged object fails its
+// authentication, and one too short to hold crypt's header lists with no
+// plaintext size at all. Some WebDAV servers leave such an object under the
+// real pending name, instead of a .partial, when an upload is cut off. An
+// object another computer wrote under a different vault password fails the
+// same check, which is why shared cleanup deletes only an old one (see
+// requireAbandonedPendingObject); rollback deletes its own names at once. Any
+// other read failure, such as a network error, still stops the password
+// change.
+func pendingObjectContentInvalid(stat objectStat, readErr error) bool {
+	if hasStorePostCommandFailure(readErr) {
+		return false
+	}
+	return stat.Size <= 0 || errors.Is(readErr, errSavedVaultPasswordDecrypt)
+}
+
+// requireAbandonedPendingObject lets cleanup delete a pending object whose
+// contents fail their check only when it hasn't changed for
+// abandonedPendingObjectAge, by the modification time rclone lists for it,
+// which on most backends is the uploading computer's clock at upload. A newer
+// one may be another computer's upload in progress, so the password change is
+// refused with ErrPasswordChangeVaultBusy and nothing is deleted. There's no
+// second look just before the delete: it would come about a second later,
+// and a server that caches listings wouldn't show a change by then anyway.
+func requireAbandonedPendingObject(before objectStat, now time.Time) error {
+	modified, err := time.Parse(time.RFC3339Nano, before.ModTime)
+	if err != nil || now.Sub(modified) < abandonedPendingObjectAge {
+		return ErrPasswordChangeVaultBusy
+	}
+	return nil
 }
 
 func bytesEqual(left, right []byte) bool {
@@ -502,15 +589,29 @@ func PasswordRotationStagePath(repositoryID, operationUUID string) (string, erro
 	return filepath.Join(root, repositoryID, operationUUID), nil
 }
 
+// PreparePasswordRotationStage creates password-change/<repository>/<operation>
+// owner-only, reusing any of those folders that already exist.
+//
+// Staging trusts the folders it creates under the app-data root. Links above
+// or in these folders are treated like ordinary paths; member removal uses
+// os.Remove, which removes a link without following it. Some users' app-data
+// root sits under a linked folder (a symlinked home or ~/.local, folders placed
+// by a dotfile manager, /home -> /var/home on ostree systems), and a link
+// planted inside our owner-only folders takes someone or something already on
+// the computer, which is outside what Replicaro defends against. So there is
+// no walk from the filesystem root and no link, owner, mode, or link-count
+// re-check on what was just created. What protects staged plaintext against
+// accidents is that folders are 0700 and files 0600 with O_EXCL, every write
+// is fsynced, reads are bounded, and cleanup only ever removes the stage's
+// fixed member names. Don't add link or owner checks here without a product
+// decision: they turn ordinary home-folder layouts into failed password
+// changes.
 func PreparePasswordRotationStage(repositoryID, operationUUID string) (string, error) {
 	path, err := PasswordRotationStagePath(repositoryID, operationUUID)
 	if err != nil {
 		return "", err
 	}
 	root := filepath.Dir(filepath.Dir(path))
-	if err := validatePasswordRotationAncestors(filepath.Dir(root)); err != nil {
-		return "", err
-	}
 	for _, directory := range []string{root, filepath.Dir(path), path} {
 		created, err := preparePasswordRotationDirectory(directory)
 		if err != nil {
@@ -525,19 +626,45 @@ func PreparePasswordRotationStage(repositoryID, operationUUID string) (string, e
 	return path, nil
 }
 
+// preparePasswordRotationDirectory creates one stage folder owner-only, or
+// accepts the folder that is already there, and in both cases sets mode 0700
+// again. On Windows the folder inherits the application folder's protected
+// DACL instead and gets no ACL write here. It reports whether it created the
+// folder so the caller can fsync the parent.
+func preparePasswordRotationDirectory(path string) (bool, error) {
+	created := true
+	if err := os.Mkdir(path, 0o700); errors.Is(err, os.ErrExist) {
+		created = false
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return false, statErr
+		}
+		if !info.IsDir() {
+			return false, fmt.Errorf("password-change staging component is not a directory")
+		}
+	} else if err != nil {
+		return false, err
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
+// validatePasswordRotationStage returns the derived stage folder for this
+// operation once it exists. Callers never accept a stored path; the UUIDs are
+// the only input.
 func validatePasswordRotationStage(repositoryID, operationUUID string) (string, error) {
 	path, err := PasswordRotationStagePath(repositoryID, operationUUID)
 	if err != nil {
 		return "", err
 	}
-	root := filepath.Dir(filepath.Dir(path))
-	if err := validatePasswordRotationAncestors(filepath.Dir(root)); err != nil {
+	info, err := os.Stat(path)
+	if err != nil {
 		return "", err
 	}
-	for _, directory := range []string{root, filepath.Dir(path), path} {
-		if err := validatePasswordRotationDirectory(directory); err != nil {
-			return "", err
-		}
+	if !info.IsDir() {
+		return "", fmt.Errorf("password-change staging path is not a directory")
 	}
 	return path, nil
 }
@@ -582,9 +709,6 @@ func WritePasswordRotationNativeInput(repositoryID, operationUUID, password stri
 	if err := errors.Join(writeErr, closeErr); err != nil {
 		return "", err
 	}
-	if err := validatePasswordRotationFile(path); err != nil {
-		return "", err
-	}
 	if err := syncPasswordRotationDirectory(filepath.Dir(path)); err != nil {
 		return "", err
 	}
@@ -623,13 +747,7 @@ func StagePasswordRotationInventory(repositoryID, operationUUID string, inventor
 		if writeErr != nil || closeErr != nil {
 			return errors.Join(writeErr, closeErr)
 		}
-		if err := validatePasswordRotationFile(filepath.Join(path, name)); err != nil {
-			return err
-		}
-		if err := appdata.SecurePath(filepath.Join(path, name), false); err != nil {
-			return err
-		}
-		if err := validatePasswordRotationFile(filepath.Join(path, name)); err != nil {
+		if err := os.Chmod(filepath.Join(path, name), 0o600); err != nil {
 			return err
 		}
 		inventory.Objects[index].StagedFile = name
@@ -655,13 +773,7 @@ func StagePasswordRotationInventory(repositoryID, operationUUID string, inventor
 	if writeErr != nil || closeErr != nil {
 		return errors.Join(writeErr, closeErr)
 	}
-	if err := validatePasswordRotationFile(filepath.Join(path, "manifest.json")); err != nil {
-		return err
-	}
-	if err := appdata.SecurePath(filepath.Join(path, "manifest.json"), false); err != nil {
-		return err
-	}
-	if err := validatePasswordRotationFile(filepath.Join(path, "manifest.json")); err != nil {
+	if err := os.Chmod(filepath.Join(path, "manifest.json"), 0o600); err != nil {
 		return err
 	}
 	if err := syncPasswordRotationDirectory(path); err != nil {
@@ -684,11 +796,7 @@ func ResetPasswordRotationStage(repositoryID, operationUUID string) error {
 		if !validPasswordRotationStageFilename(name) {
 			return fmt.Errorf("password-change staging contains an unexpected object")
 		}
-		filePath := filepath.Join(path, name)
-		if err := validatePasswordRotationFile(filePath); err != nil {
-			return err
-		}
-		if err := os.Remove(filePath); err != nil {
+		if err := os.Remove(filepath.Join(path, name)); err != nil {
 			return err
 		}
 	}
@@ -817,6 +925,43 @@ func stripPasswordFence(s Store, object PasswordRotationObject, operationUUID st
 	return append([]byte(nil), object.Data...), nil
 }
 
+// removeOwnPasswordRotationPartialUploads deletes, without reading them, the
+// rclone partial uploads of this operation's own pending names. An earlier
+// publishing attempt that was cut off mid-upload leaves one behind, and a
+// resume can't overwrite it: the partial's hex suffix comes from the local
+// upload file, which every attempt writes anew, so rclone picks a different
+// partial name and never touches the old one. Without this the check below
+// would refuse every resume of the operation. The pending names are derived
+// from this operation's UUID, so no other writer uses them. Any other pending
+// object or partial upload is left alone and still fails the check.
+func removeOwnPasswordRotationPartialUploads(ctx context.Context, session *storeSession, inventory PasswordRotationInventory) error {
+	own := make(map[string]bool, len(inventory.Objects))
+	for _, object := range inventory.Objects {
+		name, err := derivedPendingName(object.Name, inventory.OperationUUID)
+		if err != nil {
+			return err
+		}
+		own[name] = true
+	}
+	listed, err := profileObjects(ctx, session)
+	if err != nil {
+		return err
+	}
+	for name := range listed {
+		pendingName, partial := pendingPartialUploadBase(name)
+		if !partial || !own[pendingName] {
+			continue
+		}
+		if _, err := session.run(ctx, "deletefile", sidecarRemote+name); err != nil {
+			return err
+		}
+		if _, exists, err := statObject(ctx, session, sidecarRemote+name); err != nil || exists {
+			return fmt.Errorf("verify password-change partial upload cleanup")
+		}
+	}
+	return nil
+}
+
 func (s Store) verifyPasswordRotatedObjectsBeforeRoot(ctx context.Context, session *storeSession, inventory PasswordRotationInventory) error {
 	listed, err := profileObjects(ctx, session)
 	if err != nil {
@@ -917,6 +1062,9 @@ func (s Store) PublishPasswordRotatedTree(ctx context.Context, inventory Passwor
 	if rootCanonical == nil {
 		return fmt.Errorf("password-change staging has no canonical root")
 	}
+	if err := removeOwnPasswordRotationPartialUploads(ctx, session, inventory); err != nil {
+		return err
+	}
 	if err := s.verifyPasswordRotatedObjectsBeforeRoot(ctx, session, inventory); err != nil {
 		return err
 	}
@@ -956,16 +1104,18 @@ func (s Store) PublishPasswordRotatedTree(ctx context.Context, inventory Passwor
 }
 
 func CleanupPasswordRotationStage(repositoryID, operationUUID string) error {
+	return cleanupPasswordRotationStage(repositoryID, operationUUID, false)
+}
+
+func cleanupPasswordRotationStage(repositoryID, operationUUID string, keepRecord bool) error {
 	path, err := PasswordRotationStagePath(repositoryID, operationUUID)
 	if err != nil {
 		return err
 	}
-	exists, err := validatePasswordRotationCleanupPath(path)
-	if err != nil {
-		return err
-	}
-	if !exists {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
+	} else if err != nil {
+		return err
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -973,16 +1123,18 @@ func CleanupPasswordRotationStage(repositoryID, operationUUID string) error {
 	}
 	// The durable database operation plus the exact derived directory preserve
 	// cleanup identity even if an earlier attempt removed some files or the
-	// manifest. Only fixed rotation members are ever eligible for removal.
+	// manifest. Only fixed rotation members are ever eligible for removal. Any
+	// other name stops cleanup before the manifest and the folder go, so the
+	// operation stays retryable instead of deleting a folder that holds
+	// something we didn't put there. Each member goes through os.Remove, which
+	// deletes a link itself rather than what it points to and never recurses,
+	// so no per-file type or link check is needed first.
 	for _, entry := range entries {
 		if !validPasswordRotationStageFilename(entry.Name()) {
 			return fmt.Errorf("password-change staging contains an unexpected object")
 		}
 		filePath := filepath.Join(path, entry.Name())
-		if err := validatePasswordRotationFile(filePath); err != nil {
-			return err
-		}
-		if entry.Name() == "manifest.json" {
+		if entry.Name() == "manifest.json" || (keepRecord && entry.Name() == passwordRotationRecordName) {
 			continue
 		}
 		if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -999,6 +1151,9 @@ func CleanupPasswordRotationStage(repositoryID, operationUUID string) error {
 	if err := syncPasswordRotationDirectory(path); err != nil {
 		return err
 	}
+	if keepRecord {
+		return nil
+	}
 	parent := filepath.Dir(path)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -1009,26 +1164,10 @@ func CleanupPasswordRotationStage(repositoryID, operationUUID string) error {
 	return passwordRotationFault("local_cleanup_deleted")
 }
 
-func validatePasswordRotationCleanupPath(path string) (bool, error) {
-	root := filepath.Dir(filepath.Dir(path))
-	if err := validatePasswordRotationAncestors(filepath.Dir(root)); err != nil {
-		return false, err
-	}
-	for _, directory := range []string{root, filepath.Dir(path), path} {
-		if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		} else if err != nil {
-			return false, err
-		}
-		if err := validatePasswordRotationDirectory(directory); err != nil {
-			return false, err
-		}
-	}
-	return true, nil
-}
-
 func validPasswordRotationStageFilename(name string) bool {
-	if name == "manifest.json" || name == "restic-new-password.txt" {
+	switch name {
+	case "manifest.json", "restic-new-password.txt",
+		passwordRotationRecordName, passwordRotationRecordTempName, passwordRotationFenceName:
 		return true
 	}
 	if strings.HasPrefix(name, "object-") && strings.HasSuffix(name, ".json") && len(name) == len("object-000.json") {
@@ -1047,15 +1186,39 @@ func validPasswordRotationStageFilename(name string) bool {
 	return false
 }
 
+// removePasswordRotationFile removes one fixed-name stage member. os.Remove
+// deletes a link rather than its target and never recurses.
 func removePasswordRotationFile(path string) error {
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(path); errors.Is(err, os.ErrNotExist) {
 		return nil
-	}
-	if err := validatePasswordRotationFile(path); err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	} else if err != nil {
 		return err
 	}
 	return syncPasswordRotationDirectory(filepath.Dir(path))
+}
+
+// readPasswordRotationFileBounded reads one staged file and refuses anything
+// over limit before allocating for it.
+func readPasswordRotationFileBounded(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil || info.Size() < 0 || info.Size() > limit {
+		_ = file.Close()
+		return nil, fmt.Errorf("password-change staging file exceeds its size limit")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, limit+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("password-change staging file exceeds its size limit")
+	}
+	return data, nil
 }

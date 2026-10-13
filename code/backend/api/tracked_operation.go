@@ -130,12 +130,23 @@ func (op *trackedOperation) activate() error {
 }
 
 // startWithoutCancel closes the cancel gate for work that cannot be stopped
-// once it has started (snapshot and job deletion). It is called after the
-// locks are held and before anything changes. It reports false when a cancel
-// was accepted first; the caller then ends the operation interrupted without
-// starting. Shutdown still ends ctx; that is an interruption, not a cancel.
+// once it has started (snapshot and job deletion, vault settings save, vault
+// removal, and password change). It is called after the locks are held and
+// before anything changes. It reports false when a cancel was accepted first;
+// the caller then ends the operation interrupted without starting. Shutdown
+// still ends ctx; that is an interruption, not a cancel.
 func (op *trackedOperation) startWithoutCancel() bool {
-	return op.runtime.CloseCancel(op.id)
+	if op.runtime.CloseCancel(op.id) {
+		return true
+	}
+	// The gate also refuses while the winning cancel is still in flight, and
+	// its callback may not have ended ctx yet. The status is decided from ctx
+	// (operationruntime.TerminalStatus), so wait for it; otherwise this cancel
+	// could be reported as a failure. The callback registered in
+	// beginOperationRuntime only cancels ctx and cannot fail, so this returns
+	// promptly.
+	<-op.ctx.Done()
+	return false
 }
 
 // finish closes the cancel gate, saves the final status and output, and only
@@ -176,16 +187,18 @@ func (op *trackedOperation) finishWithCause(status, output string, cause error) 
 }
 
 // fail ends the operation as failed with err's text, or interrupted when err
-// comes from a cancel or shutdown.
+// comes from this operation's own cancel or from shutdown. An internal
+// timeout (for example a sidecar deadline) is failed, so it notifies.
 func (op *trackedOperation) fail(err error) bool {
-	return op.finishWithCause(terminalOperationStatus(op.ctx, err), err.Error(), err)
+	return op.finishWithCause(operationruntime.TerminalStatus(op.ctx, err), err.Error(), err)
 }
 
 // notStarted ends an operation that never got past waiting: a cancel while it
 // waited, or shutdown. Nothing ran, so it is interrupted with a plain reason
-// in its log. Any other error before start is a failure.
+// in its log. Any other error before start, an internal timeout included, is
+// a failure.
 func (op *trackedOperation) notStarted(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if operationruntime.TerminalStatus(op.ctx, err) == "interrupted" {
 		reason := "Cancelled before the operation started."
 		if op.lifetime.Err() != nil {
 			reason = "Application stopped before the operation started."

@@ -18,6 +18,9 @@
 //     was deleted or moved, which is an error the user must see.
 //   - Timeouts and unexpected OS errors pause; access denied errors; helper
 //     launch/protocol/integrity failures error because they prove nothing.
+//   - A probe that never got a helper slot, because stuck checks of other
+//     storage hold them all, pauses under its own reason: this storage may be
+//     fine, and the pause ends once those checks finish.
 //   - Nothing is ever relocated automatically, and no path is rewritten.
 //   - There is no retry loop here. Pausing reuses the scheduler's existing
 //     catch-up (recheck at most every five minutes).
@@ -74,11 +77,25 @@ type RepositoryStorageUnavailableError struct {
 	ReasonCode string
 }
 
+// slotsExhaustedExplanation follows the reason code in the result of an
+// operation paused by it. The code alone would leave the user guessing why
+// healthy storage wasn't checked and whether they have to do anything.
+const slotsExhaustedExplanation = "Replicaro couldn't check this storage because earlier checks of other drives " +
+	"or network shares stopped responding and are still running. Backups resume automatically when those " +
+	"checks finish. If a network share stopped responding, reconnect it; restarting Replicaro also clears this."
+
+func unavailableText(base, reason string) string {
+	if reason == database.AvailabilityReasonObservationSlotsExhausted {
+		return base + ": " + reason + ". " + slotsExhaustedExplanation
+	}
+	return base + ": " + reason
+}
+
 func (err *RepositoryStorageUnavailableError) Error() string {
 	if err == nil || err.ReasonCode == "" {
 		return ErrRepositoryStorageUnavailable.Error()
 	}
-	return ErrRepositoryStorageUnavailable.Error() + ": " + err.ReasonCode
+	return unavailableText(ErrRepositoryStorageUnavailable.Error(), err.ReasonCode)
 }
 
 func (err *RepositoryStorageUnavailableError) Unwrap() error {
@@ -115,7 +132,7 @@ func (err *SourceStorageUnavailableError) Error() string {
 	if err == nil || err.ReasonCode == "" {
 		return ErrSourceStorageUnavailable.Error()
 	}
-	return ErrSourceStorageUnavailable.Error() + ": " + err.ReasonCode
+	return unavailableText(ErrSourceStorageUnavailable.Error(), err.ReasonCode)
 }
 
 func (err *SourceStorageUnavailableError) Unwrap() error {
@@ -243,8 +260,9 @@ func recordDecision(key, stage string, check Check) {
 }
 
 // probe runs one bounded helper request. The returned error is only a context
-// error or a helper launch/protocol/integrity failure; unobservable storage is
-// reported inside the response.
+// error, storageidentity.ErrHelperSlotsExhausted, or a helper
+// launch/protocol/integrity failure; unobservable storage is reported inside
+// the response.
 func probe(ctx context.Context, path, kind, mountPoint string) (storageidentity.HelperResponse, error) {
 	if err := storageidentity.ValidateBindingPath(path); err != nil {
 		return storageidentity.HelperResponse{}, err
@@ -267,6 +285,11 @@ func probe(ctx context.Context, path, kind, mountPoint string) (storageidentity.
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return storageidentity.HelperResponse{}, context.Canceled
+		}
+		// Checked before the deadline: running out of slots also ends at the
+		// deadline, but it is about other storage, not this one.
+		if errors.Is(err, storageidentity.ErrHelperSlotsExhausted) {
+			return storageidentity.HelperResponse{}, storageidentity.ErrHelperSlotsExhausted
 		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(bounded.Err(), context.DeadlineExceeded) {
 			return storageidentity.HelperResponse{}, context.DeadlineExceeded
@@ -315,6 +338,11 @@ func pauseCheck(reason, step string, code int64) Check {
 // saved with the binding; legacy marks a row still in the retired format.
 func decide(recorded storageidentity.Facts, legacy bool, response storageidentity.HelperResponse, err error) Check {
 	if err != nil {
+		if errors.Is(err, storageidentity.ErrHelperSlotsExhausted) {
+			// This storage was never probed, so the share that stopped
+			// answering keeps "timed out" and this one gets its own reason.
+			return pauseCheck(database.AvailabilityReasonObservationSlotsExhausted, stepHelper, 0)
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			// Includes a hung SMB/NFS/FUSE call that the helper could not
 			// finish in time: storage is there but not answering, so pause.
@@ -540,17 +568,6 @@ func AdmitRepositoryStorage(ctx context.Context, repo models.Repository) (Check,
 	}
 }
 
-// RequireRepositoryAvailable is the engine callback for established
-// operation sessions and deliberately does nothing. The vault decision and
-// the full repository/native/protected identity check already ran once under
-// the vault lock; probing again here would turn every native command into
-// another availability gate.
-func RequireRepositoryAvailable(ctx context.Context, repo models.Repository) error {
-	_ = ctx
-	_ = repo
-	return nil
-}
-
 // ObserveBackupSet observes one source and its selected targets concurrently,
 // with a fixed worker bound. This keeps the observations close to the
 // admission transaction without creating unbounded helper processes.
@@ -664,6 +681,9 @@ func bindFilesystem(ctx context.Context, path, kind, stage string) (Binding, err
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return Binding{}, context.Canceled
+		}
+		if errors.Is(err, storageidentity.ErrHelperSlotsExhausted) {
+			return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationSlotsExhausted, step: stepHelper}
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationTimeout, step: stepHelper, timeout: true}

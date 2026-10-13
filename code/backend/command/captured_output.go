@@ -4,17 +4,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/local/replicaro/appdata"
 )
 
-// CapturedOutputPublisher receives the complete, unmodified stdout and stderr
-// after the process tree has been drained. It is for presentation only: it must
-// consume the readers synchronously, and a logging failure must never affect
-// the native result.
-type CapturedOutputPublisher func(engine, kind, status, diagnostic string, stdout, stderr io.Reader) bool
+// CapturedOutputPublisher receives the paths of the complete, unmodified
+// stdout and stderr capture files after the process tree has been drained.
+// It is for presentation only, and a logging failure must never affect the
+// native result.
+//
+// Returning true hands both files over: the publisher (the operation log)
+// appends them to the operation's log when the step is finalized and deletes
+// them then, and Close leaves them alone. Until then the engine adapter that
+// ran the command keeps reading them through OpenStdout/OpenStderr; every
+// finalizer runs after that engine call has returned. Handing the files over
+// instead of copying them saves one full write, read and fsync per stream.
+// Returning false leaves them with the capture, and Close deletes them as
+// usual. A file left behind by a crash before finalization is removed by
+// CleanupCapturedOutput at the next start.
+type CapturedOutputPublisher func(engine, kind, status, diagnostic, stdoutPath, stderrPath string) bool
 
 type capturedOutputPublisherKey struct{}
 type capturedOutputKindKey struct{}
@@ -49,10 +62,29 @@ func capturedOutputPublication(ctx context.Context) (CapturedOutputPublisher, st
 
 // CapturedOutput owns two temporary, owner-local stream files. Callers parse
 // through OpenStdout/OpenStderr and must Close the value when finished.
+//
+// The files are plain temporary files in the command-output folder under the
+// app-data root: os.CreateTemp (mode 0600 and a unique name), a reopen by path
+// for each reader, and os.Remove. On Windows the folder and the files inherit
+// the application folder's protected DACL, so they get no ACL write of their
+// own. There's deliberately no handle-relative open, no link, link-count,
+// owner or mode re-check, and no per-call ACL write here. Those only resist
+// someone with access to the computer swapping files in Replicaro's own
+// folder, which Replicaro doesn't defend against. Don't add them back without
+// a product decision.
+//
+// Readers open through appdata.OpenFileShareDelete so Close can still remove
+// a capture file while a caller holds a reader on it. With Go's default
+// Windows sharing that removal fails and the file stays until the next
+// startup cleanup. The writer is always closed before anything removes the
+// file, so os.CreateTemp's default sharing is enough for it.
 type CapturedOutput struct {
 	stdout *captureFile
 	stderr *captureFile
 	once   sync.Once
+	// handedOff is set when a publisher took over both files; Close then
+	// leaves them for the operation log to append and delete.
+	handedOff atomic.Bool
 }
 
 type captureFile struct {
@@ -64,6 +96,8 @@ type captureFile struct {
 }
 
 var beforeCaptureWrite func()
+
+func capturedOutputDirectory() (string, error) { return appdata.Directory("command-output") }
 
 func newCapturedOutput() (*CapturedOutput, error) {
 	directory, err := capturedOutputDirectory()
@@ -93,6 +127,25 @@ func CleanupCapturedOutput() error {
 	return cleanupCapturedOutputDirectory(directory)
 }
 
+func cleanupCapturedOutputDirectory(directory string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	var cleanupErrors []error
+	for _, entry := range entries {
+		name := entry.Name()
+		if (!strings.HasPrefix(name, ".stdout-") && !strings.HasPrefix(name, ".stderr-")) ||
+			!strings.HasSuffix(name, ".tmp") || !entry.Type().IsRegular() {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(directory, name)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, removeErr)
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
 // CapturedOutputForTests constructs the same file-backed result without
 // launching a process. It keeps engine test seams compatible while exercising
 // the production reader and cleanup lifecycle.
@@ -111,7 +164,7 @@ func CapturedOutputForTests(stdoutValue, stderrValue []byte) (*CapturedOutput, e
 }
 
 func newCaptureFile(directory, pattern string) (*captureFile, error) {
-	file, err := createCapturedOutputFile(directory, pattern)
+	file, err := os.CreateTemp(directory, pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +217,15 @@ func (file *captureFile) open() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openCapturedOutput(filepath.Clean(path))
+	return appdata.OpenFileShareDelete(filepath.Clean(path), os.O_RDONLY, 0)
+}
+
+// completePath returns the file's path once it is closed and was written
+// without error, the state in which it may be handed to a publisher.
+func (file *captureFile) completePath() (string, bool) {
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	return file.path, file.closed && file.writeErr == nil && file.path != ""
 }
 
 func (file *captureFile) remove() {
@@ -176,7 +237,7 @@ func (file *captureFile) remove() {
 	path := file.path
 	file.mu.Unlock()
 	if path != "" {
-		_ = removeCapturedOutput(path)
+		_ = os.Remove(path)
 	}
 }
 
@@ -195,19 +256,18 @@ func (output *CapturedOutput) publish(ctx context.Context, engine, status, diagn
 	if publisher == nil {
 		return false
 	}
-	stdout, stdoutErr := output.OpenStdout()
-	stderr, stderrErr := output.OpenStderr()
-	published := false
-	if stdoutErr == nil && stderrErr == nil {
-		published = publisher(engine, kind, status, diagnostic, stdout, stderr)
+	// A capture that failed to write is never handed over: the log would
+	// show a truncated stream as if it were complete.
+	stdoutPath, stdoutOK := output.stdout.completePath()
+	stderrPath, stderrOK := output.stderr.completePath()
+	if !stdoutOK || !stderrOK {
+		return false
 	}
-	if stdout != nil {
-		_ = stdout.Close()
+	if !publisher(engine, kind, status, diagnostic, stdoutPath, stderrPath) {
+		return false
 	}
-	if stderr != nil {
-		_ = stderr.Close()
-	}
-	return published
+	output.handedOff.Store(true)
+	return true
 }
 
 // PublishForTests exercises the production publication boundary for engine
@@ -216,12 +276,16 @@ func (output *CapturedOutput) PublishForTests(ctx context.Context, engine, statu
 	return output.publish(ctx, engine, status, diagnostic)
 }
 
-// Close removes both run-local capture files.
+// Close removes both run-local capture files, unless a publisher took them
+// over; the operation log deletes those after appending them.
 func (output *CapturedOutput) Close() error {
 	if output == nil {
 		return nil
 	}
 	output.once.Do(func() {
+		if output.handedOff.Load() {
+			return
+		}
 		output.stdout.remove()
 		output.stderr.remove()
 	})

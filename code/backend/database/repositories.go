@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -259,6 +260,9 @@ func ListRepositories(db *sql.DB) ([]models.Repository, error) {
 
 		repos = append(repos, r)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	return repos, nil
 }
@@ -281,7 +285,7 @@ func TakeStartupStuckResticRepositories(db *sql.DB) ([]models.Repository, error)
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	if _, err := db.Exec(`DROP TABLE startup_stuck_restic_repositories`); err != nil {
@@ -487,7 +491,7 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 		}
 		remainingTargets = append(remainingTargets, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	jobRows, err := tx.Query(`SELECT id, portable_target_ids FROM backup_jobs`)
@@ -517,7 +521,7 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 			jobUpdates = append(jobUpdates, portableJobUpdate{jobID, string(updated)})
 		}
 	}
-	if err := jobRows.Close(); err != nil {
+	if err := closeRows(jobRows); err != nil {
 		return err
 	}
 	for _, update := range jobUpdates {
@@ -536,7 +540,7 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 			}
 			remainingTargets = append(remainingTargets, repositoryID)
 		}
-		if err := activeRows.Close(); err != nil {
+		if err := closeRows(activeRows); err != nil {
 			return err
 		}
 	}
@@ -572,7 +576,7 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 			remainingTargets = append(remainingTargets, ownerID)
 		}
 	}
-	if err := dormantRows.Close(); err != nil {
+	if err := closeRows(dormantRows); err != nil {
 		return err
 	}
 	for _, update := range dormantUpdates {
@@ -584,6 +588,13 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 	// Remove only this membership. A logical job is deleted only when its
 	// final target disappears; operations intentionally remain untouched.
 	if _, err := tx.Exec(`DELETE FROM backup_job_targets WHERE repository_id = ?`, id); err != nil {
+		return err
+	}
+	// The target delete cascades away this vault's scheduled restorations. A
+	// never-started admission group that held only those is now empty, and
+	// left in place it would fail the group check for every other vault of
+	// the job until the next start.
+	if _, err := tx.Exec(deleteEmptyUnstartedAdmissionGroups); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM backup_jobs WHERE NOT EXISTS
@@ -665,23 +676,80 @@ func RecordVaultSizeAttempt(db *sql.DB, id string, attemptedAt time.Time) error 
 	return nil
 }
 
-func PublishVaultSize(db *sql.DB, id string, sizeBytes int64, measuredAt time.Time) error {
+// ErrVaultSizeSettingsChanged means the vault's connector, location or
+// connector options changed while its size was being measured, so the result
+// belongs to storage the vault no longer points at and was not saved.
+var ErrVaultSizeSettingsChanged = fmt.Errorf("vault settings changed during the Vault Size measurement")
+
+// VaultSizeMeasurement is what a Vault Size measurement remembers from the
+// moment it was admitted: the vault's storage settings exactly as saved, and
+// how often the vault had been marked dirty by then.
+type VaultSizeMeasurement struct {
+	repositoryID     string
+	connector        string
+	location         string
+	connectorOptions string
+	dirtyCount       int64
+}
+
+// BeginVaultSizeMeasurement reads the vault's storage settings and dirty count
+// for a measurement that is about to start. The measurement runs without the
+// vault lock, so these are compared again when it publishes and while it runs.
+func BeginVaultSizeMeasurement(db *sql.DB, id string) (VaultSizeMeasurement, error) {
+	measurement := VaultSizeMeasurement{repositoryID: id}
+	err := db.QueryRow(`SELECT connector, location, connector_options, vault_size_dirty_count
+		FROM repositories WHERE id=?`, id).Scan(&measurement.connector, &measurement.location,
+		&measurement.connectorOptions, &measurement.dirtyCount)
+	return measurement, err
+}
+
+// VaultSizeMeasurementCurrent reports whether the vault still exists with the
+// storage settings the measurement started with. Removing or relocating the
+// vault, or changing its connector, path or credentials, makes it false.
+func VaultSizeMeasurementCurrent(db *sql.DB, measurement VaultSizeMeasurement) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM repositories
+		WHERE id=? AND connector=? AND location=? AND connector_options=?`,
+		measurement.repositoryID, measurement.connector, measurement.location, measurement.connectorOptions).Scan(&count)
+	return count == 1, err
+}
+
+// PublishVaultSize saves a measured size. The settings check is part of the
+// same UPDATE, so a relocation or credential change that commits while the
+// result is being saved can't be overwritten by a size of the old storage;
+// that case returns ErrVaultSizeSettingsChanged and saves nothing. The dirty
+// flag is cleared only when nothing marked the vault dirty after the
+// measurement started: a backup that ran during the listing keeps the vault
+// dirty so the next refresh measures it again.
+func PublishVaultSize(db *sql.DB, measurement VaultSizeMeasurement, sizeBytes int64, measuredAt time.Time) error {
 	if sizeBytes < 0 {
 		return fmt.Errorf("vault size cannot be negative")
 	}
-	result, err := db.Exec(`UPDATE repositories SET vault_size_bytes=?, vault_size_measured_at=?, vault_size_dirty=0 WHERE id=?`,
-		sizeBytes, measuredAt.UTC().Format(time.RFC3339Nano), id)
+	result, err := db.Exec(`UPDATE repositories SET vault_size_bytes=?, vault_size_measured_at=?,
+		vault_size_dirty=CASE WHEN vault_size_dirty_count=? THEN 0 ELSE vault_size_dirty END
+		WHERE id=? AND connector=? AND location=? AND connector_options=?`,
+		sizeBytes, measuredAt.UTC().Format(time.RFC3339Nano), measurement.dirtyCount,
+		measurement.repositoryID, measurement.connector, measurement.location, measurement.connectorOptions)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
-		return sql.ErrNoRows
+		var exists int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM repositories WHERE id=?`, measurement.repositoryID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return sql.ErrNoRows
+		}
+		return ErrVaultSizeSettingsChanged
 	}
 	return nil
 }
 
+// MarkVaultSizeDirty marks the vault's cached size as out of date and counts
+// the mark, so a measurement running at the same time can tell it happened.
 func MarkVaultSizeDirty(db *sql.DB, id string) error {
-	result, err := db.Exec(`UPDATE repositories SET vault_size_dirty=1 WHERE id=?`, id)
+	result, err := db.Exec(`UPDATE repositories SET vault_size_dirty=1, vault_size_dirty_count=vault_size_dirty_count+1 WHERE id=?`, id)
 	if err != nil {
 		return err
 	}
@@ -769,14 +837,6 @@ func UpdateRepositorySettings(db *sql.DB, id, checkSchedule, maintenanceSchedule
 		return err
 	}
 	return updateRepositorySettings(db, id, checkSchedule, maintenanceSchedule, repo.ConcurrencyMode, autoUnlock, nil)
-}
-
-func UpdateRepositorySettingsWithObjectLock(db *sql.DB, id, checkSchedule, maintenanceSchedule string, autoUnlock bool, objectLock models.ObjectLockSettings) error {
-	repo, err := GetRepository(db, id)
-	if err != nil {
-		return err
-	}
-	return updateRepositorySettings(db, id, checkSchedule, maintenanceSchedule, repo.ConcurrencyMode, autoUnlock, &objectLock)
 }
 
 func UpdateRepositorySettingsWithObjectLockAndConcurrency(db *sql.DB, id, checkSchedule, maintenanceSchedule, concurrencyMode string, autoUnlock bool, objectLock models.ObjectLockSettings) error {
@@ -996,21 +1056,52 @@ func dueRepositories(db *sql.DB, operation string) ([]models.Repository, error) 
 			continue
 		}
 		when, err := time.Parse(time.RFC3339, next)
-		if err == nil && !when.After(now) {
+		if err != nil {
+			continue
+		}
+		if !when.After(now) {
 			due = append(due, repo)
+			continue
+		}
+		if nextRunBeyondSchedule(schedule, when, now) {
+			rescheduleRepositoryTask(db, repo.ID, operation, schedule, next, now)
 		}
 	}
 	return due, nil
 }
 
-func SetRepositoryOperationStatus(db *sql.DB, id, operation, status string) error {
-	column := "last_check_status"
+// rescheduleRepositoryTask moves a vault check or maintenance whose saved
+// next run lies more than one schedule period ahead, as a clock that jumped
+// forward and back leaves behind, to the next occurrence from now. Left
+// alone it would not run until that date; for Object Lock maintenance, which
+// renews the provider locks, that could let the locks run out. Vault care
+// keeps its fixed intervals here too. Only the value read above is replaced,
+// so a run or settings change that wrote the row meanwhile wins.
+func rescheduleRepositoryTask(db *sql.DB, id, operation, schedule, savedNext string, now time.Time) {
+	scheduleColumn, nextColumn := "check_schedule", "next_check"
 	if operation == "maintenance" {
-		column = "last_maintenance_status"
+		scheduleColumn, nextColumn = "maintenance_schedule", "next_maintenance"
 	}
-	_, err := db.Exec(`UPDATE repositories SET `+column+` = ? WHERE id = ?`, status, id)
-	return err
+	next := NextRunFrom(schedule, now)
+	if next == "" {
+		return
+	}
+	result, err := db.Exec(`UPDATE repositories SET `+nextColumn+`=?
+		WHERE id=? AND `+scheduleColumn+`=? AND `+nextColumn+`=?`,
+		next, id, schedule, savedNext)
+	if err != nil {
+		log.Printf("reschedule vault %s %s after a clock change: %v", id, operation, err)
+		return
+	}
+	if count, _ := result.RowsAffected(); count == 1 {
+		log.Printf("vault %s: next %s %s was more than one schedule period ahead; rescheduled to %s",
+			id, operation, savedNext, next)
+	}
 }
+
+// UnavailableStorageRecheckInterval is how long scheduled work waits before
+// checking again on storage that was unavailable.
+const UnavailableStorageRecheckInterval = 5 * time.Minute
 
 // DeferRepositoryTask moves one due scheduled vault check or maintenance to
 // next without running it. The update only applies while the stored due time
@@ -1023,18 +1114,5 @@ func DeferRepositoryTask(db *sql.DB, id, operation, expectedDue string, next tim
 	}
 	_, err := db.Exec(`UPDATE repositories SET `+column+`=? WHERE id=? AND `+column+`=?`,
 		next.Format(time.RFC3339), id, expectedDue)
-	return err
-}
-
-func MarkRepositoryOperation(db *sql.DB, id, operation, schedule, status string) error {
-	now := time.Now()
-	lastColumn, nextColumn, statusColumn := "last_check", "next_check", "last_check_status"
-	if operation == "maintenance" {
-		lastColumn, nextColumn, statusColumn = "last_maintenance", "next_maintenance", "last_maintenance_status"
-	}
-	_, err := db.Exec(
-		`UPDATE repositories SET `+lastColumn+` = ?, `+nextColumn+` = ?, `+statusColumn+` = ? WHERE id = ?`,
-		now.Format(time.RFC3339), NextRunFrom(schedule, now), status, id,
-	)
 	return err
 }

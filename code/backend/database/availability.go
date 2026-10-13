@@ -24,6 +24,9 @@ const (
 	AvailabilityReasonIdentityMismatch   = "identity_mismatch"
 	AvailabilityReasonObservationFailed  = "observation_failed"
 	AvailabilityReasonObservationTimeout = "observation_timeout"
+	// AvailabilityReasonObservationSlotsExhausted pauses storage that was never
+	// probed because stuck checks of other storage held every helper slot.
+	AvailabilityReasonObservationSlotsExhausted = "observation_slots_exhausted"
 
 	// AvailabilityReasonUnavailableTooLong marks the one failed operation
 	// raised when an enabled job's storage has stayed unavailable for
@@ -138,7 +141,8 @@ func validateAvailabilityObservation(value StorageAvailabilityObservation, now t
 	case StorageUnavailable:
 		switch value.ReasonCode {
 		case AvailabilityReasonStorageMissing, AvailabilityReasonIdentityMismatch,
-			AvailabilityReasonObservationFailed, AvailabilityReasonObservationTimeout:
+			AvailabilityReasonObservationFailed, AvailabilityReasonObservationTimeout,
+			AvailabilityReasonObservationSlotsExhausted:
 		default:
 			return fmt.Errorf("storage availability reason is invalid")
 		}
@@ -187,7 +191,7 @@ func advanceScheduleAfter(schedule string, dueAt, now time.Time) (string, error)
 	if schedule == "" || schedule == "manual" {
 		return "", fmt.Errorf("manual schedules do not have regular occurrences")
 	}
-	nextText := NextRunFrom(schedule, dueAt)
+	nextText := nextJobRunFrom(schedule, dueAt)
 	if nextText == "" {
 		return "", fmt.Errorf("backup schedule is invalid")
 	}
@@ -196,7 +200,7 @@ func advanceScheduleAfter(schedule string, dueAt, now time.Time) (string, error)
 		return "", fmt.Errorf("backup schedule produced an invalid occurrence")
 	}
 	if _, cronSchedule := schedulevalue.CronExpression(schedule); cronSchedule && !next.After(now) {
-		nextText = NextRunFrom(schedule, now)
+		nextText = nextJobRunFrom(schedule, now)
 		if nextText == "" {
 			return "", fmt.Errorf("backup schedule is invalid")
 		}
@@ -206,8 +210,15 @@ func advanceScheduleAfter(schedule string, dueAt, now time.Time) (string, error)
 		}
 		return next.Format(time.RFC3339Nano), nil
 	}
-	_, customMonths := schedulevalue.CustomMonths(schedule)
-	if schedule != "monthly" && !customMonths && !next.After(now) {
+	// Fixed intervals (hourly and custom minutes) skip ahead in one step.
+	// Calendar schedules step one occurrence at a time on the local clock
+	// because their intervals vary: daily and weekly keep their local time
+	// across daylight-saving changes (an hour shorter or longer), and a month
+	// step goes to the same local day and time of the following month, or to
+	// its last day when that month is shorter, with later steps counting from
+	// that day.
+	_, customMinutes := schedulevalue.CustomMinutes(schedule)
+	if (schedule == "hourly" || customMinutes) && !next.After(now) {
 		interval := next.Sub(dueAt)
 		if interval <= 0 {
 			return "", fmt.Errorf("backup schedule does not advance")
@@ -217,7 +228,7 @@ func advanceScheduleAfter(schedule string, dueAt, now time.Time) (string, error)
 		return next.Format(time.RFC3339Nano), nil
 	}
 	for !next.After(now) {
-		nextText = NextRunFrom(schedule, next)
+		nextText = nextJobRunFrom(schedule, next)
 		if nextText == "" {
 			return "", fmt.Errorf("backup schedule is invalid")
 		}
@@ -284,16 +295,29 @@ func updatePairObservations(
 	return err
 }
 
-func markPairMissed(tx *sql.Tx, jobID, repositoryID string, dueAt, now time.Time) error {
+// markPairMissed adds one regular occurrence to the pair's pending catch-up
+// and returns the first missed due time it saved. Due times normally only
+// grow, but a clock that jumped ahead and came back can leave a pending
+// occurrence dated after this one; the first missed time then moves back to
+// this one, so the saved range stays ordered and the pair can still be
+// admitted. The times are compared parsed: the saved texts can differ in
+// their fraction digits and so don't sort as text.
+func markPairMissed(tx *sql.Tx, target scheduledTargetRow, jobID string, dueAt, now time.Time) (string, error) {
 	due := dueAt.UTC().Format(time.RFC3339Nano)
+	first := due
+	if target.pending != 0 {
+		first = target.firstDeferredDueAt
+		if saved, err := time.Parse(time.RFC3339Nano, first); err == nil && dueAt.Before(saved) {
+			first = due
+		}
+	}
 	_, err := tx.Exec(`UPDATE job_target_schedule_state
 		SET pending_catchup=1,
 		    coalesced_missed_count=coalesced_missed_count+1,
-		    first_deferred_due_at=CASE WHEN pending_catchup=0 THEN ? ELSE first_deferred_due_at END,
-		    last_due_at=?,updated_at=?
+		    first_deferred_due_at=?,last_due_at=?,updated_at=?
 		WHERE job_id=? AND repository_id=?`,
-		due, due, now.UTC().Format(time.RFC3339Nano), jobID, repositoryID)
-	return err
+		first, due, now.UTC().Format(time.RFC3339Nano), jobID, target.repositoryID)
+	return first, err
 }
 
 func clearPairPending(tx *sql.Tx, jobID, repositoryID string, now time.Time) error {
@@ -663,12 +687,11 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 		}
 		for index := range targets {
 			target := &targets[index]
-			if err := markPairMissed(tx, request.JobID, target.repositoryID, due, now); err != nil {
+			first, err := markPairMissed(tx, *target, request.JobID, due, now)
+			if err != nil {
 				return nil, err
 			}
-			if target.pending == 0 {
-				target.firstDeferredDueAt = due.Format(time.RFC3339Nano)
-			}
+			target.firstDeferredDueAt = first
 			target.lastDueAt = due.Format(time.RFC3339Nano)
 			target.pending = 1
 			target.missed++
@@ -1106,6 +1129,26 @@ func restoreQueuedBackupOperationTx(
 	return nil
 }
 
+// deleteEmptyUnstartedAdmissionGroups deletes scheduled admission groups that
+// have no restoration rows left and in which no backup ever started. A group
+// gets all of its restorations in the transaction that creates it and never
+// gains more, so once it is empty nothing can refer to it again. With
+// any_started=0 the only thing reconcileScheduledAdmissionGroupsTx could still
+// read from it is the earlier last-run time it saved, which only sets the
+// last run shown for the job. Normal use reaches this shape whenever a delete
+// cascades away a group's last restoration: retention deleting a finished
+// operation whose restoration an earlier database failure left eligible, or a
+// vault or job target being removed. Each of those deletes runs this in the
+// same transaction, and Migrate also runs it to repair databases already in
+// that shape. Keep it to this shape: every other inconsistency the group
+// check reports means the tables are not what this code wrote, and it must
+// keep stopping startup rather than being cleaned up silently.
+const deleteEmptyUnstartedAdmissionGroups = `DELETE FROM scheduled_admission_groups
+	WHERE any_started=0 AND NOT EXISTS (
+		SELECT 1 FROM scheduled_operation_restorations r
+		WHERE r.group_id=scheduled_admission_groups.id
+	)`
+
 type scheduledGroupState struct {
 	id, admittedAt, previousJobLastRun string
 	generation, eligible               int64
@@ -1134,6 +1177,10 @@ func reconcileScheduledAdmissionGroupsTx(tx *sql.Tx, jobID string) error {
 			return err
 		}
 		group.anyStarted = anyStarted == 1
+		// Every delete that can empty a group removes this shape in the same
+		// transaction, and Migrate repairs older databases (see
+		// deleteEmptyUnstartedAdmissionGroups), so finding it here means
+		// restoration rows went missing some other way. Keep it an error.
 		if total == 0 && !group.anyStarted {
 			return fmt.Errorf("scheduled admission group state is invalid")
 		}

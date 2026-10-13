@@ -17,7 +17,6 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
 	"github.com/local/replicaro/vaultreconnect"
@@ -33,14 +32,12 @@ func readProfileDefault(ctx context.Context, repo models.Repository) (vaultprofi
 
 func publishSyncedProfileDefault(ctx context.Context, repo models.Repository, data []byte, options vaultprofile.PublishOptions) error {
 	return (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		ForProfile(repo.ProfileUUID).
 		PublishUnderLock(ctx, data, options)
 }
 
 func readSyncedProfileDefault(ctx context.Context, repo models.Repository) (vaultprofile.ReadResult, error) {
 	return (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		ForProfile(repo.ProfileUUID).
 		ReadDetailed(ctx)
 }
@@ -192,22 +189,6 @@ func Publish(ctx context.Context, repo models.Repository, jobs []models.BackupJo
 	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).Publish(ctx, data, vaultprofile.PublishOptions{OperationID: uuid.NewString()})
 }
 
-func PublishNew(ctx context.Context, repo models.Repository, jobs []models.BackupJob) error {
-	return PublishNewWithDormant(ctx, repo, jobs, nil)
-}
-
-func PublishNewWithDormant(ctx context.Context, repo models.Repository, jobs []models.BackupJob, dormant []vaultprofile.BackupJob) error {
-	return PublishNewOperation(ctx, repo, jobs, dormant, uuid.NewString())
-}
-
-func PublishNewOperation(ctx context.Context, repo models.Repository, jobs []models.BackupJob, dormant []vaultprofile.BackupJob, operationID string) error {
-	data, err := BuildInitialProfile(repo, jobs, dormant)
-	if err != nil {
-		return err
-	}
-	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).Publish(ctx, data, vaultprofile.PublishOptions{OperationID: operationID, CreateOnly: true})
-}
-
 func BuildInitialRoot(repo models.Repository) ([]byte, error) {
 	root, err := vaultprofile.BuildRoot(repo, repo.NativeRepositoryID, repo.ProfileUUID, 1, time.Time{}, repo.CreatedAt)
 	if err != nil {
@@ -220,25 +201,20 @@ func BuildInitialProfile(repo models.Repository, jobs []models.BackupJob, dorman
 	return profileBytes(repo, jobs, dormant, 1, time.Time{})
 }
 
-// SyncRepository is one profile sync attempt for a vault that takes the vault
-// lock itself: the queue worker's, and the same sync run right after another
-// vault's connection. Its result also drives the vault's saved reconnect
-// state (package vaultreconnect), recorded while the vault lock is still held
-// so that a reconnect cannot commit between this attempt and its
-// bookkeeping. Callers that publish under a lock they already hold
-// (creation, connection, removal, password change) use
-// SyncRepositoryUnderLock; they report their own failures, which do not count
-// toward the reconnect clock, but their successes are recorded like the
+// syncRepositoryAttempt is one profile sync attempt for a vault that takes
+// the vault lock itself, as the queue worker (SyncPending) does. Its result
+// also drives the vault's saved reconnect state (package vaultreconnect),
+// recorded while the vault lock is still held so that a reconnect cannot
+// commit between this attempt and its bookkeeping. Callers that publish under
+// a lock they already hold (creation, connection, removal, password change)
+// use SyncRepositoryUnderLock; they report their own failures, which do not
+// count toward the reconnect clock, but their successes are recorded like the
 // worker's own (see SyncRepositoryUnderLock).
-func SyncRepository(ctx context.Context, db *sql.DB, repositoryID string) error {
-	return syncRepositoryAttempt(ctx, db, repositoryID, vaultreconnect.Now())
-}
-
-// syncRepositoryAttempt is SyncRepository for an attempt that started at
-// startedAt. The start is taken before waiting for the vault lock (and, in a
-// queue pass, before waiting for a free slot): the reconnect clock measures
-// the gap between failures to it, and a long backup holding the lock must not
-// look like the app not retrying.
+//
+// The attempt started at startedAt. The start is taken before waiting for the
+// vault lock (and, in a queue pass, before waiting for a free slot): the
+// reconnect clock measures the gap between failures to it, and a long backup
+// holding the lock must not look like the app not retrying.
 func syncRepositoryAttempt(ctx context.Context, db *sql.DB, repositoryID string, startedAt time.Time) error {
 	unlock, err := vaultlock.AcquireExclusiveContext(ctx, repositoryID)
 	if err != nil {
@@ -431,6 +407,13 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 	if err != nil {
 		if stateErr == nil {
 			saved := err.Error()
+			if vaultprofile.IsStorageFull(err) {
+				// The card shows this saved error, so the note is in the UI
+				// language, translated now. It stays in that language until the
+				// next attempt saves a new error; a language change doesn't
+				// rewrite it.
+				saved += "\n" + vaultreconnect.OutOfSpaceNote(db)
+			}
 			if checkAfterFailure != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, database.ErrVaultProfilePending) {
 				if note := checkAfterFailure(); note != "" {
 					saved += "\n" + note

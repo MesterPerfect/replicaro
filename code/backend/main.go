@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/instanceguard"
 	"github.com/local/replicaro/kopiapolicy"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/metadata"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/notifications"
@@ -47,17 +49,23 @@ import (
 )
 
 const (
-	startupPublicationActivationWindow = 15 * time.Second
-	activationRequestReserve           = 3 * time.Second
-	containerAPIListenPort             = 9460
-	containerRcloneAuthRelayPort       = 53683
-	containerPackageMarkerPath         = "/opt/replicaro/.container-package"
+	// secondLaunchPublicationWait is how long a launch that lost the instance
+	// guard keeps looking for the owner's rendezvous record. The owner takes
+	// the guard before it opens the database and runs startup recovery, and
+	// only publishes once the API is accepting connections.
+	secondLaunchPublicationWait  = 12 * time.Second
+	containerAPIListenPort       = 9460
+	containerRcloneAuthRelayPort = 53683
+	containerPackageMarkerPath   = "/opt/replicaro/.container-package"
 )
 
+// openRunningWebUI opens the running instance's URL for a second launch. Tests
+// replace it so they don't start a real browser.
+var openRunningWebUI = desktop.OpenWebUI
+
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
+	err := run()
+	os.Exit(finishRun(err, serviceStarted.Load(), headlessStart, stderrCaptured(), startupLogPath, showStartupFailure))
 }
 
 type runtimeOwnership struct {
@@ -94,6 +102,9 @@ type startupOptions struct {
 	// still carry a password or token in its value, so the value is dropped
 	// here and never reaches the log.
 	unknownOptions []string
+	// repairInstallation is set by --repair-replicaro. It replaces a damaged
+	// installation ID without asking; an intact one is left alone.
+	repairInstallation bool
 	// help is set by --help or -h. When it is set, every other field is left
 	// empty and run() only prints startupUsage.
 	help bool
@@ -115,14 +126,18 @@ Options:
       address. Repeatable. Needs one of the port options above. On Linux
       outside the Docker package, this also keeps Start at login on.
   --rclone-auth-no-open-browser
-      Show cloud sign-in links instead of opening a browser, for headless
-      installs. On Linux outside the Docker package, this also
-      keeps Start at login on.
+      Don't open a browser on this machine for cloud sign-in, for headless
+      installs. The sign-in link shows in Replicaro either way. On Linux
+      outside the Docker package, this also keeps Start at login on.
   --headless
       Another name for --rclone-auth-no-open-browser.
   --no-root[=<uid>:<gid>]
       Docker package only: run as this user and group instead of root.
       Default: 1000:1000.
+  --repair-replicaro
+      If Replicaro reports that it has been damaged, repair it and start.
+      You'll need to reconnect your vaults afterwards. Does nothing when
+      Replicaro isn't damaged.
   --help, -h
       Show this help and exit.
 `
@@ -214,6 +229,13 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 				}
 				options.noRootUser = &user
 			}
+		case argument == "--repair-replicaro":
+			if options.repairInstallation {
+				return startupOptions{}, fmt.Errorf("--repair-replicaro may be supplied only once")
+			}
+			options.repairInstallation = true
+		case strings.HasPrefix(argument, "--repair-replicaro="):
+			return startupOptions{}, fmt.Errorf("--repair-replicaro does not accept a value")
 		case strings.HasPrefix(argument, "--help="), strings.HasPrefix(argument, "-h="):
 			// Handled like the other options that take no value, which reject
 			// one (see --headless=), rather than showing help or ignoring it.
@@ -291,6 +313,69 @@ func keepStartAtLoginOn(db *sql.DB, settings *models.Settings) error {
 	return database.SaveSettings(db, *settings)
 }
 
+const damagedInstallationText = "Replicaro has been damaged, so Replicaro can't start. " +
+	"Your backed up data is safe and isn't affected. " +
+	"Replicaro can repair the damage on its own with your permission. " +
+	"After the repair, you'll need to reconnect your vaults."
+
+var (
+	// errRepairNeeded stops a start that can't ask about the repair: Linux,
+	// Docker, a terminal or redirected start, or a dialog that couldn't be
+	// shown. finishRun shows its text as it is.
+	errRepairNeeded = errors.New(damagedInstallationText + " To repair it, start Replicaro once with --repair-replicaro.")
+	// errRepairDeclined stops a start where the user answered No. The
+	// question comes back on the next start, so finishRun shows nothing more.
+	errRepairDeclined = errors.New("Replicaro has been damaged and the repair was declined, so Replicaro didn't start")
+	// confirmStartupRepair asks the repair question in a dialog. Tests
+	// replace it.
+	confirmStartupRepair = desktop.ConfirmStartupRepair
+)
+
+// startupRepairQuestion returns the dialog that asks whether to repair a
+// damaged installation, or nil where the start can't ask. Only Windows and
+// macOS show a dialog, and only where they would show the startup failure
+// notice (see stderrCaptured): a terminal or scripted start would wait on a
+// dialog nobody sees. Linux shows notifications, which can't take an answer.
+func startupRepairQuestion(goos string, stderrCaptured bool) func(string) (answered, repair bool) {
+	if (goos != "windows" && goos != "darwin") || stderrCaptured {
+		return nil
+	}
+	return confirmStartupRepair
+}
+
+// settleInstallationID makes sure the stored installation ID can be used
+// before startup goes on. A damaged ID is replaced only with the user's
+// go-ahead, given by --repair-replicaro (repair) or by answering Yes in the
+// dialog ask shows, because a new ID means every vault has to be reconnected.
+// A read error is returned as a failed start and never repaired, so the next
+// start tries again.
+func settleInstallationID(db *sql.DB, repair bool, ask func(string) (answered, repair bool)) error {
+	_, err := database.InstallationID(db)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, database.ErrInstallationIDDamaged) {
+		return fmt.Errorf("read the installation ID: %w", err)
+	}
+	if !repair {
+		if ask == nil {
+			return errRepairNeeded
+		}
+		answered, yes := ask(damagedInstallationText + " Repair Replicaro now?")
+		if !answered {
+			return errRepairNeeded
+		}
+		if !yes {
+			return errRepairDeclined
+		}
+	}
+	if _, err := database.RepairInstallationID(db); err != nil {
+		return fmt.Errorf("repair the installation ID: %w", err)
+	}
+	log.Print("Replicaro replaced its damaged installation ID; vaults need to be reconnected")
+	return nil
+}
+
 func requireContainerRuntime() error {
 	return requireContainerRuntimeFor(runtime.GOOS, os.Lstat)
 }
@@ -338,8 +423,9 @@ func isNoBufferSpaceError(err error) bool {
 }
 
 // acquireRuntimeOwnership is the single production and process-test seam for
-// guard authority, stale rendezvous cleanup, and loopback listener selection.
-// A losing instance activates the owner and never creates a listener.
+// the instance guard, stale rendezvous cleanup, and loopback listener
+// selection. A losing instance opens the running owner's web interface and
+// never creates a listener; the returned bool reports that hand-off.
 func acquireRuntimeOwnership(root string, explicitPort ...int) (*runtimeOwnership, bool, error) {
 	return acquireRuntimeOwnershipWithListener(root, func() (net.Listener, runtimeendpoint.Endpoint, error) {
 		if len(explicitPort) > 1 {
@@ -386,14 +472,10 @@ func acquireRuntimeOwnershipWithListener(
 	guard, err := instanceguard.Acquire(filepath.Join(root, "replicaro.instance"))
 	if err != nil {
 		if errors.Is(err, instanceguard.ErrAlreadyRunning) {
-			ctx, cancel := context.WithTimeout(context.Background(), startupPublicationActivationWindow)
-			defer cancel()
-			publicationWait := startupPublicationActivationWindow - activationRequestReserve
-			activationErr := rendezvous.Activate(ctx, filepath.Join(root, rendezvous.FileName), publicationWait)
-			if activationErr == nil {
-				return nil, true, nil
+			if openErr := openRunningInstance(root); openErr != nil {
+				return nil, false, errors.Join(err, openErr)
 			}
-			return nil, false, errors.Join(err, activationErr)
+			return nil, true, nil
 		}
 		return nil, false, err
 	}
@@ -403,8 +485,12 @@ func acquireRuntimeOwnershipWithListener(
 	fail := func(err error) (*runtimeOwnership, bool, error) {
 		return nil, false, errors.Join(err, ownership.Close())
 	}
-	if err := rendezvous.PrepareOwner(ownership.rendezvousPath); err != nil {
+	discarded, err := rendezvous.PrepareOwner(ownership.rendezvousPath)
+	if err != nil {
 		return fail(err)
+	}
+	if discarded != nil {
+		log.Printf("Replicaro removed a leftover rendezvous record it could not read (%s): %v", ownership.rendezvousPath, discarded)
 	}
 	ownership.listener, ownership.endpoint, err = listen()
 	if err != nil {
@@ -417,8 +503,33 @@ func acquireRuntimeOwnershipWithListener(
 	return ownership, false, nil
 }
 
+// openRunningInstance is the whole second-launch path: read the running
+// owner's URL from its rendezvous record, open it in the browser from this
+// process, and let the caller exit. There's deliberately no request to the
+// running instance. Only local programs can read the owner-only record, and
+// Replicaro doesn't defend against those; web pages can't read it, and the API
+// keeps them out with its Host, Origin, Fetch-Metadata, JSON and
+// installation-UUID checks. Opening the URL from here also lets the browser
+// come forward with the focus the user just gave this launch.
+//
+// Don't add an activation endpoint or token back here without a product
+// decision: it would only guard against local programs, and tools that read
+// the record still find the same fields.
+func openRunningInstance(root string) error {
+	target, err := rendezvous.WaitForRunningURL(filepath.Join(root, rendezvous.FileName), secondLaunchPublicationWait)
+	if err != nil {
+		return err
+	}
+	webURL := target + "/"
+	log.Printf("Replicaro is already running at %s", webURL)
+	if err := openRunningWebUI(webURL); err != nil {
+		return fmt.Errorf("open the running Replicaro web interface: %w", err)
+	}
+	return nil
+}
+
 // ServeAndPublish starts the configured handler, proves that Serve has entered
-// the owned listener's accept loop, and only then publishes the activation
+// the owned listener's accept loop, and only then publishes the rendezvous
 // record. Readiness deliberately does not require a synthetic client socket.
 func (ownership *runtimeOwnership) ServeAndPublish(server *http.Server) (<-chan error, error) {
 	if ownership == nil || ownership.listener == nil || server == nil {
@@ -450,15 +561,38 @@ func (ownership *runtimeOwnership) ServeAndPublish(server *http.Server) (<-chan 
 	return serveDone, nil
 }
 
+// Unpublish removes the rendezvous record while this process still holds the
+// instance guard. run calls it as the very first shutdown step, before the
+// HTTP drain and the worker stops, which together can take several seconds.
+// A launch arriving in that window finds no record, waits for one, and fails
+// with the usual "already running" error (or opens the next owner if one
+// starts in time), instead of reading a record whose PID is still alive and
+// opening a listener that has already closed. Close calls it again; once the
+// record is gone that's a no-op.
+//
+// A launch that read the record a moment before this runs can still open the
+// URL just after the listener closes. That gap is milliseconds wide and only
+// costs a browser tab that doesn't load, so there's no connection probe.
+//
+// Don't move this back into Close alone: Close runs after the whole shutdown.
+func (ownership *runtimeOwnership) Unpublish() error {
+	if ownership == nil || !ownership.published {
+		return nil
+	}
+	if err := rendezvous.Remove(ownership.rendezvousPath); err != nil {
+		return err
+	}
+	ownership.published = false
+	return nil
+}
+
 func (ownership *runtimeOwnership) Close() error {
 	if ownership == nil {
 		return nil
 	}
 	ownership.closeOnce.Do(func() {
 		var errs []error
-		if ownership.published {
-			errs = append(errs, rendezvous.RemoveIfNonce(ownership.rendezvousPath, ownership.record.Nonce))
-		}
+		errs = append(errs, ownership.Unpublish())
 		if ownership.listener != nil {
 			if err := ownership.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				errs = append(errs, err)
@@ -475,7 +609,7 @@ func (ownership *runtimeOwnership) Close() error {
 type shutdownHooks struct {
 	rcloneAuth                                                           func() error
 	http, scheduler, runner, metadata, statistics, profiles, kopiaPolicy func(context.Context) error
-	kopiaReconnect, resticRecovery                                       func(context.Context) error
+	kopiaReconnect, resticRecovery, passwordRecovery                     func(context.Context) error
 	// operations joins the request-started background operations (restore,
 	// manual check and maintenance, snapshot and job deletion): it waits for
 	// each to save its final state. Their cancel happens earlier, before the
@@ -519,8 +653,7 @@ var admitStartupStuckRepository = func(ctx context.Context, db *sql.DB, repo mod
 	return repositoryadmission.AdmitControlPlaneReadUnderLock(
 		ctx, db, repo,
 		func(ctx context.Context, candidate models.Repository) error {
-			store := (vaultprofile.Store{Repository: candidate}).
-				WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+			store := (vaultprofile.Store{Repository: candidate})
 			if err := store.AssertRootIdentity(ctx); err != nil {
 				return err
 			}
@@ -551,6 +684,20 @@ func prepareStartupResticRecovery(parent context.Context, db *sql.DB) (*startupR
 	if err != nil {
 		return nil, fmt.Errorf("load stuck Restic vault recovery: %w", err)
 	}
+	// Startup password recovery already holds a vault whose change is still
+	// before commit, and the unlock below skips such a vault anyway. Leave it
+	// out instead of failing startup on that lock. Skipping it is safe: until
+	// the change commits, every operation kind that selects a vault for this
+	// unlock is refused on it, the backups and checks that run once it ends
+	// still run their own Restic unlock first, and Migrate has already reset
+	// the statuses that selected the vault.
+	repositories = slices.DeleteFunc(repositories, func(repo models.Repository) bool {
+		if !runner.StartupPasswordRecoveryRunning(repo.ID) {
+			return false
+		}
+		log.Printf("native Restic startup auto unlock skipped for vault %s while vault-password recovery is unresolved", repo.ID)
+		return true
+	})
 	ctx, cancel := context.WithCancel(parent)
 	recovery := &startupResticRecovery{published: make(chan struct{}), done: make(chan struct{}), cancel: cancel}
 	unlocks := make([]func(), 0, len(repositories))
@@ -635,9 +782,7 @@ func unlockStartupStuckResticRepository(ctx context.Context, db *sql.DB, repo mo
 		resolveErr = probeStartupStuckResticIdentity(ctx, repo)
 	}
 	if resolveErr == nil {
-		engine, engineErr := engines.ResolveWithRepositoryAvailabilityCheck(
-			repo, storageavailability.RequireRepositoryAvailable,
-		)
+		engine, engineErr := engines.Resolve(repo)
 		resolveErr = engineErr
 		if resolveErr == nil {
 			_, resolveErr = engines.UnlockResticRepository(ctx, engine, repo)
@@ -680,7 +825,7 @@ func shutdownInOrder(ctx context.Context, hooks shutdownHooks) error {
 	// resources stay open.
 	producers := []func(context.Context) error{
 		hooks.scheduler, hooks.statistics, hooks.runner, hooks.metadata, hooks.profiles, hooks.kopiaPolicy,
-		hooks.kopiaReconnect, hooks.resticRecovery, hooks.operations,
+		hooks.kopiaReconnect, hooks.resticRecovery, hooks.passwordRecovery, hooks.operations,
 	}
 	done := make(chan error, len(producers))
 	pending := 0
@@ -807,6 +952,29 @@ func startupRollbackHooks(
 	}
 }
 
+func warnAboutUnknownOptions(names []string) {
+	for _, name := range names {
+		log.Printf("ignoring unknown option %q", name)
+	}
+}
+
+// timeZoneWarning returns the startup line for a set TZ that Go couldn't
+// load (local is then UTC), or "". Go falls back to UTC without saying so,
+// which in Docker means cron schedules quietly run at UTC. Go strips one
+// leading ":" and treats an empty value and "UTC" as UTC on purpose, so those
+// get no warning. Windows ignores TZ (Go asks Windows for the zone), so it
+// never warns there.
+func timeZoneWarning(tz string, local *time.Location) string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	name := strings.TrimPrefix(tz, ":")
+	if name == "" || name == "UTC" || local.String() != "UTC" {
+		return ""
+	}
+	return fmt.Sprintf("Replicaro could not load the time zone TZ=%q and uses UTC instead; schedules run in UTC. Use a zone name such as Europe/Berlin.", tz)
+}
+
 func run() (result error) {
 	options, err := parseStartupOptions(os.Args[1:])
 	// Answer help before any startup work, so asking for it never starts
@@ -825,12 +993,15 @@ func run() (result error) {
 	}
 	// Warn before checking the error: the parser keeps the unknown names when
 	// a combination of options is rejected, and the typo is usually the cause.
-	for _, name := range options.unknownOptions {
-		log.Printf("ignoring unknown option %q", name)
+	// A command line that is accepted gets its warnings once the startup log
+	// is open, below, so they're in the file too.
+	if err != nil || options.containerPublishedPort != nil {
+		warnAboutUnknownOptions(options.unknownOptions)
 	}
 	if err != nil {
 		return err
 	}
+	headlessStart = headlessServiceMode(runtime.GOOS, options)
 	if options.containerPublishedPort != nil {
 		if err := requireContainerRuntime(); err != nil {
 			return err
@@ -839,25 +1010,32 @@ func run() (result error) {
 			return err
 		}
 	}
+	// The startup log is opened here, after the options are known to be
+	// valid: a rejected command line must not create app data. Its error
+	// still reaches stderr and the failure notice, just not the file.
+	if options.containerPublishedPort == nil {
+		startupLogPath = startStartupLog()
+		warnAboutUnknownOptions(options.unknownOptions)
+	}
 	root, err := appdata.Directory("")
 	if err != nil {
 		return err
 	}
 	var runtimeOwner *runtimeOwnership
-	var activatedExisting bool
+	var openedExisting bool
 	if options.containerPublishedPort != nil {
-		runtimeOwner, activatedExisting, err = acquireContainerRuntimeOwnership(root, *options.containerPublishedPort)
+		runtimeOwner, openedExisting, err = acquireContainerRuntimeOwnership(root, *options.containerPublishedPort)
 	} else {
 		var explicitPort []int
 		if options.loopbackPort != nil {
 			explicitPort = append(explicitPort, *options.loopbackPort)
 		}
-		runtimeOwner, activatedExisting, err = acquireRuntimeOwnership(root, explicitPort...)
+		runtimeOwner, openedExisting, err = acquireRuntimeOwnership(root, explicitPort...)
 	}
 	if err != nil {
 		return err
 	}
-	if activatedExisting {
+	if openedExisting {
 		return nil
 	}
 	defer func() {
@@ -868,7 +1046,6 @@ func run() (result error) {
 	if err := desktop.ConfigureEndpoint(endpoint); err != nil {
 		return err
 	}
-	record := runtimeOwner.record
 	storageRunner, err := storagehelper.NewRunner(storageavailability.DefaultObservationTimeout, 4)
 	if err != nil {
 		return err
@@ -876,6 +1053,11 @@ func run() (result error) {
 	storageavailability.Configure(storageRunner, storageavailability.DefaultObservationTimeout)
 
 	log.Printf("Replicaro starting on %s", endpoint.String())
+	if tz, set := os.LookupEnv("TZ"); set {
+		if warning := timeZoneWarning(tz, time.Local); warning != "" {
+			log.Print(warning)
+		}
+	}
 	if err := command.CleanupCapturedOutput(); err != nil {
 		log.Printf("Replicaro could not remove every abandoned command-output file: %v", err)
 	}
@@ -899,6 +1081,12 @@ func run() (result error) {
 		_ = db.Close()
 		return err
 	}
+	// Every vault and the browser's client UUID check use the installation ID,
+	// so a damaged one is settled before anything else uses the database.
+	if err := settleInstallationID(db, options.repairInstallation, startupRepairQuestion(runtime.GOOS, stderrCaptured())); err != nil {
+		_ = db.Close()
+		return err
+	}
 	// Storage support diagnostics (fixed step labels and OS codes only) go to
 	// the support-only activity level so they appear in support exports.
 	storageavailability.ConfigureSupportLog(func(message string) { _ = database.LogSupport(db, message) })
@@ -910,27 +1098,20 @@ func run() (result error) {
 		_ = db.Close()
 		return fmt.Errorf("recover local engine artifacts: %w", err)
 	}
-	if err := engines.CleanupRcloneSessions(); err != nil {
+	if err := cleanUpStartupLeftovers(db); err != nil {
 		_ = db.Close()
-		return fmt.Errorf("clean stale rclone sessions: %w", err)
+		return err
 	}
-	rcloneConfigOwners, err := database.RcloneVaultConfigOwnerIDs(db)
+	// Vaults with an unfinished password change are reserved here, before any
+	// worker or request exists; their recovery runs once the UI is served (see
+	// runner.StartupPasswordRecovery). A start that fails before then only
+	// releases the reservations.
+	passwordRecovery, err := runner.PrepareStartupPasswordRecovery(db, 30*time.Minute)
 	if err != nil {
-		_ = db.Close()
-		return fmt.Errorf("classify native rclone vault configs: %w", err)
-	}
-	if err := engines.ReconcileRcloneVaultConfigs(rcloneConfigOwners); err != nil {
-		_ = db.Close()
-		return fmt.Errorf("reconcile native rclone vault configs: %w", err)
-	}
-	passwordRecoveryCtx, cancelPasswordRecovery := context.WithTimeout(context.Background(), 30*time.Minute)
-	sendRecoveredPasswordNotifications, err := runner.RecoverVaultPasswordChangesOnce(passwordRecoveryCtx, db)
-	if err != nil {
-		cancelPasswordRecovery()
 		_ = db.Close()
 		return fmt.Errorf("recover interrupted vault-password changes: %w", err)
 	}
-	cancelPasswordRecovery()
+	defer passwordRecovery.Cancel()
 	settings, err := database.GetSettings(db)
 	if err != nil {
 		_ = db.Close()
@@ -974,6 +1155,7 @@ func run() (result error) {
 		defer cancelRollback()
 		rollbackHooks := startupRollbackHooks(db, readDB, nil, stopKopiaPolicy)
 		rollbackHooks.resticRecovery = resticRecovery.stop
+		rollbackHooks.passwordRecovery = passwordRecovery.Stop
 		rollbackErr := shutdownInOrder(rollbackCtx, rollbackHooks)
 		return errors.Join(fmt.Errorf("prepare startup Kopia policy verification: %w", err), rollbackErr)
 	}
@@ -985,12 +1167,12 @@ func run() (result error) {
 	var closeRcloneAuth func() error
 	if options.containerPublishedPort != nil {
 		server, closeRcloneAuth = api.NewContainerServerAtWithReaderAndRuntime(
-			db, readDB, endpoint, options.lanOrigins, record, desktop.RestoreWindow,
+			db, readDB, endpoint, options.lanOrigins,
 			containerRcloneAuthRelayPort, operationRuntime, updater,
 		)
 	} else {
 		server, closeRcloneAuth = api.NewServerAtWithReaderAndRuntime(
-			db, readDB, endpoint, options.lanOrigins, record, desktop.RestoreWindow,
+			db, readDB, endpoint, options.lanOrigins,
 			options.rcloneAuthNoOpenBrowser, headlessServiceMode(runtime.GOOS, options), operationRuntime, updater,
 		)
 	}
@@ -1004,6 +1186,7 @@ func run() (result error) {
 		defer cancelRollback()
 		rollbackHooks := startupRollbackHooks(db, readDB, stopMetadata, stopKopiaPolicy)
 		rollbackHooks.resticRecovery = resticRecovery.stop
+		rollbackHooks.passwordRecovery = passwordRecovery.Stop
 		rollbackHooks.statistics = stopStatistics
 		rollbackHooks.rcloneAuth = closeRcloneAuth
 		rollbackErr := shutdownInOrder(
@@ -1013,48 +1196,147 @@ func run() (result error) {
 		return errors.Join(err, rollbackErr)
 	}
 	// Native recovery may wait on unavailable storage. Start the reserved
-	// Restic pass and existing Kopia reconnect recovery after API/UI publication.
+	// Restic pass, the reserved password-change recovery and the existing Kopia
+	// reconnect recovery after API/UI publication.
 	close(resticRecovery.published)
+	passwordRecovery.Start()
 	stopKopiaReconnect := startKopiaFilesystemReconnectRecovery(applicationCtx, db)
 	stopScheduler := scheduler.StartContextWithRuntime(db, operationRuntime)
 	stopProfiles := profilesync.StartContext(db)
 	updater.StartAutomatic(updateCtx)
-	serveErr := desktop.Run(func() error {
-		// Startup password recovery registered these before the desktop
-		// integration existed; desktop.Run has set it up by the time it calls
-		// this, so a native notification is no longer dropped.
-		sendRecoveredPasswordNotifications()
-		return <-serveDone
-	})
+	// The staged shutdown runs once. It normally starts when desktop.Run
+	// returns. On Windows at the end of a session, and on macOS for Quit and
+	// the end of a session, the OS instead expects the app to finish while
+	// its own event loop waits, so desktop.Run starts it from there; on macOS
+	// AppKit then exits the process without desktop.Run returning. Otherwise
+	// the call after desktop.Run waits for that run and returns its result.
+	shutdown := sync.OnceValue(func() error {
+		// Withdraw the rendezvous record first, while the guard is still held,
+		// so a launch during the rest of shutdown can't open a URL that's about
+		// to stop answering. See runtimeOwnership.Unpublish.
+		unpublishErr := runtimeOwner.Unpublish()
 
-	// Close HTTP admission and drain/cancel request contexts before any handler
-	// can recreate or submit work to a worker coordinator being torn down.
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
-	// A request may be waiting behind startup recovery's reserved vault lock.
-	// Begin canceling its native child before HTTP drain, then join the worker
-	// with the other producers before closing SQLite. Cancellation has no total
-	// native deadline during normal operation and does not replay interrupted work.
-	resticRecovery.cancel()
-	cancelUpdate()
-	shutdownErr := shutdownWithTrackedOperations(shutdownCtx, operationRuntime, shutdownHooks{
-		http:           shutdownHTTP,
-		rcloneAuth:     closeRcloneAuth,
-		updater:        updater.Wait,
-		scheduler:      stopScheduler,
-		runner:         func(ctx context.Context) error { return runner.ShutdownContext(ctx, db) },
-		metadata:       stopMetadata,
-		statistics:     stopStatistics,
-		profiles:       stopProfiles,
-		kopiaPolicy:    stopKopiaPolicy,
-		kopiaReconnect: stopKopiaReconnect,
-		resticRecovery: resticRecovery.stop,
-		notifications:  func(ctx context.Context) error { return notifications.Wait(ctx) },
-		database: func(ctx context.Context) error {
-			return errors.Join(database.CloseMetadataCaches(ctx), readDB.Close(), db.Close())
-		},
+		// Close HTTP admission and drain/cancel request contexts before any
+		// handler can recreate or submit work to a worker coordinator being
+		// torn down.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelShutdown()
+		// A request may be waiting behind startup recovery's reserved vault
+		// lock. Begin canceling its native child before HTTP drain, then join
+		// the worker with the other producers before closing SQLite.
+		// Cancellation has no total native deadline during normal operation
+		// and does not replay interrupted work.
+		resticRecovery.cancel()
+		passwordRecovery.Cancel()
+		cancelUpdate()
+		shutdownErr := shutdownWithTrackedOperations(shutdownCtx, operationRuntime, shutdownHooks{
+			http:             shutdownHTTP,
+			rcloneAuth:       closeRcloneAuth,
+			updater:          updater.Wait,
+			scheduler:        stopScheduler,
+			runner:           func(ctx context.Context) error { return runner.ShutdownContext(ctx, db) },
+			metadata:         stopMetadata,
+			statistics:       stopStatistics,
+			profiles:         stopProfiles,
+			kopiaPolicy:      stopKopiaPolicy,
+			kopiaReconnect:   stopKopiaReconnect,
+			resticRecovery:   resticRecovery.stop,
+			passwordRecovery: passwordRecovery.Stop,
+			notifications:    func(ctx context.Context) error { return notifications.Wait(ctx) },
+			database: func(ctx context.Context) error {
+				return errors.Join(database.CloseMetadataCaches(ctx), readDB.Close(), db.Close())
+			},
+		})
+		// shutdownInOrder returns at the HTTP step when the drain runs out of
+		// time, before its rclone sign-in step, and the deferred close in run
+		// never runs when the OS ends the process after this shutdown (macOS
+		// after a terminate request, Windows after WM_ENDSESSION). So the
+		// cloud sign-in sessions are closed here as well, which cancels their
+		// rclone work and removes their session folders. When the step above
+		// already closed them, this call finds nothing left to close.
+		rcloneAuthErr := closeRcloneAuth()
+		return errors.Join(unpublishErr, shutdownErr, rcloneAuthErr)
 	})
+	// The tray labels and the Quit prompt use the saved UI language. The
+	// labels are read once, when Run sets up the tray; the prompt reads the
+	// setting each time it opens.
+	desktop.SetText(func() func(key string) string { return savedLanguageLookup(db) })
+	serveErr := desktop.Run(func() error {
+		serviceStarted.Store(true)
+		// Startup password recovery holds its notifications until the desktop
+		// integration exists; desktop.Run has set it up by the time it calls
+		// this, so a native notification is no longer dropped.
+		passwordRecovery.DeliverNotifications()
+		return <-serveDone
+	}, shutdown)
 	serveErr = normalizeHTTPServeError(serveErr)
-	result = errors.Join(serveErr, shutdownErr)
+	result = errors.Join(serveErr, shutdown())
 	return result
+}
+
+// savedLanguageLookup resolves the saved UI language once and returns a
+// catalog lookup for it. When the setting can't be read, as during shutdown
+// once the database is closed, it falls back to English.
+func savedLanguageLookup(db *sql.DB) func(key string) string {
+	language := models.LanguageEnglish
+	if settings, err := database.GetSettings(db); err == nil {
+		language = settings.Language
+	}
+	effective := locale.Effective(language)
+	return func(key string) string { return locale.Text(effective, key, nil) }
+}
+
+// cleanUpStartupLeftovers reads once which vault IDs a saved vault, pending
+// creation or pending connection owns, and removes what an earlier process
+// left behind for any other ID. Without that list nothing is removed and
+// startup stops: removing a live vault's rclone config would sign it out.
+func cleanUpStartupLeftovers(db *sql.DB) error {
+	owners, err := database.RcloneVaultConfigOwnerIDs(db)
+	if err != nil {
+		return fmt.Errorf("classify native rclone vault configs: %w", err)
+	}
+	cleanUpRcloneStartupState(owners)
+	cleanUpEngineStartupLeftovers(owners)
+	return nil
+}
+
+// cleanUpEngineStartupLeftovers removes engine files an earlier process left
+// behind: the engine cache folders of vault IDs not in owners, and the
+// temporary copies an interrupted install of a bundled program left next to
+// it. It runs before any worker or request can start an engine or install
+// one.
+//
+// Both only take up space, so a failure is logged and startup goes on; the
+// next start tries again.
+func cleanUpEngineStartupLeftovers(owners map[string]bool) {
+	removed, err := engines.ReconcileRepositoryCaches(owners)
+	if removed > 0 {
+		log.Printf("Replicaro removed %d orphaned engine cache folders", removed)
+	}
+	if err != nil {
+		log.Printf("Replicaro could not remove every orphaned engine cache: %v", err)
+	}
+	if err := appdata.RemoveStaleInstallTemporaries(
+		filepath.Join("engines", engines.ResticID), filepath.Join("engines", engines.KopiaID),
+		filepath.Join("components", "rclone"), filepath.Join("components", "storage-helper"),
+	); err != nil {
+		log.Printf("Replicaro could not remove every interrupted engine install: %v", err)
+	}
+}
+
+// cleanUpRcloneStartupState removes what an earlier process left behind in
+// Replicaro's private rclone folders: stale sign-in and operation sessions,
+// and the config folders of vaults not in owners. It runs after the database
+// is open and before any rclone operation can start.
+//
+// Failing to remove something is only logged. Leftover sessions never affect
+// new ones, and a leftover vault config is retried on the next start, so
+// neither is a reason to keep Replicaro from starting.
+func cleanUpRcloneStartupState(owners map[string]bool) {
+	if err := engines.CleanupRcloneSessions(); err != nil {
+		log.Printf("Replicaro could not remove every stale rclone session: %v", err)
+	}
+	if err := engines.ReconcileRcloneVaultConfigs(owners); err != nil {
+		log.Printf("Replicaro could not remove every orphaned rclone vault config: %v", err)
+	}
 }

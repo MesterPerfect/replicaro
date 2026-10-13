@@ -1,21 +1,41 @@
+// Package rendezvous publishes where the running Replicaro serves its web
+// interface, so a second launch can open it instead of starting another
+// service.
+//
+// The instance guard decides which process owns the service. The owner writes
+// a small record (replicaro.runtime.json in the app-data folder) once its
+// listener is accepting connections and removes it at shutdown. A launch that
+// loses the guard reads the URL from that record and opens it in the browser
+// itself, then exits.
+//
+// The record is owner-only (0600 on Unix; on Windows it inherits the app-data
+// folder's protected DACL), atomically replaced, size-bounded and strictly
+// decoded, and it is only used while the PID it names is alive. Those checks
+// cover crashes, half-written files and a stale record left by an old
+// process. Nothing here tries to stop another program running as the same
+// user from reading or rewriting the record: anything with that access can
+// already drive Replicaro directly, and Replicaro doesn't defend against
+// software or people that have access to the computer. Web pages are a
+// different matter, and the API keeps them out with its Host, Origin,
+// Fetch-Metadata, JSON and installation-UUID checks, none of which depend on
+// this record.
+//
+// Don't add an activation endpoint, token check or ACL/owner verifier back
+// here without a product decision: a second launch already has everything it
+// needs to open the UI, and those checks only resisted local tampering.
 package rendezvous
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
-	"net"
-	"net/http"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/local/replicaro/appdata"
@@ -23,26 +43,27 @@ import (
 )
 
 const (
-	RecordVersion     = "replicaro-rendezvous-v1"
-	ActivationVersion = "replicaro-activation-v1"
-	FileName          = "replicaro.runtime.json"
-	ActivationPath    = "/api/activate"
-	maxRecordBytes    = 4096
-	maxActivationBody = 1024
+	RecordVersion  = "replicaro-rendezvous-v1"
+	FileName       = "replicaro.runtime.json"
+	maxRecordBytes = 4096
+	retryInterval  = 25 * time.Millisecond
 )
 
+// Record is the published file. Replicaro reads only the PID and URL, and it
+// accepts a record with or without the nonce and activation token.
+//
+// It still writes both as random values because other Replicaro versions
+// require them when they read the record. A version that requires them treats
+// a record without them as invalid: its second launch keeps waiting for a
+// running instance until it gives up, and some versions also refuse to start
+// over a leftover record they can't read. Don't stop writing them without a
+// product decision about those versions.
 type Record struct {
 	Version string `json:"version"`
 	Nonce   string `json:"nonce"`
 	PID     int    `json:"pid"`
 	URL     string `json:"url"`
 	Token   string `json:"activationToken"`
-}
-
-type ActivationRequest struct {
-	Version string `json:"version"`
-	Nonce   string `json:"nonce"`
-	PID     int    `json:"pid"`
 }
 
 func NewRecord(endpoint runtimeendpoint.Endpoint) (Record, error) {
@@ -61,17 +82,52 @@ func NewRecord(endpoint runtimeendpoint.Endpoint) (Record, error) {
 	return record, record.validate()
 }
 
-func PrepareOwner(path string) error {
-	record, err := read(path, false)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+// PrepareOwner runs right after this process wins the instance guard, so no
+// running Replicaro owns the record at path. Anything still there was left by
+// an earlier owner that didn't shut down cleanly, and it's removed before the
+// new record is published.
+//
+// That includes a record that can't be read or decoded: a leftover from a
+// crash, from a run under sudo, or from an older or newer record format.
+// Refusing to start over it would block every launch until someone found and
+// deleted a hidden file by hand. When that happens the read error comes back
+// as discarded so the caller can log it. A link whose target is gone counts
+// too: opening follows the link and reports the record as missing, but
+// Publish refuses anything at path, so leaving the link would fail every
+// launch. path is always the fixed record name in the app-data folder, and
+// os.Remove neither follows a link nor recurses into a folder, so nothing else
+// can go with it. Startup only stops when the removal itself fails.
+func PrepareOwner(path string) (discarded error, err error) {
+	_, readErr := read(path, false)
+	if errors.Is(readErr, os.ErrNotExist) {
+		if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+			return nil, nil
+		}
+		readErr = fmt.Errorf("link target is missing: %w", withoutPath(path, readErr))
 	}
-	if err != nil {
-		return fmt.Errorf("refuse unsafe stale rendezvous state: %w", err)
+	if readErr == nil {
+		return nil, Remove(path)
 	}
-	return removeMatching(path, record.Nonce)
+	readErr = withoutPath(path, readErr)
+	if removeErr := Remove(path); removeErr != nil {
+		return nil, fmt.Errorf("Replicaro can't remove the leftover file %s (%w); it also couldn't be read (%w). Delete it and start Replicaro again",
+			path, withoutPath(path, removeErr), readErr)
+	}
+	return readErr, nil
 }
 
+// withoutPath drops the *fs.PathError wrapper when it names path. The
+// messages built from these errors already show path once, and the wrapped
+// cause (permission denied, a decode error) is the part worth reading.
+func withoutPath(path string, err error) error {
+	if pathErr, ok := err.(*fs.PathError); ok && pathErr.Path == path {
+		return pathErr.Err
+	}
+	return err
+}
+
+// Publish writes the record to a private temporary file in the same folder
+// and renames it into place, so a reader never sees a partial record.
 func Publish(path string, record Record) error {
 	if err := record.validate(); err != nil {
 		return err
@@ -94,6 +150,9 @@ func Publish(path string, record Record) error {
 			_ = os.Remove(temporary)
 		}
 	}()
+	// CreateTemp already uses 0600 on Unix. The explicit chmod keeps that
+	// true whatever the umask or a future CreateTemp does; on Windows it's a
+	// no-op and the file inherits the app-data folder's DACL.
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
@@ -108,12 +167,6 @@ func Publish(path string, record Record) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := appdata.SecurePath(temporary, false); err != nil {
-		return err
-	}
-	if err := validateOwnerOnly(temporary); err != nil {
-		return err
-	}
 	if err := appdata.AtomicReplace(temporary, path); err != nil {
 		return err
 	}
@@ -121,43 +174,46 @@ func Publish(path string, record Record) error {
 	return nil
 }
 
-func RemoveIfNonce(path, nonce string) error {
-	if !validSecret(nonce) {
-		return fmt.Errorf("rendezvous nonce is invalid")
-	}
-	record, err := read(path, false)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+// Remove deletes the record at path and ignores one that's already gone. The
+// owner calls it at shutdown, and PrepareOwner uses it for a leftover from an
+// earlier owner; both run while the instance guard is held.
+func Remove(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if subtle.ConstantTimeCompare([]byte(record.Nonce), []byte(nonce)) != 1 {
-		return nil
-	}
-	return removeMatching(path, nonce)
+	return nil
 }
 
-func removeMatching(path, nonce string) error {
-	record, err := read(path, false)
-	if err != nil {
-		return err
-	}
-	if subtle.ConstantTimeCompare([]byte(record.Nonce), []byte(nonce)) != 1 {
-		return nil
-	}
-	return os.Remove(path)
-}
-
-func ReadForActivation(path string) (Record, error) {
+// ReadRunning returns the record only when it decodes cleanly and the process
+// it names is still alive.
+func ReadRunning(path string) (Record, error) {
 	return read(path, true)
 }
 
-func read(path string, requireLivePID bool) (Record, error) {
-	if err := validateOwnerOnly(path); err != nil {
-		return Record{}, err
+// WaitForRunningURL is what a launch that lost the instance guard uses. The
+// owner takes the guard well before it publishes (it opens the database and
+// runs startup recovery first), so a missing, stale or not-yet-valid record is
+// retried until wait runs out.
+func WaitForRunningURL(path string, wait time.Duration) (string, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		record, err := ReadRunning(path)
+		if err == nil {
+			return record.URL, nil
+		}
+		if !time.Now().Before(deadline) {
+			return "", fmt.Errorf("find the running Replicaro: %w", err)
+		}
+		time.Sleep(min(retryInterval, time.Until(deadline)))
 	}
-	file, err := os.Open(path)
+}
+
+func read(path string, requireLivePID bool) (Record, error) {
+	// A second launch polls this file while the owner may be removing it
+	// (stale-record cleanup at startup, or shutdown). A plain os.Open on
+	// Windows doesn't share delete, so the owner's os.Remove would fail with
+	// a sharing violation for as long as a reader held it open.
+	file, err := appdata.OpenFileShareDelete(path, os.O_RDONLY, 0)
 	if err != nil {
 		return Record{}, err
 	}
@@ -182,115 +238,8 @@ func read(path string, requireLivePID bool) (Record, error) {
 	return record, nil
 }
 
-func Activate(ctx context.Context, path string, retryFor time.Duration) error {
-	if retryFor <= 0 {
-		retryFor = 750 * time.Millisecond
-	}
-	deadline := time.Now().Add(retryFor)
-	var record Record
-	var err error
-	for {
-		record, err = ReadForActivation(path)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
-	body, err := json.Marshal(ActivationRequest{
-		Version: ActivationVersion, Nonce: record.Nonce, PID: record.PID,
-	})
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, record.URL+ActivationPath, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+record.Token)
-	request.Header.Set("Content-Type", "application/json")
-	request.Host = strings.TrimPrefix(record.URL, "http://")
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-		Transport: &http.Transport{
-			Proxy:       nil,
-			DialContext: (&net.Dialer{Timeout: time.Second}).DialContext,
-		},
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("activation redirect is not permitted")
-		},
-	}
-	endpoint, err := runtimeendpoint.ParseExact(record.URL)
-	if err != nil {
-		return err
-	}
-	clientUUID, err := runtimeendpoint.ReadClientUUID(ctx, client, endpoint)
-	if err != nil {
-		return fmt.Errorf("read existing Replicaro installation: %w", err)
-	}
-	request.Header.Set(runtimeendpoint.ClientUUIDHeader, clientUUID)
-	response, err := client.Do(request)
-	if err != nil {
-		return fmt.Errorf("activate existing Replicaro instance: %w", err)
-	}
-	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxActivationBody))
-	if response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("existing Replicaro instance rejected activation")
-	}
-	return nil
-}
-
-func Handler(record Record, activate func() error) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method is not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-		if err != nil || !strings.EqualFold(mediaType, "application/json") {
-			http.Error(w, "Content-Type application/json is required", http.StatusUnsupportedMediaType)
-			return
-		}
-		if request.ContentLength < 0 || request.ContentLength > maxActivationBody {
-			http.Error(w, "activation body is invalid", http.StatusBadRequest)
-			return
-		}
-		authorizations := request.Header.Values("Authorization")
-		authorization := request.Header.Get("Authorization")
-		expected := "Bearer " + record.Token
-		if len(authorizations) != 1 || len(authorization) != len(expected) ||
-			subtle.ConstantTimeCompare([]byte(authorization), []byte(expected)) != 1 {
-			http.Error(w, "activation authentication failed", http.StatusUnauthorized)
-			return
-		}
-		request.Body = http.MaxBytesReader(w, request.Body, maxActivationBody)
-		var activation ActivationRequest
-		if err := decodeStrictReader(request.Body, &activation); err != nil ||
-			activation.Version != ActivationVersion || activation.PID != record.PID ||
-			len(activation.Nonce) != len(record.Nonce) ||
-			subtle.ConstantTimeCompare([]byte(activation.Nonce), []byte(record.Nonce)) != 1 {
-			http.Error(w, "activation body is invalid", http.StatusBadRequest)
-			return
-		}
-		if activate == nil || activate() != nil {
-			http.Error(w, "activation failed", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	})
-}
-
 func (record Record) validate() error {
-	if record.Version != RecordVersion || !validSecret(record.Nonce) ||
-		!validSecret(record.Token) || record.PID <= 0 {
+	if record.Version != RecordVersion || record.PID <= 0 {
 		return fmt.Errorf("rendezvous record fields are invalid")
 	}
 	endpoint, err := runtimeendpoint.ParseExact(record.URL)
@@ -308,20 +257,8 @@ func randomSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(value), nil
 }
 
-func validSecret(value string) bool {
-	if len(value) != base64.RawURLEncoding.EncodedLen(32) {
-		return false
-	}
-	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
-	return err == nil && len(decoded) == 32 && base64.RawURLEncoding.EncodeToString(decoded) == value
-}
-
 func decodeStrict(data []byte, target any) error {
-	return decodeStrictReader(bytes.NewReader(data), target)
-}
-
-func decodeStrictReader(reader io.Reader, target any) error {
-	decoder := json.NewDecoder(reader)
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err

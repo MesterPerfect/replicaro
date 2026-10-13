@@ -220,10 +220,11 @@ func supportCatalogSecretValues(connector string, options map[string]string) []s
 	return integrations.SecretValues(connector, rest)
 }
 
-// Environment variable values shorter than this are not redacted. They are
-// settings such as RCLONE_TRANSFERS=1 or "true", not credentials, and as plain
-// substrings they would blank every matching digit or word in the report.
-const supportRcloneVariableMinimumLength = 6
+// SupportEnvironmentValueMinimumLength is the shortest environment variable
+// value the support report redacts. Shorter values are settings such as
+// RCLONE_TRANSFERS=1 or "true", not credentials, and as plain substrings they
+// would blank every matching digit or word in the report.
+const SupportEnvironmentValueMinimumLength = 6
 
 // rcloneRemotePrivacyValues returns what an Any Rclone Remote vault adds to
 // the privacy context: the config file path (which often holds the user
@@ -255,7 +256,7 @@ func rcloneRemotePrivacyValues(connector string, options map[string]string, valu
 	}
 	for _, variable := range variables {
 		trimmed := strings.TrimSpace(variable.Value)
-		if utf8.RuneCountInString(trimmed) < supportRcloneVariableMinimumLength {
+		if utf8.RuneCountInString(trimmed) < SupportEnvironmentValueMinimumLength {
 			continue
 		}
 		values := []string{variable.Value}

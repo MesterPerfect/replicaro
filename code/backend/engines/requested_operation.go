@@ -150,22 +150,6 @@ func requestedOperationFollowupFailure(engine string, followupErr error) error {
 	return requestedOperationCommandFailure(engine, nil, followupErr, true)
 }
 
-func addRequestedOperationFollowup(engine string, operationErr, followupErr error) error {
-	if followupErr == nil {
-		return operationErr
-	}
-	var failure *RequestedOperationFailure
-	if errors.As(operationErr, &failure) {
-		copy := *failure
-		copy.FollowupError = errors.Join(copy.FollowupError, followupErr)
-		return &copy
-	}
-	if operationErr == nil {
-		return requestedOperationFollowupFailure(engine, followupErr)
-	}
-	return errors.Join(operationErr, followupErr)
-}
-
 // requestedNativeExit reports whether err is the requested native child's own
 // failure with exactly this exit code: the process started and exited with
 // code, rather than failing preparation, being interrupted, or succeeding. It

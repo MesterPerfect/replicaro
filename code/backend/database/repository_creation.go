@@ -486,10 +486,6 @@ func ListRepositoryCreationIntents(db *sql.DB) ([]RepositoryCreationIntent, erro
 	return result, rows.Err()
 }
 
-func FindRepositoryCreationIntent(db *sql.DB, engine, connector, location string) (RepositoryCreationIntent, error) {
-	return FindRepositoryCreationIntentWithOptions(db, engine, connector, location, nil)
-}
-
 func FindRepositoryCreationIntentByID(db *sql.DB, id string) (RepositoryCreationIntent, error) {
 	return scanCreationIntent(db.QueryRow(`SELECT `+creationIntentColumns+` FROM repository_creation_intents WHERE id=?`, id).Scan)
 }

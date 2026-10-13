@@ -3,15 +3,24 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/local/replicaro/models"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
+	"modernc.org/sqlite"
 )
 
 // The metadata cache deliberately resolves the public repository UUID once at
@@ -91,10 +100,6 @@ func metadataRevisionTx(tx *sql.Tx, repositoryID string) (int64, error) {
 	return revision, err
 }
 
-func bumpMetadataRevisionTx(tx *sql.Tx, repositoryID string) error {
-	return bumpMetadataRevisionTxContext(context.Background(), tx, repositoryID)
-}
-
 func bumpMetadataRevisionTxContext(ctx context.Context, tx *sql.Tx, repositoryID string) error {
 	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
 	if err != nil {
@@ -103,10 +108,6 @@ func bumpMetadataRevisionTxContext(ctx context.Context, tx *sql.Tx, repositoryID
 	_, err = tx.ExecContext(ctx, `INSERT INTO metadata_cache_revisions(repository_database_id,revision) VALUES (?,1)
 		ON CONFLICT(repository_database_id) DO UPDATE SET revision=revision+1`, repositoryDatabaseID)
 	return err
-}
-
-func bumpMetadataRevisionIfChanged(tx *sql.Tx, repositoryID string, result sql.Result) error {
-	return bumpMetadataRevisionIfChangedContext(context.Background(), tx, repositoryID, result)
 }
 
 func bumpMetadataRevisionIfChangedContext(ctx context.Context, tx *sql.Tx, repositoryID string, result sql.Result) error {
@@ -262,15 +263,6 @@ func MarkMetadataRepositoryFailed(db *sql.DB, repositoryID, safeError string, at
 	return err
 }
 
-func ClearMetadataRepositoryFailure(db *sql.DB, repositoryID string) error {
-	handle, _, err := metadataCacheWriter(context.Background(), db, repositoryID)
-	if err != nil {
-		return err
-	}
-	_, err = handle.writer.Exec(`DELETE FROM metadata_cache_failures WHERE repository_database_id=(SELECT database_id FROM repositories WHERE id=?)`, repositoryID)
-	return err
-}
-
 func metadataReadRevisionAndGate(ctx context.Context, tx *sql.Tx, authority MetadataReadAuthority, expectedRevision *int64) (int64, int64, error) {
 	repositoryDatabaseID, err := metadataRepositoryDatabaseIDForAuthority(ctx, tx, authority)
 	if err != nil {
@@ -312,12 +304,21 @@ func SearchReadyMetadataFiles(ctx context.Context, db *sql.DB, repositoryID, que
 	return result, err
 }
 
+// The path is folded with replicaro_search_fold, and the query is folded the
+// same way before it becomes a LIKE pattern, so "ärger" and "arger" find
+// "Ärger", and "café" and "cafe" find both an NFC "Café" and the NFD spelling
+// macOS stores. The stored spelling is still what the row returns and what a
+// restore uses.
+//
+// Matching only the path also covers a match on the name: the pattern always
+// starts and ends with %, and every name is the tail of its path. One fold per
+// row instead of two keeps a search over a large cache about twice as fast.
 const metadataSearchCatalogSQL = `SELECT f.root,f.parent_path,f.name,
 	EXISTS(SELECT 1 FROM metadata_cache_files child WHERE child.repository_database_id=f.repository_database_id
 		AND child.root=f.root AND child.parent_path=CASE WHEN f.parent_path='' THEN f.name ELSE f.parent_path||'/'||f.name END AND child.name<>''),
 	EXISTS(SELECT 1 FROM metadata_cache_file_versions v WHERE v.file_id=f.file_id AND v.is_dir=1)
 FROM metadata_cache_files f WHERE f.repository_database_id=? AND f.name<>''
-	AND (f.name LIKE ? ESCAPE char(92) OR (CASE WHEN f.parent_path='' THEN f.name ELSE f.parent_path||'/'||f.name END) LIKE ? ESCAPE char(92))
+	AND replicaro_search_fold(CASE WHEN f.parent_path='' THEN f.name ELSE f.parent_path||'/'||f.name END) LIKE ? ESCAPE char(92)
 ORDER BY f.root,f.parent_path,f.name LIMIT ? OFFSET ?`
 
 const metadataBrowseChildrenSQL = `SELECT parent_path,name,has_child,has_directory_version FROM (
@@ -372,7 +373,8 @@ func searchReadyMetadataFilesPageForAuthority(ctx context.Context, db *sql.DB, a
 	}
 	// Search and browse intentionally touch only _files/_file_versions and child
 	// existence. The millions-row membership table is lazy until path selection.
-	rows, err := tx.QueryContext(ctx, metadataSearchCatalogSQL, repositoryDatabaseID, searchLikePattern(query), searchLikePattern(query), limit, offset)
+	pattern := searchLikePattern(foldMetadataSearchText(query))
+	rows, err := tx.QueryContext(ctx, metadataSearchCatalogSQL, repositoryDatabaseID, pattern, limit, offset)
 	if err != nil {
 		return nil, revision, err
 	}
@@ -396,14 +398,6 @@ func searchReadyMetadataFilesPageForAuthority(ctx context.Context, db *sql.DB, a
 		return nil, revision, err
 	}
 	return result, revision, nil
-}
-
-func BrowseReadyMetadataEntriesPage(ctx context.Context, db *sql.DB, repositoryID, source, parent string, limit, offset int, expectedRevision *int64) ([]models.FileBrowseEntry, int64, error) {
-	authority, err := LoadMetadataReadAuthority(ctx, db, repositoryID)
-	if err != nil {
-		return nil, 0, err
-	}
-	return browseReadyMetadataEntriesPageForAuthority(ctx, db, authority, source, parent, limit, offset, expectedRevision, nil)
 }
 
 func BrowseReadyMetadataEntriesPageForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, source, parent string, limit, offset int, expectedRevision *int64) ([]models.FileBrowseEntry, int64, MetadataIndexState, error) {
@@ -985,10 +979,6 @@ func MetadataEntrySetRootScope(snapshot models.Snapshot) (string, error) {
 	return metadataRootScope(snapshot)
 }
 
-func replaceMetadataSnapshotRootsTx(tx *sql.Tx, repositoryID string, snapshot models.Snapshot) error {
-	return replaceMetadataSnapshotRootsTxContext(context.Background(), tx, repositoryID, snapshot)
-}
-
 func replaceMetadataSnapshotRootsTxContext(ctx context.Context, tx *sql.Tx, repositoryID string, snapshot models.Snapshot) error {
 	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
 	if err != nil {
@@ -1219,60 +1209,6 @@ func EnsureMetadataSnapshotsKnown(db *sql.DB, repositoryID string, snapshots []m
 	return tx.Commit()
 }
 
-func MarkMetadataSnapshotPending(db *sql.DB, repositoryID, snapshotID string) error {
-	handle, _, err := metadataCacheWriter(context.Background(), db, repositoryID)
-	if err != nil {
-		return err
-	}
-	tx, err := handle.writer.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
-	if err != nil {
-		return err
-	}
-	var entrySetID sql.NullInt64
-	if err := tx.QueryRow(`SELECT entry_set_id FROM metadata_cache_snapshots
-		WHERE repository_database_id=? AND snapshot_id=?`, repositoryDatabaseID, snapshotID).Scan(&entrySetID); errors.Is(err, sql.ErrNoRows) {
-		return tx.Commit()
-	} else if err != nil {
-		return err
-	}
-	result, err := tx.Exec(`UPDATE metadata_cache_snapshots SET entry_set_id=NULL,status='pending',indexed_at='',error=''
-		WHERE repository_database_id=? AND snapshot_id=?`, repositoryDatabaseID, snapshotID)
-	if err != nil {
-		return err
-	}
-	if entrySetID.Valid {
-		var shared int
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM metadata_cache_snapshots
-			WHERE repository_database_id=? AND entry_set_id=?)`, repositoryDatabaseID, entrySetID.Int64).Scan(&shared); err != nil {
-			return err
-		}
-		// Shared sets keep their catalog rows. A final detach uses the same
-		// candidate-scoped cleanup as deletion, avoiding repository-wide scans.
-		if shared == 0 {
-			if err := cleanupFinalMetadataEntrySetsTx(context.Background(), tx, repositoryDatabaseID, []int64{entrySetID.Int64}); err != nil {
-				return err
-			}
-		}
-	}
-	if err := bumpMetadataRevisionIfChanged(tx, repositoryID, result); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func ReadyMetadataSnapshotIDs(db *sql.DB, repositoryID string, snapshotIDs []string) (map[string]bool, error) {
-	authority, err := LoadMetadataReadAuthority(context.Background(), db, repositoryID)
-	if err != nil {
-		return nil, err
-	}
-	return ReadyMetadataSnapshotIDsForAuthority(context.Background(), db, authority, snapshotIDs)
-}
-
 func ListMetadataEntries(db *sql.DB, repositoryID, snapshotID, parentPath string) ([]models.SnapshotEntry, error) {
 	authority, err := LoadMetadataReadAuthority(context.Background(), db, repositoryID)
 	if err != nil {
@@ -1292,7 +1228,7 @@ func ListMetadataEntries(db *sql.DB, repositoryID, snapshotID, parentPath string
 // then computes each file's one bucket in the selected snapshot's block list.
 // Expanding every block first would read an entire large snapshot to browse a
 // small folder. Source-root joins preserve the exact native restore address.
-const metadataSnapshotChildrenSQL = `SELECT
+const metadataSnapshotChildrenSelectSQL = `SELECT
  CASE WHEN f.parent_path='' THEN f.name ELSE f.parent_path||'/'||f.name END AS path,
  r.path,v.mode,v.size,v.is_dir
  FROM metadata_cache_snapshots s
@@ -1303,9 +1239,44 @@ const metadataSnapshotChildrenSQL = `SELECT
  CROSS JOIN metadata_cache_block_list_items l ON l.block_list_id=setrow.block_list_id AND l.bucket=f.file_id % state.bucket_count
  CROSS JOIN metadata_cache_block_entries e ON e.block_id=l.block_id AND e.file_id=f.file_id
  JOIN metadata_cache_file_versions v ON v.file_id=f.file_id AND v.file_version_id=e.file_version_id
- WHERE s.repository_database_id=? AND s.snapshot_id=? ORDER BY v.is_dir DESC,path`
+ WHERE s.repository_database_id=? AND s.snapshot_id=?`
+
+const metadataSnapshotChildrenSQL = metadataSnapshotChildrenSelectSQL + ` ORDER BY v.is_dir DESC,path`
+
+// Restore Browse pages one native root's folder. Within one root the relative
+// path names a single entry, so the order is total and offsets stay stable: a
+// native snapshot never changes once it is indexed.
+const metadataSnapshotRootChildrenPageSQL = metadataSnapshotChildrenSelectSQL +
+	` AND r.path=? ORDER BY v.is_dir DESC,path LIMIT ? OFFSET ?`
 
 func ReadyMetadataSnapshotEntriesForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, snapshotID, parentPath string) (models.Snapshot, []models.SnapshotEntry, bool, error) {
+	return readyMetadataSnapshotEntries(ctx, db, authority, snapshotID, parentPath, func(models.Snapshot) (string, []any, bool) {
+		return metadataSnapshotChildrenSQL, nil, true
+	})
+}
+
+// ReadyMetadataSnapshotRootEntriesPageForAuthority returns one page of a
+// folder's entries under a single native root of a ready snapshot. chooseRoot
+// sees the cached snapshot in the same read transaction and returns the native
+// root path to list; returning false skips the listing, so the caller can
+// refuse a hidden snapshot or an unknown root without reading any entries.
+func ReadyMetadataSnapshotRootEntriesPageForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, snapshotID, parentPath string, limit, offset int, chooseRoot func(models.Snapshot) (string, bool)) (models.Snapshot, []models.SnapshotEntry, bool, error) {
+	if limit <= 0 || limit > 201 {
+		limit = 201
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return readyMetadataSnapshotEntries(ctx, db, authority, snapshotID, parentPath, func(snapshot models.Snapshot) (string, []any, bool) {
+		root, ok := chooseRoot(snapshot)
+		if !ok {
+			return "", nil, false
+		}
+		return metadataSnapshotRootChildrenPageSQL, []any{root, limit, offset}, true
+	})
+}
+
+func readyMetadataSnapshotEntries(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, snapshotID, parentPath string, listing func(models.Snapshot) (string, []any, bool)) (models.Snapshot, []models.SnapshotEntry, bool, error) {
 	parentPath = normalizeMetadataPath(parentPath)
 	handle, _, release, err := metadataCacheReaderForAuthority(ctx, db, authority)
 	if err != nil {
@@ -1332,7 +1303,11 @@ func ReadyMetadataSnapshotEntriesForAuthority(ctx context.Context, db *sql.DB, a
 	if err != nil || !ready {
 		return snapshots[0], []models.SnapshotEntry{}, ready, err
 	}
-	rows, err := tx.QueryContext(ctx, metadataSnapshotChildrenSQL, parentPath, repositoryDatabaseID, snapshotID)
+	query, extra, list := listing(snapshots[0])
+	if !list {
+		return snapshots[0], []models.SnapshotEntry{}, true, tx.Commit()
+	}
+	rows, err := tx.QueryContext(ctx, query, append([]any{parentPath, repositoryDatabaseID, snapshotID}, extra...)...)
 	if err != nil {
 		return models.Snapshot{}, nil, false, err
 	}
@@ -1360,10 +1335,6 @@ func ReplaceMetadataSnapshot(db *sql.DB, repositoryID string, snapshot models.Sn
 	return ReplaceMetadataSnapshotForRefreshContext(context.Background(), db, repositoryID, snapshot, entries)
 }
 
-func ReplaceMetadataSnapshotForRefresh(db *sql.DB, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry) error {
-	return ReplaceMetadataSnapshotForRefreshContext(context.Background(), db, repositoryID, snapshot, entries)
-}
-
 func ReplaceMetadataSnapshotForRefreshContext(ctx context.Context, db *sql.DB, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry) error {
 	var engine string
 	if err := db.QueryRowContext(ctx, `SELECT engine FROM repositories WHERE id=?`, repositoryID).Scan(&engine); err != nil {
@@ -1375,10 +1346,6 @@ func ReplaceMetadataSnapshotForRefreshContext(ctx context.Context, db *sql.DB, r
 
 func ReplaceMetadataSnapshotWithIdentity(db *sql.DB, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry, identity MetadataEntrySetIdentity) error {
 	return replaceMetadataSnapshotWithIdentity(context.Background(), db, repositoryID, snapshot, entries, identity)
-}
-
-func ReplaceMetadataSnapshotWithIdentityForRefresh(db *sql.DB, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry, identity MetadataEntrySetIdentity) error {
-	return ReplaceMetadataSnapshotWithIdentityForRefreshContext(context.Background(), db, repositoryID, snapshot, entries, identity)
 }
 
 func ReplaceMetadataSnapshotWithIdentityForRefreshContext(ctx context.Context, db *sql.DB, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry, identity MetadataEntrySetIdentity) error {
@@ -1498,10 +1465,6 @@ func insertMetadataTempRows(ctx context.Context, tx *sql.Tx, prefix, tuple strin
 		}
 	}
 	return nil
-}
-
-func insertMetadataEntriesBatchedTx(tx *sql.Tx, repositoryID string, entrySetID int64, snapshot models.Snapshot, entries []models.SnapshotEntry) error {
-	return insertMetadataEntriesBatchedTxContext(context.Background(), tx, repositoryID, entrySetID, snapshot, entries)
 }
 
 func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repositoryID string, entrySetID int64, snapshot models.Snapshot, entries []models.SnapshotEntry) error {
@@ -1802,7 +1765,7 @@ func detachMetadataSnapshotsTx(ctx context.Context, tx *sql.Tx, repositoryID str
 		}
 		finalSets = append(finalSets, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM metadata_cache_snapshots WHERE repository_database_id=?
@@ -1823,50 +1786,6 @@ func ReplaceMetadataSnapshots(db *sql.DB, repositoryID string, snapshots []model
 		}
 	}
 	return RemoveMetadataSnapshotsNotIn(db, repositoryID, snapshotIDs(snapshots))
-}
-
-func replaceMetadataSnapshotTx(tx *sql.Tx, repositoryID string, snapshot models.Snapshot, entries []models.SnapshotEntry, identity MetadataEntrySetIdentity) error {
-	if err := validateMetadataEntrySetIdentity(identity); err != nil {
-		return err
-	}
-	if err := detachMetadataSnapshotsTx(context.Background(), tx, repositoryID, []string{snapshot.ID}); err != nil {
-		return err
-	}
-	if err := upsertMetadataSnapshotHeaderTx(tx, repositoryID, snapshot, "pending", "", ""); err != nil {
-		return err
-	}
-	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
-	if err != nil {
-		return err
-	}
-	rootScope, err := metadataRootScope(snapshot)
-	if err != nil {
-		return err
-	}
-	result, err := tx.Exec(`INSERT INTO metadata_cache_entry_sets(repository_database_id,engine,native_identity,root_scope) VALUES (?,?,?,?)`,
-		repositoryDatabaseID, identity.Engine, identity.NativeIdentity, rootScope)
-	if err != nil {
-		return err
-	}
-	entrySetID, err := result.LastInsertId()
-	if err != nil {
-		return err
-	}
-	if err := insertMetadataEntriesBatchedTx(tx, repositoryID, entrySetID, snapshot, entries); err != nil {
-		return err
-	}
-	_, err = tx.Exec(`UPDATE metadata_cache_snapshots SET entry_set_id=?,status='ready',indexed_at=?,error=''
-		WHERE repository_database_id=? AND snapshot_id=?`, entrySetID, time.Now().UTC().Format(time.RFC3339), repositoryDatabaseID, snapshot.ID)
-	return err
-}
-
-// The cache has no catalog overlay; _files is populated with the entry set.
-func ReuseMetadataSnapshotEntrySet(db *sql.DB, repositoryID string, snapshot models.Snapshot, identity MetadataEntrySetIdentity) (bool, error) {
-	return reuseMetadataSnapshotEntrySet(context.Background(), db, repositoryID, snapshot, identity)
-}
-
-func ReuseMetadataSnapshotEntrySetForRefresh(db *sql.DB, repositoryID string, snapshot models.Snapshot, identity MetadataEntrySetIdentity) (bool, error) {
-	return ReuseMetadataSnapshotEntrySetForRefreshContext(context.Background(), db, repositoryID, snapshot, identity)
 }
 
 func ReuseMetadataSnapshotEntrySetForRefreshContext(ctx context.Context, db *sql.DB, repositoryID string, snapshot models.Snapshot, identity MetadataEntrySetIdentity) (bool, error) {
@@ -2003,7 +1922,7 @@ func RemoveMetadataSnapshotsNotIn(db *sql.DB, repositoryID string, snapshotIDs [
 		}
 		remove = append(remove, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	if err := detachMetadataSnapshotsTx(context.Background(), tx, repositoryID, remove); err != nil {
@@ -2199,23 +2118,6 @@ func MetadataSnapshotsNeedingIndex(db *sql.DB, repositoryID string, now time.Tim
 	return result, nil
 }
 
-func ReconcileMetadataSnapshotHeaders(db *sql.DB, repositoryID string, snapshots []models.Snapshot) error {
-	ctx := context.Background()
-	handle, _, err := metadataCacheWriter(ctx, db, repositoryID)
-	if err != nil {
-		return err
-	}
-	tx, err := handle.writer.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := reconcileMetadataSnapshotHeadersTx(ctx, tx, repositoryID, snapshots); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 type metadataHeaderDelta struct{ changed bool }
 
 func reconcileMetadataSnapshotHeadersTx(ctx context.Context, tx *sql.Tx, repositoryID string, snapshots []models.Snapshot) (metadataHeaderDelta, error) {
@@ -2242,7 +2144,7 @@ func reconcileMetadataSnapshotHeadersTx(ctx context.Context, tx *sql.Tx, reposit
 		}
 		remove = append(remove, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return delta, err
 	}
 	if len(remove) != 0 {
@@ -2297,15 +2199,6 @@ func reconcileMetadataSnapshotHeadersTx(ctx context.Context, tx *sql.Tx, reposit
 func ReconcileMetadataSnapshotHeadersComplete(db *sql.DB, repositoryID string, snapshots []models.Snapshot, at time.Time, observedGeneration int64) error {
 	_, _, err := reconcileMetadataSnapshotHeadersComplete(context.Background(), db, repositoryID, snapshots, at, observedGeneration, false)
 	return err
-}
-
-func ReconcileMetadataSnapshotHeadersCompleteForRefresh(db *sql.DB, repositoryID string, snapshots []models.Snapshot, at time.Time, observedGeneration int64) (bool, error) {
-	_, required, err := reconcileMetadataSnapshotHeadersComplete(context.Background(), db, repositoryID, snapshots, at, observedGeneration, true)
-	return required, err
-}
-
-func ReconcileMetadataSnapshotHeadersCompleteForRefreshGeneration(db *sql.DB, repositoryID string, snapshots []models.Snapshot, at time.Time, observedGeneration int64) (int64, bool, error) {
-	return reconcileMetadataSnapshotHeadersComplete(context.Background(), db, repositoryID, snapshots, at, observedGeneration, true)
 }
 
 func ReconcileMetadataSnapshotHeadersCompleteForRefreshGenerationContext(ctx context.Context, db *sql.DB, repositoryID string, snapshots []models.Snapshot, at time.Time, observedGeneration int64) (int64, bool, error) {
@@ -2463,6 +2356,79 @@ func escapeLike(value string) string {
 	value = strings.ReplaceAll(value, "%", "\\%")
 	return strings.ReplaceAll(value, "_", "\\_")
 }
+
+func init() {
+	// The driver adds registered functions to every connection it opens, so
+	// this has to run before any database is opened; package init does that.
+	sqlite.MustRegisterDeterministicScalarFunction("replicaro_search_fold", 1,
+		func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			switch value := args[0].(type) {
+			case string:
+				return foldMetadataSearchText(value), nil
+			case []byte:
+				return foldMetadataSearchText(string(value)), nil
+			default:
+				return value, nil
+			}
+		})
+}
+
+// foldMetadataSearchText returns the spelling File History search compares. It
+// decomposes the text canonically, drops nonspacing marks (Unicode category Mn),
+// applies Unicode case folding and recomposes the result as NFC. Composed and
+// decomposed spellings therefore match, capitals match lower case (ß matches
+// ss), and "cafe" finds "café" and "Café".
+//
+// Only Mn is dropped. Spacing marks (Mc) and enclosing marks (Me) stay, so
+// Indic scripts keep their spacing vowel signs. In scripts whose Mn marks carry
+// meaning (Devanagari virama, Hebrew and Arabic points, Thai vowel marks,
+// Japanese kana voicing marks, so "パン" also finds "ハン") a search finds more
+// than the exact spelling. That is acceptable for search: results always show
+// the stored spelling, and a search never selects or restores anything on its
+// own.
+//
+// NFC at the end puts back what decomposition split into characters that are
+// not marks, such as Hangul syllables, so "?" still matches one syllable and
+// NFD-stored Korean matches its NFC spelling.
+//
+// ASCII-only text comes back unchanged: it is already normalized and SQLite's
+// LIKE ignores ASCII case itself, which keeps a search over a large cache close
+// to the cost of a plain LIKE. Text with non-ASCII characters comes back with
+// its ASCII letters in lower case. Bytes that aren't valid UTF-8 compare as
+// U+FFFD; keeping them would let a dropped mark join two stray bytes into a
+// real character.
+func foldMetadataSearchText(value string) string {
+	first := 0
+	for first < len(value) && value[first] < utf8.RuneSelf {
+		first++
+	}
+	if first == len(value) {
+		return value
+	}
+	// The ASCII in front only needs lower-casing, so it skips the chain. Its
+	// last character still goes through the chain with the rest, because what
+	// follows can combine with it; ASCII never combines with ASCII, so this
+	// gives the same text as folding the whole value.
+	if first > 0 {
+		first--
+	}
+	// A chain keeps state between calls and SQLite calls this from every
+	// connection at once, so each call takes its own chain from the pool.
+	// transform.String resets it before use.
+	chain := metadataSearchFoldChains.Get().(transform.Transformer)
+	defer metadataSearchFoldChains.Put(chain)
+	folded, _, err := transform.String(chain, value[first:])
+	if err != nil {
+		// None of these transformers reports an error on any input, but if one
+		// ever did, the stored spelling is a safer thing to match than half a fold.
+		return value
+	}
+	return strings.ToLower(value[:first]) + folded
+}
+
+var metadataSearchFoldChains = sync.Pool{New: func() any {
+	return transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), cases.Fold(), norm.NFC)
+}}
 
 func searchLikePattern(value string) string {
 	var pattern strings.Builder

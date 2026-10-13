@@ -261,8 +261,7 @@ func admitUnderLock(
 			return models.Repository{}, classifyKnownUnavailable(err)
 		}
 	} else {
-		store := (vaultprofile.Store{Repository: repo}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+		store := (vaultprofile.Store{Repository: repo})
 		if err := store.AssertRootIdentity(ctx); err != nil {
 			return models.Repository{}, classifyKnownUnavailable(err)
 		}
@@ -299,7 +298,7 @@ func admitUnderLock(
 		resolve := options.ResolveEngine
 		if resolve == nil {
 			resolve = func(repo models.Repository) (engines.Engine, error) {
-				return engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
+				return engines.Resolve(repo)
 			}
 		}
 		engine, resolveErr := resolve(repo)
@@ -440,8 +439,7 @@ func assertFilesystemControlPlane(ctx context.Context, repo models.Repository, o
 	if options.AssertControlPlane != nil {
 		return options.AssertControlPlane(ctx, repo)
 	}
-	store := (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	store := (vaultprofile.Store{Repository: repo})
 	if err := store.AssertRootIdentity(ctx); err != nil {
 		return err
 	}

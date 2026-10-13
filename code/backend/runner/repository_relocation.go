@@ -12,7 +12,6 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 )
 
@@ -97,7 +96,7 @@ func recoverKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, listed dat
 	}
 	configured := repo.Location
 	repo.Location = intent.CandidatePath
-	engine, err := engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
+	engine, err := engines.Resolve(repo)
 	if err != nil {
 		return err
 	}

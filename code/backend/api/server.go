@@ -35,7 +35,6 @@ import (
 	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/platforms"
 	"github.com/local/replicaro/profilesync"
-	"github.com/local/replicaro/rendezvous"
 	"github.com/local/replicaro/runner"
 	"github.com/local/replicaro/runtimeendpoint"
 	"github.com/local/replicaro/scheduler"
@@ -66,7 +65,6 @@ var validateRotatedCredentials = func(ctx context.Context, repo models.Repositor
 }
 var readProfileWithRotatedCredentials = func(ctx context.Context, repo models.Repository) ([]byte, error) {
 	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		Read(ctx)
 }
 
@@ -111,13 +109,17 @@ func projectedProfileSizeWarningForSizes(sizes []int) string {
 
 var readRootWithRotatedCredentials = func(ctx context.Context, repo models.Repository) ([]byte, error) {
 	return (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		Read(ctx)
 }
 var stageRepositoryArtifacts = engines.StageRepositoryArtifacts
 var restoreRepositoryArtifacts = func(stage *engines.RepositoryArtifactStage) error { return stage.Restore() }
 var finalizeRepositoryArtifacts = func(stage *engines.RepositoryArtifactStage) error { return stage.Finalize() }
 var cleanupCreationEngineArtifacts = engines.CleanupRepositoryArtifacts
+
+// beforeJobDefinitionUpdate runs between a job edit's early checks and its
+// write transaction. Tests use it to land a competing change in that window.
+var beforeJobDefinitionUpdate = func(string) {}
+
 var removeCreationRcloneConfig = engines.RemoveRcloneVaultConfig
 var removeDeletedRcloneConfig = engines.RemoveRcloneVaultConfig
 var cleanupCreationNativeFence = cleanupNativeOperationFence
@@ -130,7 +132,6 @@ var updateRepositoryCredentials = database.UpdateRepositoryCredentials
 var deleteBackupJob = database.DeleteJob
 var assertRepositoryWriter = func(ctx context.Context, repo models.Repository) error {
 	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		AssertAttachment(ctx, repo.ClientUUID, repo.AttachmentGeneration)
 }
 var runQueuedRepositoryTask = scheduler.RunQueuedRepositoryTask
@@ -167,24 +168,54 @@ func cleanupPreparedRepositoryCreation(db *sql.DB, intent database.RepositoryCre
 	if intent.Phase != database.RepositoryCreationPrepared {
 		return fmt.Errorf("only a prepared repository creation can be cancelled")
 	}
+	claimed, err := creationIDHasOtherOwner(db, intent.ID)
+	if err != nil {
+		return fmt.Errorf("cancel pending creation: %w", err)
+	}
 	markRetained := func(message string) {
 		_ = database.MarkRepositoryCreationError(db, intent.ID, message)
 	}
-	if err := cleanupCreationEngineArtifacts(models.Repository{ID: intent.ID, Engine: intent.Engine}); err != nil {
-		markRetained("Prepared creation local engine cleanup is incomplete; retry cancellation.")
-		return fmt.Errorf("cancel pending creation local engine cleanup: %w", err)
-	}
-	if intent.Connector != engines.RcloneRemoteConnector {
-		if err := removeCreationRcloneConfig(intent.ID); err != nil {
-			markRetained("Prepared creation local rclone cleanup is incomplete; retry cancellation.")
-			return fmt.Errorf("cancel pending creation local rclone cleanup: %w", err)
+	if !claimed {
+		if err := cleanupCreationEngineArtifacts(models.Repository{ID: intent.ID, Engine: intent.Engine}); err != nil {
+			markRetained("Prepared creation local engine cleanup is incomplete; retry cancellation.")
+			return fmt.Errorf("cancel pending creation local engine cleanup: %w", err)
+		}
+		if intent.Connector != engines.RcloneRemoteConnector {
+			if err := removeCreationRcloneConfig(intent.ID); err != nil {
+				markRetained("Prepared creation local rclone cleanup is incomplete; retry cancellation.")
+				return fmt.Errorf("cancel pending creation local rclone cleanup: %w", err)
+			}
 		}
 	}
 	if err := cancelPreparedRepositoryCreation(db, intent.ID); err != nil {
 		markRetained("Prepared creation cleanup completed, but cancellation is incomplete; retry cancellation.")
 		return err
 	}
+	if !claimed {
+		// The cache only takes up space, so a failed removal doesn't keep the
+		// creation; the startup sweep removes what is left.
+		_ = engines.RemoveRepositoryCaches(models.Repository{ID: intent.ID, Engine: intent.Engine})
+	}
 	return nil
+}
+
+// creationIDHasOtherOwner reports whether a saved vault or an unfinished
+// connection uses the pending creation's ID. That happens when a creation
+// stopped after it published the vault and the user then connected the same
+// location: the vault is attached, or is being attached, under the creation's
+// ID, and the engine config, rclone config and cache under that ID are that
+// connection's. Cancelling or forgetting the leftover creation must then
+// delete only the creation itself.
+//
+// The caller holds the vault lock on the ID, which connecting a vault with
+// that ID also needs, so the answer holds until the caller is done. A read
+// error is returned, so the caller refuses rather than guesses.
+func creationIDHasOtherOwner(db *sql.DB, id string) (bool, error) {
+	owned, err := database.RepositoryIDOwnedOutsideCreation(db, id)
+	if err != nil {
+		return false, fmt.Errorf("check for a saved vault or connection with the pending creation's ID: %w", err)
+	}
+	return owned, nil
 }
 
 func reviewedConnectorOptions(integration integrations.Integration, options map[string]string) map[string]string {
@@ -258,6 +289,22 @@ func writeCodedError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message, "code": code})
+}
+
+// writeRetiredBackupOptionError answers a job save refused for a retired
+// Advanced option. The body keeps the English text in "error" for API clients
+// and adds the code and the flag, from which the UI builds its translated
+// message. The refusal is about the user's input, not a Replicaro fault.
+func writeRetiredBackupOptionError(w http.ResponseWriter, err error) {
+	var retired *engines.RetiredBackupOptionError
+	if !errors.As(err, &retired) {
+		badRequest(w, err.Error())
+		return
+	}
+	markSupportResponseError(w, err, true)
+	writeJSONStatus(w, http.StatusBadRequest, map[string]string{
+		"error": retired.Error(), "code": engines.RetiredBackupOptionCode, "flag": retired.Flag,
+	})
 }
 
 func badRequest(w http.ResponseWriter, message string) {
@@ -374,9 +421,7 @@ func repositoryByID(db *sql.DB, id string) (models.Repository, error) {
 }
 
 var resolveEngine = func(repo models.Repository) (engines.Engine, error) {
-	return engines.ResolveWithRepositoryAvailabilityCheck(
-		repo, storageavailability.RequireRepositoryAvailable,
-	)
+	return engines.Resolve(repo)
 }
 
 func engineOutputError(output string, err error) error {
@@ -387,25 +432,18 @@ func engineOutputError(output string, err error) error {
 }
 
 func Handler(db *sql.DB) http.Handler {
-	return HandlerAt(db, runtimeendpoint.Preferred(), rendezvous.Record{}, nil)
+	return HandlerAt(db, runtimeendpoint.Preferred())
 }
 
-func HandlerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error) http.Handler {
-	return HandlerAtWithSecurityMode(db, endpoint, record, activate, SecurityModeProduction)
-}
-
-func HandlerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, mode SecurityMode) http.Handler {
-	return handlerAtWithSecurityModeAndRcloneAuth(
-		db, endpoint, record, activate, mode, newRcloneAuthStore(), appupdate.New(db),
+func HandlerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint) http.Handler {
+	return handlerAtWithRcloneAuth(
+		db, endpoint, newDesktopRcloneAuthStore(), appupdate.New(db),
 	)
 }
 
-func handlerAtWithSecurityModeAndRcloneAuth(
+func handlerAtWithRcloneAuth(
 	db *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
-	record rendezvous.Record,
-	activate func() error,
-	mode SecurityMode,
 	rcloneAuth *rcloneAuthStore,
 	updaters ...*appupdate.Service,
 ) http.Handler {
@@ -413,18 +451,15 @@ func handlerAtWithSecurityModeAndRcloneAuth(
 	if len(updaters) > 0 && updaters[0] != nil {
 		updater = updaters[0]
 	}
-	return handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, db, endpoint, nil, record, activate, mode, rcloneAuth, updater, false, false, operationruntime.New(),
+	return handlerAtWithRcloneAuthAndRuntime(
+		db, db, endpoint, nil, rcloneAuth, updater, false, false, operationruntime.New(),
 	)
 }
 
-func handlerAtWithSecurityModeRcloneAuthAndRuntime(
+func handlerAtWithRcloneAuthAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
-	mode SecurityMode,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
 	keepStartAtLogin bool,
@@ -434,20 +469,9 @@ func handlerAtWithSecurityModeRcloneAuthAndRuntime(
 	// This copy replaces the web UI handler's for every /api/ request, so it
 	// needs the same LAN origins or proxied API calls fail the Host check.
 	security := requestSecurity{
-		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
+		endpoint: endpoint, lanOrigins: lanOrigins, clientUUID: installationUUID(db),
 	}
 	handler := handlerForExecutionInstanceWithReader(db, readDB, uuid.NewString(), rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager)
-	if record.Version != "" {
-		mux := http.NewServeMux()
-		activationHandler := rendezvous.Handler(record, activate)
-		mux.HandleFunc(rendezvous.ActivationPath, func(w http.ResponseWriter, r *http.Request) {
-			if secureAPIRequest(w, r) {
-				activationHandler.ServeHTTP(w, r)
-			}
-		})
-		mux.Handle("/", handler)
-		handler = mux
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.ServeHTTP(w, withSecurity(r, security))
 	})
@@ -573,6 +597,21 @@ func handlerForExecutionInstanceWithReader(
 		writeJSON(w, issues)
 	})
 
+	handle(mux, "/api/dashboard/timeline", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		limit, _ := strconv.Atoi(query.Get("limit"))
+		timeline, err := database.ListDashboardTimeline(readDB, query.Get("filter"), limit, query.Get("cursor"))
+		if err != nil {
+			if errors.Is(err, database.ErrInvalidDashboardTimelineFilter) || errors.Is(err, database.ErrInvalidDashboardTimelineCursor) {
+				writeError(w, http.StatusBadRequest, err)
+			} else {
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+		writeJSON(w, timeline)
+	})
+
 	handle(mux, "/api/dashboard/issues/review", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			badRequest(w, "invalid method")
@@ -604,6 +643,15 @@ func handlerForExecutionInstanceWithReader(
 
 	handle(mux, "/api/operations/active", func(w http.ResponseWriter, r *http.Request) {
 		operations, err := database.ListActiveOperations(readDB)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, operations)
+	})
+
+	handle(mux, "/api/operations/latest-by-vault", func(w http.ResponseWriter, r *http.Request) {
+		operations, err := database.ListLatestVaultOperations(readDB, r.URL.Query().Get("kind"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -827,19 +875,29 @@ func handlerForExecutionInstanceWithReader(
 				}
 				// Forget removes only the exact local recovery state and artifacts.
 				// Native repository content is never deleted or rolled back.
-				if err := cleanupCreationEngineArtifacts(models.Repository{ID: intent.ID, Engine: intent.Engine}); err != nil {
-					writeError(w, http.StatusInternalServerError, fmt.Errorf("forget pending creation local engine cleanup: %w", err))
+				claimed, claimErr := creationIDHasOtherOwner(db, intent.ID)
+				if claimErr != nil {
+					writeError(w, http.StatusInternalServerError, claimErr)
 					return
 				}
-				if intent.Connector != engines.RcloneRemoteConnector {
-					if err := removeCreationRcloneConfig(intent.ID); err != nil {
-						writeError(w, http.StatusInternalServerError, fmt.Errorf("forget pending creation local rclone cleanup: %w", err))
+				if !claimed {
+					if err := cleanupCreationEngineArtifacts(models.Repository{ID: intent.ID, Engine: intent.Engine}); err != nil {
+						writeError(w, http.StatusInternalServerError, fmt.Errorf("forget pending creation local engine cleanup: %w", err))
 						return
+					}
+					if intent.Connector != engines.RcloneRemoteConnector {
+						if err := removeCreationRcloneConfig(intent.ID); err != nil {
+							writeError(w, http.StatusInternalServerError, fmt.Errorf("forget pending creation local rclone cleanup: %w", err))
+							return
+						}
 					}
 				}
 				if err := forgetRepositoryCreationIntent(db, id); err != nil {
 					writeError(w, http.StatusConflict, err)
 					return
+				}
+				if !claimed {
+					_ = engines.RemoveRepositoryCaches(models.Repository{ID: intent.ID, Engine: intent.Engine})
 				}
 				// Inactivity was proven above, so this normally passes at once. The
 				// cleanup absorbs a momentary inherited holder and refuses a fence
@@ -1005,7 +1063,7 @@ func handlerForExecutionInstanceWithReader(
 				"archiveWriteClass": repoModel.ArchiveWriteClass, "location": repoModel.Location,
 				"password": repoModel.Passphrase, "passwordConfirmation": repoModel.Passphrase,
 				"options": repoModel.ConnectorOptions, "profile_uuid": repoModel.ProfileUUID,
-				"expectedVaultUUID": repoModel.ID, "name": repoModel.Name, "description": repoModel.Description,
+				"name": repoModel.Name, "description": repoModel.Description,
 				"checkSchedule": repoModel.CheckSchedule, "maintenanceSchedule": repoModel.MaintenanceSchedule,
 				"concurrencyMode": repoModel.ConcurrencyMode,
 			}
@@ -1072,6 +1130,19 @@ func handlerForExecutionInstanceWithReader(
 			return
 		}
 		startVaultPasswordChange(db, runtimeManager, w, strings.TrimSpace(req.RepositoryID), req.NewPassword, false)
+	})
+
+	handle(mux, "/api/repository/password/statuses", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			badRequest(w, "invalid method")
+			return
+		}
+		results, err := runner.VaultPasswordChangeStatuses(readDB)
+		if err != nil {
+			writeJSONStatus(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, results)
 	})
 
 	handle(mux, "/api/repository/password/retry", func(w http.ResponseWriter, r *http.Request) {
@@ -1236,7 +1307,7 @@ func handlerForExecutionInstanceWithReader(
 			return
 		}
 		root, err := vaultprofile.ParseRoot(rootData, repo.Connector)
-		if err != nil || root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine || root.Repository.NativeRepositoryID != repo.NativeRepositoryID {
+		if err != nil || !root.Identifies(repo) {
 			writeError(w, http.StatusConflict, fmt.Errorf("new credentials address a different vault"))
 			return
 		}
@@ -1460,8 +1531,27 @@ func handlerForExecutionInstanceWithReader(
 			writeError(w, http.StatusInternalServerError, jobsErr)
 			return
 		}
-		cachedSnapshot, entries, ready, cacheErr := database.ReadyMetadataSnapshotEntriesForAuthority(
-			r.Context(), readDB, authority, snapshotID, browsePath,
+		// Large folders are paged the way File History pages: up to
+		// metadataPageSize entries per response, with offset, nextOffset and
+		// hasMore. A request without offset gets the first page. No revision is
+		// needed between pages because one snapshot's indexed contents never
+		// change, and tying pages to the vault-wide revision would restart
+		// paging whenever another snapshot finishes indexing.
+		offset := metadataOffset(r)
+		hidden := false
+		var nativeRoot models.SnapshotSourceRoot
+		var rootErr error
+		_, entries, ready, cacheErr := database.ReadyMetadataSnapshotRootEntriesPageForAuthority(
+			r.Context(), readDB, authority, snapshotID, browsePath, metadataPageSize+1, offset,
+			func(cachedSnapshot models.Snapshot) (string, bool) {
+				cachedSnapshot = models.PresentSnapshot(cachedSnapshot, repoModel.ProfileUUID, knownJobs)
+				if cachedSnapshot.Presentation == models.SnapshotPresentationHidden {
+					hidden = true
+					return "", false
+				}
+				nativeRoot, rootErr = exactRestoreNativeRoot(cachedSnapshot, r.URL.Query().Get("nativeRootId"), true)
+				return nativeRoot.Path, rootErr == nil
+			},
 		)
 		if cacheErr != nil {
 			if errors.Is(cacheErr, database.ErrMetadataIndexingUnavailable) {
@@ -1475,29 +1565,29 @@ func handlerForExecutionInstanceWithReader(
 			writeCodedError(w, http.StatusConflict, "metadata_not_ready", "backup data is still being prepared")
 			return
 		}
-		cachedSnapshot = models.PresentSnapshot(cachedSnapshot, repoModel.ProfileUUID, knownJobs)
-		if cachedSnapshot.Presentation == models.SnapshotPresentationHidden {
+		if hidden {
 			writeError(w, http.StatusForbidden, fmt.Errorf("snapshot %q is absent or not visible to this vault profile", snapshotID))
 			return
 		}
-		nativeRoot, rootErr := exactRestoreNativeRoot(cachedSnapshot, r.URL.Query().Get("nativeRootId"), true)
 		if rootErr != nil {
 			writeError(w, http.StatusUnprocessableEntity, rootErr)
 			return
 		}
-		rootEntries := entries[:0]
-		for _, entry := range entries {
-			if entry.SourceRoot != nativeRoot.Path {
-				continue
-			}
-			entry.NativeRootID = nativeRoot.Identity
-			entry.NativeRootUser = nativeRoot.User
-			entry.NativeRootHost = nativeRoot.Host
-			rootEntries = append(rootEntries, entry)
+		hasMore := len(entries) > metadataPageSize
+		if hasMore {
+			entries = entries[:metadataPageSize]
+		}
+		for index := range entries {
+			entries[index].NativeRootID = nativeRoot.Identity
+			entries[index].NativeRootUser = nativeRoot.User
+			entries[index].NativeRootHost = nativeRoot.Host
 		}
 		writeJSON(w, map[string]any{
-			"entries": rootEntries,
-			"raw":     "Loaded from the metadata cache.",
+			"entries":    entries,
+			"raw":        "Loaded from the metadata cache.",
+			"offset":     offset,
+			"nextOffset": offset + len(entries),
+			"hasMore":    hasMore,
 		})
 	})
 
@@ -1596,8 +1686,13 @@ func handlerForExecutionInstanceWithReader(
 		if descriptor.ID == "" {
 			descriptor.ID = engine.ID()
 		}
-		if err := engines.ValidateRestoreCapability(descriptor, restoreOptions); err != nil {
-			writeError(w, http.StatusUnprocessableEntity, err)
+		if err := engines.ValidateRestoreRequest(descriptor, restoreOptions); err != nil {
+			writeRestoreRequestRefusal(w, err)
+			return
+		}
+		if descriptor.ID == engines.KopiaID && req.Path != "" && !req.OriginalLocation &&
+			refuseKopiaFileIntoMissingDestination(w, r, db, repoModel.ID, req.TargetPath,
+				[]RestoreSelectionItem{{SnapshotID: req.SnapshotID, Path: req.Path, NativeRootID: req.NativeRootID}}) {
 			return
 		}
 		if refuseWhilePasswordChangeUnfinished(w, db, repoModel.ID) {
@@ -1686,7 +1781,7 @@ func handlerForExecutionInstanceWithReader(
 			stageSucceeded = operationStatus == engines.RequestedOperationSucceeded
 		}
 		err = nativeErr
-		if stepErr := finishTrackedNativeStep(db, operationID, "backup", output, nativeErr, processStarted); stepErr != nil {
+		if stepErr := finishTrackedNativeStep(r.Context(), db, operationID, "backup", output, nativeErr, processStarted); stepErr != nil {
 			err = errors.Join(err, fmt.Errorf("persist native backup result: %w", stepErr))
 		}
 		if stepErr := startOperationStep(db, operationID, "application", "metadata_cache", time.Now()); stepErr != nil {
@@ -1716,7 +1811,7 @@ func handlerForExecutionInstanceWithReader(
 				err = errors.Join(err, fmt.Errorf("persist metadata-cache application result: %w", finishErr))
 			}
 		}
-		status := terminalOperationStatus(r.Context(), err)
+		status := operationruntime.TerminalStatus(r.Context(), err)
 		operationOutput := combinedOperationOutput(output, err)
 		var dispatchNotification func()
 		if status != "interrupted" {
@@ -1803,6 +1898,10 @@ func handlerForExecutionInstanceWithReader(
 				badRequest(w, models.ReservedSnapshotTagError)
 				return
 			}
+			if err := models.ValidateSkipMarkerFileName(req.SkipMarkerFileName); err != nil {
+				badRequest(w, err.Error())
+				return
+			}
 			if err := jobscript.ValidateDefinition(req.BeforeScriptPath, req.BeforeScriptMustSucceed,
 				req.AfterScriptPath, req.AfterScriptMustSucceed); err != nil {
 				badRequest(w, err.Error())
@@ -1819,6 +1918,14 @@ func handlerForExecutionInstanceWithReader(
 					badRequest(w, "missing job id")
 					return
 				}
+				// Every edit has to say which copy of the job it was made from,
+				// or an edit from an outdated copy could put back old retention
+				// or targets unnoticed. The product UI always sends it; a page
+				// loaded from a version without revisions gets this message.
+				if req.Revision == "" {
+					badRequest(w, "This page is out of date, so the job wasn't saved. Reload the page and try again.")
+					return
+				}
 				var storedErr error
 				stored, storedErr = database.GetJob(db, req.ID)
 				if storedErr != nil {
@@ -1827,6 +1934,16 @@ func handlerForExecutionInstanceWithReader(
 					} else {
 						writeError(w, http.StatusInternalServerError, storedErr)
 					}
+					return
+				}
+				// An edit sends back the revision it was made from, so an edit
+				// from an outdated copy can't put back old retention or targets.
+				//
+				// This runs before the other checks so an outdated copy gets the
+				// reload message, and again in the write transaction; the early
+				// check keeps the validation below from judging an old copy.
+				if req.Revision != stored.Revision {
+					writeJobDefinitionChanged(w)
 					return
 				}
 				if req.Source != stored.Source && stored.SourceBindingState != "unbound_imported" {
@@ -1847,6 +1964,23 @@ func handlerForExecutionInstanceWithReader(
 					return
 				}
 				represented[repository.Engine] = true
+			}
+			// Only saving a job refuses retired Advanced options. A job that
+			// still carries one keeps running, loading and publishing
+			// unchanged until someone edits it; creating, copying or bulk
+			// editing it lands here and asks for the flag to be removed. Only
+			// the sections of this job's attached vaults are checked: a section
+			// kept for a vault this computer hasn't attached can't be edited
+			// here and is preserved unchanged.
+			submittedSections := models.EngineSettings{}
+			for engineID := range represented {
+				if section, ok := engineSettings[engineID]; ok {
+					submittedSections[engineID] = section
+				}
+			}
+			if err := engines.RejectRetiredBackupOptions(submittedSections); err != nil {
+				writeRetiredBackupOptionError(w, err)
+				return
 			}
 			var validationErr error
 			if r.Method == http.MethodPut {
@@ -1889,6 +2023,9 @@ func handlerForExecutionInstanceWithReader(
 				RetentionMonthly:        req.RetentionMonthly,
 				RetentionYearly:         req.RetentionYearly,
 				Excludes:                req.Excludes,
+				SkipNoBackupFolders:     req.SkipNoBackupFolders,
+				SkipCacheDirFolders:     req.SkipCacheDirFolders,
+				SkipMarkerFileName:      req.SkipMarkerFileName,
 				Tag:                     req.Tag,
 				BeforeScriptPath:        req.BeforeScriptPath,
 				BeforeScriptMustSucceed: req.BeforeScriptMustSucceed,
@@ -1928,9 +2065,14 @@ func handlerForExecutionInstanceWithReader(
 			definitionChanged := true
 			if r.Method == http.MethodPut {
 				id = job.ID
-				if err := database.UpdateJob(db, job); err != nil {
+				beforeJobDefinitionUpdate(job.ID)
+				if err := database.UpdateJobAtRevision(db, job, req.Revision); err != nil {
 					if errors.Is(err, database.ErrJobDefinitionBusy) {
 						writeJobBeingDeleted(w)
+						return
+					}
+					if errors.Is(err, database.ErrJobDefinitionChanged) {
+						writeJobDefinitionChanged(w)
 						return
 					}
 					if errors.Is(err, database.ErrJobRunActive) ||
@@ -2328,7 +2470,6 @@ func handlerForExecutionInstanceWithReader(
 			}
 			err := database.SaveSettings(db, models.Settings{
 				DefaultEngine:                req.DefaultEngine,
-				AutoStart:                    req.AutoStart,
 				LogRetentionDays:             req.LogRetentionDays,
 				Theme:                        req.Theme,
 				Language:                     language,
@@ -2343,7 +2484,6 @@ func handlerForExecutionInstanceWithReader(
 				// see keepStartAtLogin above.
 				StartWithWindows:             req.StartWithWindows || req.StartAtLogin || keepStartAtLogin,
 				StartAtLogin:                 req.StartAtLogin || req.StartWithWindows || keepStartAtLogin,
-				MinimizeToTray:               req.MinimizeToTray,
 				MaxConcurrentJobRuns:         req.MaxConcurrentJobRuns,
 				DisableAutomaticUpdateChecks: req.DisableAutomaticUpdateChecks,
 			})
@@ -2419,8 +2559,8 @@ func NewServer(db *sql.DB) *http.Server {
 	return newServer(db, 5*time.Second)
 }
 
-func NewServerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error) *http.Server {
-	return newServerAt(db, endpoint, record, activate, 5*time.Second)
+func NewServerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint) *http.Server {
+	return newServerAt(db, endpoint, 5*time.Second)
 }
 
 // NewServerAtWithRcloneAuthShutdown gives the application explicit ownership
@@ -2430,53 +2570,14 @@ func NewServerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvou
 func NewServerAtWithRcloneAuthShutdown(
 	db *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
-	record rendezvous.Record,
-	activate func() error,
 	updaters ...*appupdate.Service,
 ) (*http.Server, func() error) {
 	updater := appupdate.New(db)
 	if len(updaters) > 0 && updaters[0] != nil {
 		updater = updaters[0]
 	}
-	return buildServerAtWithSecurityMode(
-		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, nil, false,
-	)
-}
-
-func NewServerAtWithRcloneAuthShutdownManualBrowser(
-	db *sql.DB,
-	endpoint runtimeendpoint.Endpoint,
-	record rendezvous.Record,
-	activate func() error,
-	rcloneAuthNoOpenBrowser bool,
-	updaters ...*appupdate.Service,
-) (*http.Server, func() error) {
-	updater := appupdate.New(db)
-	if len(updaters) > 0 && updaters[0] != nil {
-		updater = updaters[0]
-	}
-	return buildServerAtWithSecurityMode(
-		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, nil, false,
-		rcloneAuthNoOpenBrowser,
-	)
-}
-
-func NewServerAtWithRcloneAuthShutdownManualBrowserAndRuntime(
-	db *sql.DB,
-	endpoint runtimeendpoint.Endpoint,
-	record rendezvous.Record,
-	activate func() error,
-	rcloneAuthNoOpenBrowser bool,
-	runtimeManager *operationruntime.Manager,
-	updaters ...*appupdate.Service,
-) (*http.Server, func() error) {
-	updater := appupdate.New(db)
-	if len(updaters) > 0 && updaters[0] != nil {
-		updater = updaters[0]
-	}
-	return buildServerAtWithSecurityMode(
-		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager, false,
-		rcloneAuthNoOpenBrowser,
+	return buildServerAt(
+		db, db, endpoint, nil, 5*time.Second, updater, nil, false,
 	)
 }
 
@@ -2489,8 +2590,6 @@ func NewServerAtWithReaderAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
 	rcloneAuthNoOpenBrowser bool,
 	keepStartAtLogin bool,
 	runtimeManager *operationruntime.Manager,
@@ -2500,8 +2599,8 @@ func NewServerAtWithReaderAndRuntime(
 	if len(updaters) > 0 && updaters[0] != nil {
 		updater = updaters[0]
 	}
-	return buildServerAtWithSecurityMode(
-		db, readDB, endpoint, lanOrigins, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager,
+	return buildServerAt(
+		db, readDB, endpoint, lanOrigins, 5*time.Second, updater, runtimeManager,
 		keepStartAtLogin, rcloneAuthNoOpenBrowser,
 	)
 }
@@ -2517,8 +2616,6 @@ func NewContainerServerAtWithReaderAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
 	rcloneAuthRelayPort int,
 	runtimeManager *operationruntime.Manager,
 	updaters ...*appupdate.Service,
@@ -2527,27 +2624,19 @@ func NewContainerServerAtWithReaderAndRuntime(
 	if len(updaters) > 0 && updaters[0] != nil {
 		updater = updaters[0]
 	}
-	return buildContainerServerAtWithSecurityMode(
-		db, readDB, endpoint, lanOrigins, record, activate, 5*time.Second, SecurityModeProduction,
+	return buildContainerServerAt(
+		db, readDB, endpoint, lanOrigins, 5*time.Second,
 		updater, runtimeManager, rcloneAuthRelayPort,
 	)
 }
 
 func newServer(db *sql.DB, readHeaderTimeout time.Duration) *http.Server {
-	return newServerAt(db, runtimeendpoint.Preferred(), rendezvous.Record{}, nil, readHeaderTimeout)
+	return newServerAt(db, runtimeendpoint.Preferred(), readHeaderTimeout)
 }
 
-func newServerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, readHeaderTimeout time.Duration) *http.Server {
-	return newServerAtWithSecurityMode(db, endpoint, record, activate, readHeaderTimeout, SecurityModeProduction)
-}
-
-func NewServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, mode SecurityMode) *http.Server {
-	return newServerAtWithSecurityMode(db, endpoint, record, activate, 5*time.Second, mode)
-}
-
-func newServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, readHeaderTimeout time.Duration, mode SecurityMode) *http.Server {
-	server, closeRcloneAuth := buildServerAtWithSecurityMode(
-		db, db, endpoint, nil, record, activate, readHeaderTimeout, mode, appupdate.New(db), nil, false,
+func newServerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, readHeaderTimeout time.Duration) *http.Server {
+	server, closeRcloneAuth := buildServerAt(
+		db, db, endpoint, nil, readHeaderTimeout, appupdate.New(db), nil, false,
 	)
 	server.RegisterOnShutdown(func() {
 		if err := closeRcloneAuth(); err != nil {
@@ -2557,40 +2646,39 @@ func newServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, 
 	return server
 }
 
-func buildServerAtWithSecurityMode(
+func buildServerAt(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
 	readHeaderTimeout time.Duration,
-	mode SecurityMode,
 	updater *appupdate.Service,
 	runtimeManager *operationruntime.Manager,
 	keepStartAtLogin bool,
-	manualRcloneBrowser ...bool,
+	rcloneAuthNoOpenBrowser ...bool,
 ) (*http.Server, func() error) {
-	rcloneAuth := newRcloneAuthStore(manualRcloneBrowser...)
+	// --rclone-auth-no-open-browser (or --headless) only stops Replicaro from
+	// opening the sign-in page; the link is shown in the UI either way.
+	rcloneAuth := newDesktopRcloneAuthStore()
+	if len(rcloneAuthNoOpenBrowser) == 1 && rcloneAuthNoOpenBrowser[0] {
+		rcloneAuth = newRcloneAuthStore()
+	}
 	return buildServerWithRcloneAuth(
-		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
+		db, readDB, endpoint, lanOrigins, readHeaderTimeout, updater, runtimeManager,
 		rcloneAuth, keepStartAtLogin, false,
 	)
 }
 
-func buildContainerServerAtWithSecurityMode(
+func buildContainerServerAt(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
 	readHeaderTimeout time.Duration,
-	mode SecurityMode,
 	updater *appupdate.Service,
 	runtimeManager *operationruntime.Manager,
 	rcloneAuthRelayPort int,
 ) (*http.Server, func() error) {
 	return buildServerWithRcloneAuth(
-		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
+		db, readDB, endpoint, lanOrigins, readHeaderTimeout, updater, runtimeManager,
 		newContainerRcloneAuthStore(rcloneAuthRelayPort), false, true,
 	)
 }
@@ -2599,10 +2687,7 @@ func buildServerWithRcloneAuth(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
 	readHeaderTimeout time.Duration,
-	mode SecurityMode,
 	updater *appupdate.Service,
 	runtimeManager *operationruntime.Manager,
 	rcloneAuth *rcloneAuthStore,
@@ -2610,8 +2695,8 @@ func buildServerWithRcloneAuth(
 	containerPackage bool,
 ) (*http.Server, func() error) {
 	server := &http.Server{
-		Handler: applicationHandlerAtWithSecurityModeAndRcloneAuth(
-			db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
+		Handler: applicationHandlerAtWithRcloneAuth(
+			db, readDB, endpoint, lanOrigins, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
 		),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       15 * time.Second,
@@ -2621,13 +2706,6 @@ func buildServerWithRcloneAuth(
 		IdleTimeout:  60 * time.Second,
 	}
 	return server, rcloneAuth.closeAll
-}
-
-func normalizedSecurityMode(mode SecurityMode) SecurityMode {
-	if mode == SecurityModeDevelopment {
-		return SecurityModeDevelopment
-	}
-	return SecurityModeProduction
 }
 
 // engineCommandError attaches native CLI output to a failed command so the UI

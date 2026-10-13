@@ -55,6 +55,13 @@ func nativeProcessFenceFromContext(ctx context.Context) *NativeProcessFence {
 	return fence
 }
 
+// NativeProcessFenceInContextForTests returns the fence a native command
+// started with ctx inherits, or nil. Tests in other packages use it to check
+// that the commands they stub out were handed the fence.
+func NativeProcessFenceInContextForTests(ctx context.Context) *NativeProcessFence {
+	return nativeProcessFenceFromContext(ctx)
+}
+
 // NativeProcessFenceInactive reports true only when no process still holds the
 // operation's inherited lease. Unsupported platforms deliberately never can.
 func NativeProcessFenceInactive(path string) (bool, error) {

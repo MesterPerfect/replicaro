@@ -64,6 +64,13 @@ func NormalizeConnectorOptions(engine string, integration integrations.Integrati
 		if _, err := normalizeRcloneRemoteOptions(provided, true); err != nil {
 			return nil, err
 		}
+		variables, err := ParseRcloneRemoteEnvironment(provided[RcloneRemoteEnvironmentOption])
+		if err != nil {
+			return nil, err
+		}
+		if err := ValidateRcloneRemoteEnvironmentNamesForSave(variables); err != nil {
+			return nil, err
+		}
 	}
 	normalized, err := NormalizeStorageOptions(integration, provided)
 	if err != nil {
@@ -447,7 +454,33 @@ func validatedConnectorAddress(engine, connector, location string, options map[s
 	if engine == KopiaID && connector == "sftp" && strings.TrimSpace(address.Username) == "" {
 		return vaultidentity.EffectiveAddress{}, fmt.Errorf("SFTP username is required for Kopia")
 	}
+	// Restic starts ssh with the host as its first argument, so a host that
+	// begins with "-" would be read by ssh as an option. No real host name
+	// starts with "-". The user name is passed after -l and is safe, and Kopia
+	// already rejects such a host in its own argument parser.
+	if engine == ResticID && connector == "sftp" && strings.HasPrefix(address.Host, "-") {
+		return vaultidentity.EffectiveAddress{}, errSFTPDashHost
+	}
 	return address, nil
+}
+
+var errSFTPDashHost = errors.New(`SFTP host cannot start with "-"`)
+
+// ValidateSFTPHost refuses an SFTP host that starts with "-", whatever the
+// engine. Connecting an existing vault reads its recovery metadata before the
+// engine is known, and creating a Kopia vault doesn't get the Restic check in
+// the address validation; without this check such a host would only show up
+// as a generic failed command. Other address problems are left to the usual
+// validation.
+func ValidateSFTPHost(connector, location string, options map[string]string) error {
+	if connector != "sftp" {
+		return nil
+	}
+	address, err := vaultidentity.ResolveEffectiveAddress(connector, location, options)
+	if err == nil && strings.HasPrefix(address.Host, "-") {
+		return errSFTPDashHost
+	}
+	return nil
 }
 
 func splitConnectionString(value string) map[string]string {

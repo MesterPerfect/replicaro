@@ -236,23 +236,6 @@ export function Tooltip({
 }
 
 /* ------------------------------------------------------------------ */
-/* Badges & status                                                     */
-/* ------------------------------------------------------------------ */
-
-export function StatusBadge({ status }: { status: string }) {
-    switch (status) {
-        case "running":
-            return <span className="badge info running">{t("ui.components.ui.running")}</span>;
-        case "success":
-            return <span className="badge ok">{t("ui.components.ui.healthy")}</span>;
-        case "failed":
-            return <span className="badge danger">{t("ui.components.ui.failed")}</span>;
-        default:
-            return <span className="badge muted">{t("ui.components.ui.never.run")}</span>;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* Modal                                                               */
 /* ------------------------------------------------------------------ */
 

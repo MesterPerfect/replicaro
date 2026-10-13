@@ -70,8 +70,11 @@ func (files containerFiles) settleUser(noRoot bool, requested *containerUser) er
 	}
 	// A second Replicaro started inside a running container (docker exec runs
 	// as root now) must not re-own the state the running one is using, so it
-	// skips every change here. Asking for the running user, it then stops at
-	// the instance lock; otherwise it stops earlier, during app-data setup.
+	// skips every change here. Staying root or asking for the running user,
+	// it gets through app-data setup and stops at the instance lock the
+	// running one holds, like any second start. Switched to any other user,
+	// it can't get into the running user's owner-only state folders and stops
+	// earlier, with a permission error during app-data setup.
 	running, err := files.instanceRunning()
 	if err != nil {
 		return err

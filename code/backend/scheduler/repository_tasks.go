@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -72,13 +71,11 @@ func SetRepositoryAdmissionForTests(next func(context.Context, *sql.DB, models.R
 
 var assertRepositoryOwner = func(ctx context.Context, repo models.Repository) error {
 	return (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		AssertRootOwner(ctx, repo.ClientUUID, repo.ProfileUUID, repo.AttachmentGeneration)
 }
 
 var refreshRepositoryOwnerVaultCare = func(ctx context.Context, repo models.Repository) (models.Repository, error) {
 	authority, err := (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		ReadRootCareAuthority(ctx)
 	if err != nil {
 		return models.Repository{}, err
@@ -97,7 +94,7 @@ var assertRepositoryWriter = func(ctx context.Context, repo models.Repository) e
 		return err
 	}
 	if repo.Engine == engines.KopiaID {
-		engine, err := engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
+		engine, err := engines.Resolve(repo)
 		if err != nil {
 			return err
 		}
@@ -175,8 +172,13 @@ func runScheduledRepositoryTask(ctx context.Context, db *sql.DB, repo models.Rep
 	}
 	defer unlock()
 
-	operationID, err := retryRepositoryPersistence(ctx, func() (string, error) {
-		return database.StartRepositoryOperation(db, repo, operation, time.Now())
+	var operationID string
+	err := operationruntime.RetryWrite(ctx, 4, 25*time.Millisecond, func() error {
+		var startErr error
+		operationID, startErr = database.StartRepositoryOperation(db, repo, operation, time.Now())
+		return startErr
+	}, func(err error) bool {
+		return errors.Is(err, database.ErrRepositoryTaskActive) || errors.Is(err, database.ErrVaultBeingRemoved) || errors.Is(err, sql.ErrNoRows)
 	})
 	if errors.Is(err, database.ErrRepositoryTaskActive) || errors.Is(err, database.ErrVaultBeingRemoved) {
 		// A vault whose removal is pending is skipped like a busy one: no record,
@@ -199,8 +201,8 @@ func runScheduledRepositoryTask(ctx context.Context, db *sql.DB, repo models.Rep
 	operationCtx = command.ContextWithLiveOutput(operationCtx, func(stream, text string) {
 		runtimeManager.Append(operationID, stream, text)
 	})
-	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic string, stdout, stderr io.Reader) bool {
-		return operationlog.StageNativeOutput(operationID, engine, kind, status, diagnostic, stdout, stderr) == nil
+	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic, stdoutPath, stderrPath string) bool {
+		return operationlog.StageNativeOutput(operationID, engine, kind, status, diagnostic, stdoutPath, stderrPath) == nil
 	})
 	output, terminalPersisted, err := runRepositoryTaskWithRuntime(operationCtx, db, repo, operation, operationID, runtimeManager, true)
 	cancelOperation()
@@ -285,9 +287,7 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 	}
 	var manager engines.Engine
 	if err == nil {
-		manager, err = engines.ResolveWithRepositoryAvailabilityCheck(
-			repo, storageavailability.RequireRepositoryAvailable,
-		)
+		manager, err = engines.Resolve(repo)
 		if err != nil && operation == "maintenance" {
 			err = errors.Join(err, skipRepositoryTaskStep(db, operationID, "native", "maintenance",
 				"engine resolution failed", time.Now()))
@@ -399,7 +399,7 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 								_ = database.LogWarning(db, "Vault Size cache could not be marked dirty after native maintenance started")
 							}
 						}
-						err = finishTrackedNativeOperation(db, operationID, "maintenance", output, nativeErr, nativeProcessStarted)
+						err = finishTrackedNativeOperation(ctx, db, operationID, "maintenance", output, nativeErr, nativeProcessStarted)
 					}
 				}
 			} else if stepErr := database.StartOperationStep(db, operationID, "native", "maintenance", time.Now()); stepErr != nil {
@@ -428,7 +428,7 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 						_ = database.LogWarning(db, "Vault Size cache could not be marked dirty after native maintenance started")
 					}
 				}
-				err = finishTrackedNativeOperation(db, operationID, "maintenance", output, nativeErr, nativeProcessStarted)
+				err = finishTrackedNativeOperation(ctx, db, operationID, "maintenance", output, nativeErr, nativeProcessStarted)
 			}
 		} else {
 			output, nativeSucceeded, err = runIntegrityCheck(ctx, db, operationID, repo, manager, closeCancelGate)
@@ -437,7 +437,7 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 	// Admission or prerequisite failure can leave no requested child to run.
 	// Close before aggregate classification and terminal persistence in that case.
 	closeCancelGate()
-	status := repositoryTaskStatus(err, nativeSucceeded)
+	status := repositoryTaskStatus(ctx, err, nativeSucceeded)
 	output = combinedTaskOutput(output, err)
 	if errors.Is(err, errRepositoryTaskStepFinalization) {
 		// A started orchestration step is still running durably. Keep its parent
@@ -462,9 +462,9 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 			db, operationID, repo, operation, status,
 		)
 	}
-	persistErr := retryRepositoryFinish(context.Background(), func() error {
+	persistErr := operationruntime.RetryWrite(context.Background(), 4, 25*time.Millisecond, func() error {
 		return finishRepositoryOperation(db, operationID, repo, operation, status, output, time.Now())
-	})
+	}, func(err error) bool { return errors.Is(err, sql.ErrNoRows) })
 	if persistErr != nil {
 		message := fmt.Sprintf("repository %s completed but final state requires startup reconciliation: %v", operation, persistErr)
 		_ = database.LogError(db, message)
@@ -487,17 +487,15 @@ func runRepositoryTaskWithRuntime(ctx context.Context, db *sql.DB, repo models.R
 // cleanup, result persistence) is completed_with_issues. A check that finds
 // damage is a failed native child, so it is always failed; admission, owner
 // and Kopia policy failures never reach the native child and stay failed.
-func repositoryTaskStatus(err error, nativeSucceeded bool) string {
-	switch {
-	case err == nil:
-		return "success"
-	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
-		return "interrupted"
-	case nativeSucceeded:
+// Only a cancel or shutdown of ctx, the task's own context, is interrupted;
+// an internal timeout is a failure and notifies (see
+// operationruntime.TerminalStatus).
+func repositoryTaskStatus(ctx context.Context, err error, nativeSucceeded bool) string {
+	status := operationruntime.TerminalStatus(ctx, err)
+	if status == "failed" && nativeSucceeded {
 		return "completed_with_issues"
-	default:
-		return "failed"
 	}
+	return status
 }
 
 // requestedNativeSucceeded reports whether the requested native child itself
@@ -616,7 +614,7 @@ func runIntegrityCheck(ctx context.Context, db *sql.DB, operationID string, repo
 	// order and recorded failure steps unchanged so its operation history stays
 	// consistent.
 	if repo.Engine == engines.KopiaID {
-		if admissionErr := persistRepositoryStorageAdmission(ctx, db, operationID, repo); admissionErr != nil {
+		if admissionErr := persistRepositoryStorageAdmission(db, operationID); admissionErr != nil {
 			return "", false, errors.Join(admissionErr,
 				skip("orchestration", prepareKind, "repository storage admission failed before integrity preparation"),
 				skip("native", nativeKind, "repository storage admission failed"),
@@ -662,7 +660,7 @@ func runIntegrityCheck(ctx context.Context, db *sql.DB, operationID string, repo
 			skip("native", nativeKind, "cache preparation outcome was not persisted"), runCleanup(cleanup))
 	}
 	if repo.Engine != engines.KopiaID {
-		if admissionErr := persistRepositoryStorageAdmission(checkContext, db, operationID, repo); admissionErr != nil {
+		if admissionErr := persistRepositoryStorageAdmission(db, operationID); admissionErr != nil {
 			return "", false, errors.Join(admissionErr,
 				skip("native", nativeKind, "repository storage admission failed"), runCleanup(cleanup))
 		}
@@ -691,13 +689,17 @@ func runIntegrityCheck(ctx context.Context, db *sql.DB, operationID string, repo
 	output, nativeErr := manager.Check(nativeContext, repo)
 	closeGate()
 	nativePersistErr := finishTrackedNativeOperation(
-		db, operationID, nativeKind, output, nativeErr, nativeProcessStarted,
+		ctx, db, operationID, nativeKind, output, nativeErr, nativeProcessStarted,
 	)
 
 	return output, requestedNativeSucceeded(nativeErr), errors.Join(nativePersistErr, runCleanup(cleanup))
 }
 
+// finishTrackedNativeOperation records the native step's result. ctx is the
+// task's own context: only its cancel or shutdown labels the step
+// interrupted.
 func finishTrackedNativeOperation(
+	ctx context.Context,
 	db *sql.DB,
 	operationID, kind, output string,
 	nativeErr error,
@@ -705,6 +707,16 @@ func finishTrackedNativeOperation(
 ) error {
 	operationStatus, stageStarted, preparationErr, nativeStageErr, outputProcessingErr, stageKnown :=
 		engines.RequestedOperationOutcome(nativeErr)
+	if stageKnown && operationStatus == engines.RequestedOperationInterrupted &&
+		operationruntime.TerminalStatus(ctx, nativeErr) != "interrupted" {
+		// The engine reports any context error as interrupted, including an
+		// internal time limit. Label that the way the task's status treats it:
+		// a failed native child, or a preparation failure before one started.
+		operationStatus = engines.RequestedOperationFailed
+		if !stageStarted {
+			operationStatus = engines.RequestedOperationNotStarted
+		}
+	}
 	classifiedNativeErr := nativeErr
 	started := processStarted()
 	if stageKnown {
@@ -762,21 +774,19 @@ func finishTrackedNativeOperation(
 	return errors.Join(nativeErr, persistenceErr)
 }
 
-func persistRepositoryStorageAdmission(ctx context.Context, db *sql.DB, operationID string, repo models.Repository) error {
+func persistRepositoryStorageAdmission(db *sql.DB, operationID string) error {
 	const kind = "repository_storage_admission"
 	if err := database.StartOperationStep(db, operationID, "orchestration", kind, time.Now()); err != nil {
 		return fmt.Errorf("%w: persist repository storage admission start: %v", ErrRepositoryTaskPersistence, err)
 	}
-	admissionErr := storageavailability.RequireRepositoryAvailable(ctx, repo)
-	status, output := "succeeded", "exact repository storage is available"
-	if admissionErr != nil {
-		status, output = "failed", admissionErr.Error()
-	}
-	if err := finishRepositoryStorageAdmissionStep(db, operationID, kind, status, output, time.Now()); err != nil {
-		return errors.Join(admissionErr, ErrRepositoryTaskPersistence,
+	// The vault's storage was checked once, under the vault lock, when this
+	// task was admitted. The step records that result for the operation log
+	// rather than probing the storage a second time.
+	if err := finishRepositoryStorageAdmissionStep(db, operationID, kind, "succeeded", "exact repository storage is available", time.Now()); err != nil {
+		return errors.Join(ErrRepositoryTaskPersistence,
 			fmt.Errorf("%w: persist repository storage admission result: %v", errRepositoryTaskStepFinalization, err))
 	}
-	return admissionErr
+	return nil
 }
 
 func combinedTaskOutput(output string, err error) string {
@@ -789,76 +799,17 @@ func combinedTaskOutput(output string, err error) string {
 	return output + "\n" + err.Error()
 }
 
-func retryRepositoryPersistence(ctx context.Context, fn func() (string, error)) (string, error) {
-	var id string
-	var err error
-	for attempt := 1; attempt <= 4; attempt++ {
-		id, err = fn()
-		if err == nil || errors.Is(err, database.ErrRepositoryTaskActive) || errors.Is(err, database.ErrVaultBeingRemoved) || errors.Is(err, sql.ErrNoRows) {
-			return id, err
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
-		}
-	}
-	return id, err
-}
-
-func retryRepositoryFinish(ctx context.Context, fn func() error) error {
-	var err error
-	for attempt := 1; attempt <= 4; attempt++ {
-		err = fn()
-		if err == nil || errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
-		}
-	}
-	return err
-}
-
 func prepareRepositoryTaskNotification(
 	db *sql.DB,
 	operationID string,
 	repo models.Repository,
 	operation, status string,
 ) func() {
-	settings, err := database.GetSettings(db)
-	if err != nil {
-		_ = database.SkipOperationStep(db, operationID, "application", "notification",
-			"notification settings unavailable: "+err.Error(), time.Now())
-		return nil
-	}
-	success := status == "success"
-	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
-	event := notifications.Event{
-		Event: operation, Status: status,
-		Success: success, Title: repo.Name, OperationID: operationID,
-	}
-	if !notifications.ShouldNotify(event) || !nativeEnabled && !webhookEnabled {
-		return nil
-	}
-	event.Locale = locale.Effective(settings.Language)
-	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
-		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
-		return nil
-	}
-	// Register before terminal visibility, then let the caller dispatch only
-	// after the terminal transaction succeeds. The existing running step is the
-	// complete handoff barrier; no additional durable state is needed.
-	return func() {
-		notifications.Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, event, func(notifyErr error) {
-			stepStatus, result := "succeeded", "notification delivery completed"
-			if notifyErr != nil {
-				stepStatus, result = "warning", notifyErr.Error()
-				_ = database.LogError(db, "Notification failed: "+notifyErr.Error())
-			}
-			_ = database.FinishOperationStep(db, operationID, "notification", stepStatus, result, time.Now())
-		})
-	}
+	return notifications.PrepareOperation(db, operationID, status, database.GetSettings, func(settings models.Settings) notifications.Event {
+		return notifications.Event{
+			Event: operation, Status: status,
+			Success: status == "success", Title: repo.Name, OperationID: operationID,
+			Locale: locale.Effective(settings.Language),
+		}
+	})
 }

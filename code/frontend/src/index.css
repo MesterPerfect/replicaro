@@ -482,6 +482,17 @@ pre {
     margin-top: 16px;
 }
 
+/* Shown in place of the whole app after a render error (AppErrorBoundary). */
+.app-error {
+    max-width: 640px;
+    margin: 64px auto;
+    padding: 0 16px;
+}
+
+.app-error p {
+    color: var(--text-muted);
+}
+
 /* The "Don't remind me" checkbox sits under Continue in English, the button
    it applies to. */
 .language-load-failed-actions {
@@ -1040,6 +1051,8 @@ button.protection-ring { cursor: pointer; }
 
 .pacman-motion::before {
     top: 0;
+    /* The eye is painted onto the upper jaw so it rises and falls with the chomp. */
+    background: radial-gradient(circle at 40px 15px, var(--bg) 0 5px, currentColor 5.5px);
     border-radius: 68px 68px 0 0;
     transform-origin: 50% 100%;
     animation: pacman-chomp-top 0.46s ease-in-out infinite alternate;
@@ -2564,6 +2577,22 @@ select option {
 
 .advanced-setting > .job-script-success-help {
 	padding-left: 0;
+}
+
+/* The "skip folders that contain a marker file" boxes after the exclude
+   patterns; the custom name field lines up with the checkbox labels. */
+.marker-file-fields {
+	display: grid;
+	gap: 12px;
+	margin-bottom: 14px;
+}
+
+.marker-file-fields .advanced-setting > input {
+	display: block;
+	box-sizing: border-box;
+	width: calc(100% - 26px);
+	margin: 6px 0 0;
+	margin-inline-start: 26px;
 }
 
 .object-lock-settings-grid {
@@ -4237,7 +4266,7 @@ select option {
 .toast.error { border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 .toast.info { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
 .toast-icon { flex: 0 0 auto; }
-.toast-message { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.toast-message { min-width: 0; flex: 1; overflow-wrap: anywhere; white-space: pre-line; }
 .toast-dismiss {
     display: inline-flex;
     flex: 0 0 auto;

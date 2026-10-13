@@ -17,7 +17,9 @@ const notificationContract = {
   'notifications.message.failed': 'taskName',
   'notifications.message.sourceUnavailable30Days': 'jobName',
   'notifications.message.vaultUnavailable30Days': 'jobName,vaultName',
-  'notifications.message.vaultReconnectRequired': '',
+  'notifications.message.vaultReconnectRequired': 'vaultName',
+  'notifications.message.vaultOutOfSpace': '',
+  'notifications.message.kopiaVaultOutOfSpace': 'vaultName',
   'notifications.appUpdate.title': '',
   'notifications.appUpdate.message': '',
   'notifications.task.backup': 'name',
@@ -30,6 +32,16 @@ const notificationContract = {
   'notifications.task.removeVault': 'name',
   'notifications.task.restoreSnapshot': 'name',
   'notifications.task.restoreSelectedItems': 'name',
+};
+
+// The tray menu labels and the Quit prompt are read by the backend's desktop
+// integration (desktop.SetText), never by frontend source.
+const desktopContract = {
+  'desktop.trayOpen': '',
+  'desktop.trayQuit': '',
+  'desktop.quitPrompt': '',
+  'desktop.quitButton': '',
+  'desktop.cancelButton': '',
 };
 
 // JSON.parse accepts a repeated object key and silently keeps its last value.
@@ -115,6 +127,13 @@ if (english) {
   for (const key of keys.filter((item) => item.startsWith('notifications.'))) {
     if (!(key in notificationContract)) fail(`Unknown notification contract key: ${key}`);
   }
+  for (const [key, placeholders] of Object.entries(desktopContract)) {
+    const message = english.messages[key];
+    if (typeof message !== 'string' || placeholderNames(message) !== placeholders) fail(`Invalid required desktop key or placeholders: ${key}`);
+  }
+  for (const key of keys.filter((item) => item.startsWith('desktop.'))) {
+    if (!(key in desktopContract)) fail(`Unknown desktop contract key: ${key}`);
+  }
   const referenced = new Set();
   for (const file of collectSourceFiles(join(root, 'src'))) {
     const source = readFileSync(file, 'utf8');
@@ -124,6 +143,7 @@ if (english) {
   // Backend notification calls consume the same catalog without appearing in
   // frontend source, so these are explicit cross-process contract keys.
   for (const key of Object.keys(notificationContract)) referenced.add(key);
+  for (const key of Object.keys(desktopContract)) referenced.add(key);
   for (const key of keys.filter((item) => item.startsWith('ui.integration.'))) referenced.add(key);
   for (const key of referenced) if (!(key in english.messages)) fail(`Unknown source key: ${key}`);
   for (const key of keys) if (!referenced.has(key)) fail(`Unused catalog key: ${key}`);

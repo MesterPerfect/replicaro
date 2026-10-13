@@ -67,12 +67,6 @@ func secretSet(values ...string) map[string]bool {
 	return result
 }
 
-func RcloneProviders() []RcloneProviderDefinition {
-	result := make([]RcloneProviderDefinition, len(rcloneProviders))
-	copy(result, rcloneProviders)
-	return result
-}
-
 func RcloneProvider(storageType string) (RcloneProviderDefinition, bool) {
 	storageType = strings.ToLower(strings.TrimSpace(storageType))
 	for _, provider := range rcloneProviders {

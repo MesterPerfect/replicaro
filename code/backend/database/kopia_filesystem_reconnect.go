@@ -97,10 +97,6 @@ func MarkKopiaFilesystemReconnectActivated(db *sql.DB, repositoryID, intentID st
 	return updateKopiaFilesystemReconnect(db, repositoryID, intentID, "prepared", "activated", "", "")
 }
 
-func MarkKopiaFilesystemReconnectCleanup(db *sql.DB, repositoryID, intentID string) error {
-	return updateKopiaFilesystemReconnect(db, repositoryID, intentID, "committed", "cleanup", "", "")
-}
-
 func RecordKopiaFilesystemReconnectError(db *sql.DB, repositoryID, intentID string, reconnectErr error) error {
 	message := ""
 	if reconnectErr != nil {

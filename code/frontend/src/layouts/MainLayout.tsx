@@ -6,6 +6,7 @@ import { getAppUpdateStatus, getEngineInfo, getJobs, openAppUpdateDownload, runJ
 import { BackupRunPicker } from "../components/BackupRunPicker";
 import { backupTargetIsActive, manualRunNotice } from "../services/backupJobs";
 import { jobCurrentSource } from "../jobSourceDisplay";
+import { displayPath } from "../nativePathDisplay";
 import { Icon, Modal, Tooltip, useToast } from "../components/ui";
 import type { AppUpdateStatus, BackupJob, EngineInfo } from "../types";
 
@@ -17,11 +18,6 @@ const navItems = [
 ];
 
 type RunDialog = "backup" | null;
-
-function displayPath(value: string) {
-    if (!/^\/?[A-Za-z]:[\\/]/.test(value)) return value;
-    return value.replace(/^\/+/, "").replace(/\//g, "\\");
-}
 
 export interface AppUpdateOutletContext {
     presentManualUpdateResult: (status: AppUpdateStatus) => void;

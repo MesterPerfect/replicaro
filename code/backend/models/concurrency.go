@@ -39,8 +39,7 @@ func NormalizeConcurrencyMode(value string) (string, error) {
 // recovered high-speed preferences that these native transports cannot use.
 // Validation happens first so an unknown value is never hidden by fallback.
 // The rclone sign-in providers and Any Rclone Remote are capped at Normal; the
-// same fixed list sets the one-profile rule in api/repository_recovery.go and
-// profilebinding/repair.go.
+// same fixed list sets the one-profile rule in SoleProfileConnector.
 func NormalizeConcurrencyModeForConnector(connector, value string) (string, error) {
 	mode, err := NormalizeConcurrencyMode(value)
 	if err != nil {

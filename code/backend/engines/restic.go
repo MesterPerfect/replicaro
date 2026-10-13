@@ -148,6 +148,21 @@ func (e *resticEngine) Backup(ctx context.Context, repo models.Repository, sourc
 			args = append(args, "--exclude", exclude)
 		}
 	}
+	// Restic skips a folder's contents when the file exists, whatever it
+	// contains, and keeps the folder and the marker file itself. A saved
+	// Advanced option --exclude-caches can repeat the CACHEDIR.TAG flag;
+	// Restic accepts it twice.
+	if options.SkipNoBackupFolders {
+		args = append(args, "--exclude-if-present", models.NoBackupMarkerFile)
+	}
+	if options.SkipCacheDirFolders {
+		args = append(args, "--exclude-caches")
+	}
+	if options.SkipMarkerFileName != "" {
+		// validated as one plain name without ":" (Restic would read
+		// "name:header" as a name plus a required first line)
+		args = append(args, "--exclude-if-present", options.SkipMarkerFileName)
+	}
 	args = append(args, extra...)
 	args = append(args, source)
 	capture, out, runErr := e.runRepoCommandCaptured(ctx, repo, nil, args, command.NoTotalDeadline)
@@ -158,6 +173,7 @@ func (e *resticEngine) Backup(ctx context.Context, repo models.Repository, sourc
 		if partial, confirmed := resticPartialSnapshot(capture, runErr); confirmed {
 			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr}
 		}
+		reportBackupStorageFull(ctx, repo, capture, source, options.LogicalSource)
 		return models.Snapshot{}, out, runErr
 	}
 	// Stdout is the exact native machine-readable stream. Successful stderr is
@@ -672,7 +688,69 @@ func (e *resticEngine) changeRepositoryPassword(ctx context.Context, repo models
 	if filepath.Base(nativeInputPath) != "restic-new-password.txt" {
 		return "", requestedOperationPreparationFailure(ResticID, fmt.Errorf("native password input path is invalid"))
 	}
-	return e.runRepo(ctx, repo, []string{"key", "passwd", "--new-password-file", nativeInputPath}, command.NoTotalDeadline)
+	args := []string{"key", "passwd", "--new-password-file", nativeInputPath}
+	if hint, ok := ctx.Value(resticKeyHintKey{}).(string); ok {
+		if !resticKeyIDPattern.MatchString(hint) {
+			return "", requestedOperationPreparationFailure(ResticID, fmt.Errorf("Restic key hint is invalid"))
+		}
+		// `key passwd` replaces the key the committed password opened. When
+		// another key has the same password, Restic would otherwise pick
+		// whichever it tries first, so the change is pointed at the key
+		// recorded before the first launch, on every launch.
+		args = append(args, "--key-hint", hint)
+	}
+	return e.runRepo(ctx, repo, args, command.NoTotalDeadline)
+}
+
+type resticKeyHintKey struct{}
+
+var resticKeyIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ContextWithResticKeyHint makes the Restic password change started with ctx
+// replace the key with this full ID.
+func ContextWithResticKeyHint(ctx context.Context, keyID string) context.Context {
+	return context.WithValue(ctx, resticKeyHintKey{}, keyID)
+}
+
+// listKeys runs `key list --json` with repo.Passphrase and returns the full
+// key IDs and the ID of the key that password opened.
+func (e *resticEngine) listKeys(ctx context.Context, repo models.Repository) (current string, ids []string, err error) {
+	output, err := e.runRepo(ctx, repo, []string{"key", "list", "--json"}, command.NoTotalDeadline)
+	if err != nil {
+		return "", nil, err
+	}
+	var keys []struct {
+		Current bool   `json:"current"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(output), &keys); err != nil {
+		return "", nil, fmt.Errorf("parse Restic key list: %w", err)
+	}
+	for _, key := range keys {
+		if !resticKeyIDPattern.MatchString(key.ID) {
+			return "", nil, fmt.Errorf("Restic key list has an invalid key ID")
+		}
+		if key.Current {
+			if current != "" {
+				return "", nil, fmt.Errorf("Restic key list has more than one current key")
+			}
+			current = key.ID
+		}
+		ids = append(ids, key.ID)
+	}
+	if current == "" {
+		return "", nil, fmt.Errorf("Restic key list has no current key")
+	}
+	return current, ids, nil
+}
+
+// removeKey runs `key remove <id>` with repo.Passphrase. Restic refuses to
+// remove the key that password opened.
+func (e *resticEngine) removeKey(ctx context.Context, repo models.Repository, keyID string) (string, error) {
+	if !resticKeyIDPattern.MatchString(keyID) {
+		return "", fmt.Errorf("Restic key ID is invalid")
+	}
+	return e.runRepo(ctx, repo, []string{"key", "remove", keyID}, command.NoTotalDeadline)
 }
 
 func (e *resticEngine) probeRepositoryPassword(ctx context.Context, repo models.Repository) (string, error) {
@@ -830,6 +908,20 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 		}
 	}
 	trackedContext, processStarted := command.ContextWithProcessStartTracking(ctx)
+	if len(args) > 1 && args[0] == "key" && args[1] == "passwd" {
+		// Marked here rather than by the caller so storage preparation (rclone
+		// config and obscure runs) still ends with Replicaro. Killed partway,
+		// `key passwd` leaves only the old password opening the vault, both
+		// (the new key is written before the old one is removed), or only the
+		// new one. Its exclusive lock is usually left behind too: always when
+		// both open, when only the old one opens once the command has run for
+		// about half a second, and now and then when only the new one does.
+		// Password-change recovery handles all of those, but each one costs a
+		// rerun or a stale-lock unlock, and left alone the command finishes in
+		// a few seconds. Recovery waits for it through the change's
+		// native-process fence rather than racing it.
+		trackedContext = command.ContextOutlivingReplicaro(trackedContext)
+	}
 	if resticLiveOutputEnabled(repo, args) {
 		trackedContext = command.ContextWithLiveOutputEnabled(trackedContext)
 	}
@@ -1043,7 +1135,7 @@ func resticStorage(repo models.Repository) (string, []string, []string, error) {
 		// Restic parses this argument as a URL. The effective path is already
 		// literal, so escape once here; Azure/GCS colon grammars below are not URLs.
 		repository := "sftp://" + user + sftpHostPort(address) + (&url.URL{Path: separator + path}).EscapedPath()
-		sshArgs := []string{"-p", address.Port}
+		sshArgs := []string{"-p", address.Port, "-o", externalSSHBatchMode}
 		identity, err := materializeSSHPrivateKey(repo)
 		if err != nil {
 			return "", nil, nil, err
@@ -1427,11 +1519,6 @@ func resticPathPrefixMatch(prefix, value, source string) bool {
 // Windows-looking node names or trim whitespace returned by Restic.
 func normalizeResticPath(value string) string { return value }
 
-func resticWindowsStylePath(value string) bool {
-	normalized := strings.ReplaceAll(value, "\\", "/")
-	return resticWindowsDrivePath(normalized) || resticWindowsUNCPath(value)
-}
-
 func resticWindowsUNCPath(value string) bool {
 	return strings.HasPrefix(value, `\\`)
 }
@@ -1556,15 +1643,26 @@ func resticStoredPath(source, value string) (string, bool) {
 	return strings.TrimSuffix(source, "/") + "/" + relative, true
 }
 
+// resticLiteralIncludePath turns an archived path into a restic --include
+// pattern that matches only that path. Restic include patterns use Go's
+// filepath.Match syntax for each path component, so the metacharacters *, ?
+// and [ are wrapped in one-character classes ([*], [?], [[]). Go's matcher
+// treats a backslash as an escape only off Windows, so a pattern such as
+// "Trip \[1].jpg" would match nothing on Windows and restic would exit 0
+// having restored nothing. Character classes behave the same on every OS.
+// A ] outside a class is already literal.
+//
+// A literal backslash in an archived name (from a Linux or macOS source) is
+// escaped as \\ off Windows. On Windows a backslash in such a name cannot be
+// selected by an include pattern, so validateRestoreSelectionName refuses
+// that selection before any restic command runs.
 func resticLiteralIncludePath(relative string) string {
 	relative = strings.TrimLeft(normalizeResticPath(relative), "/")
-	escaped := strings.NewReplacer(
-		`\`, `\\`,
-		`*`, `\*`,
-		`?`, `\?`,
-		`[`, `\[`,
-	).Replace(relative)
-	return "/" + escaped
+	replacements := []string{`*`, `[*]`, `?`, `[?]`, `[`, `[[]`}
+	if runtime.GOOS != "windows" {
+		replacements = append(replacements, `\`, `\\`)
+	}
+	return "/" + strings.NewReplacer(replacements...).Replace(relative)
 }
 
 // Restic's ls positional filters and restore subfolder selectors use
@@ -1577,12 +1675,6 @@ func resticPathFilter(value string) string {
 		return value
 	}
 	return "/" + value
-}
-
-func resticWindowsDrivePath(value string) bool {
-	return len(value) > 2 &&
-		((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) &&
-		value[1] == ':' && value[2] == '/'
 }
 
 var resticSnapshotIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{64}$`)

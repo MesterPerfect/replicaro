@@ -31,25 +31,25 @@ type kopiaEngine struct {
 	custom            bool
 }
 
-func kopiaPreparationFailure(repo models.Repository, err error) error {
+func kopiaPreparationFailure(err error) error {
 	if err == nil {
 		return nil
 	}
 	return requestedOperationPreparationFailure(KopiaID, err)
 }
 
-func kopiaFollowupFailure(repo models.Repository, err error) error {
+func kopiaFollowupFailure(err error) error {
 	if err == nil {
 		return nil
 	}
 	return requestedOperationFollowupFailure(KopiaID, err)
 }
 
-func kopiaOutputProcessingFailure(repo models.Repository, err error) error {
+func kopiaOutputProcessingFailure(err error) error {
 	if err == nil {
 		return nil
 	}
-	return kopiaFollowupFailure(repo, &command.OutputProcessingFailure{Err: err})
+	return kopiaFollowupFailure(&command.OutputProcessingFailure{Err: err})
 }
 
 type kopiaInitializationGate struct {
@@ -125,6 +125,10 @@ func (e *kopiaEngine) config(repo models.Repository) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	// This runs for every Kopia command. On Windows these folders inherit the
+	// application folder's protected DACL and nothing re-applies it here:
+	// doing that on each call rewrites the ACL of every file in the Kopia
+	// cache. The chmod only keeps the Unix mode at 0700.
 	for _, directory := range []string{configDir, cacheDir, logDir} {
 		if err := os.Chmod(directory, 0o700); err != nil {
 			return "", "", err
@@ -174,9 +178,6 @@ type kopiaOperationSessionScopeKey struct{}
 type kopiaOperationSessionScope struct {
 	mu       sync.Mutex
 	sessions map[string]*kopiaRepositorySession
-	values   map[string]any
-	closers  []func() error
-	closed   bool
 }
 
 // WithOperationSessionScope allows related synchronous commands in one backup
@@ -185,69 +186,7 @@ type kopiaOperationSessionScope struct {
 func WithOperationSessionScope(ctx context.Context) context.Context {
 	return context.WithValue(ctx, kopiaOperationSessionScopeKey{}, &kopiaOperationSessionScope{
 		sessions: map[string]*kopiaRepositorySession{},
-		values:   map[string]any{},
 	})
-}
-
-func operationSessionScopeFromContext(ctx context.Context) *kopiaOperationSessionScope {
-	scope, _ := ctx.Value(kopiaOperationSessionScopeKey{}).(*kopiaOperationSessionScope)
-	return scope
-}
-
-func scopedOperationValue(ctx context.Context, key string) any {
-	scope := operationSessionScopeFromContext(ctx)
-	if scope == nil {
-		return nil
-	}
-	scope.mu.Lock()
-	defer scope.mu.Unlock()
-	return scope.values[key]
-}
-
-func rememberOperationValue(ctx context.Context, key string, value any, closer func() error) bool {
-	scope := operationSessionScopeFromContext(ctx)
-	if scope == nil {
-		return false
-	}
-	scope.mu.Lock()
-	defer scope.mu.Unlock()
-	if scope.closed {
-		return false
-	}
-	scope.values[key] = value
-	if closer != nil {
-		scope.closers = append(scope.closers, closer)
-	}
-	return true
-}
-
-// CloseOperationSessionScope releases operation-scoped engine resources before
-// terminal state is persisted. It is safe to call more than once.
-func CloseOperationSessionScope(ctx context.Context) error {
-	scope := operationSessionScopeFromContext(ctx)
-	if scope == nil {
-		return nil
-	}
-	scope.mu.Lock()
-	if scope.closed {
-		scope.mu.Unlock()
-		return nil
-	}
-	closers := append([]func() error(nil), scope.closers...)
-	scope.mu.Unlock()
-	var result error
-	failed := make([]func() error, 0, len(closers))
-	for index := len(closers) - 1; index >= 0; index-- {
-		if err := closers[index](); err != nil {
-			result = errors.Join(result, err)
-			failed = append(failed, closers[index])
-		}
-	}
-	scope.mu.Lock()
-	scope.closers = failed
-	scope.closed = len(failed) == 0
-	scope.mu.Unlock()
-	return result
 }
 
 func scopedKopiaSession(ctx context.Context, repo models.Repository) *kopiaRepositorySession {
@@ -319,7 +258,7 @@ func (s *kopiaRepositorySession) run(ctx context.Context, args []string, timeout
 		return output, err
 	}
 	if err := validateKopiaRepositoryInvocation(s.repo); err != nil {
-		return "", kopiaPreparationFailure(s.repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	if eligibleKopiaLiveCommand(args) {
@@ -339,7 +278,7 @@ func (s *kopiaRepositorySession) run(ctx context.Context, args []string, timeout
 
 func (s *kopiaRepositorySession) runCaptured(ctx context.Context, args []string, timeout time.Duration) (*command.CapturedOutput, string, error) {
 	if err := validateKopiaRepositoryInvocation(s.repo); err != nil {
-		return nil, "", kopiaPreparationFailure(s.repo, err)
+		return nil, "", kopiaPreparationFailure(err)
 	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	if eligibleKopiaLiveCommand(args) {
@@ -476,7 +415,9 @@ type kopiaExportedPolicy struct {
 		KeepAnnual  *int `json:"keepAnnual"`
 	} `json:"retention"`
 	Files struct {
-		Ignore []string `json:"ignore"`
+		Ignore          []string `json:"ignore"`
+		IgnoreDotFiles  []string `json:"ignoreDotFiles"`
+		IgnoreCacheDirs *bool    `json:"ignoreCacheDirs"`
 	} `json:"files"`
 	Compression struct {
 		CompressorName string `json:"compressorName"`
@@ -499,18 +440,18 @@ func normalizedKopiaExcludes(excludes []string) []string {
 func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source string, options BackupOptions) (snapshot models.Snapshot, output string, err error) {
 	extra, err := normalizedOptions(options.Settings)
 	if err != nil {
-		return models.Snapshot{}, "", kopiaPreparationFailure(repo, err)
+		return models.Snapshot{}, "", kopiaPreparationFailure(err)
 	}
 	if err := validateOptions(KopiaID, extra); err != nil {
-		return models.Snapshot{}, "", kopiaPreparationFailure(repo, err)
+		return models.Snapshot{}, "", kopiaPreparationFailure(err)
 	}
 	concurrency, err := kopiaConcurrency(repo)
 	if err != nil {
-		return models.Snapshot{}, "", kopiaPreparationFailure(repo, err)
+		return models.Snapshot{}, "", kopiaPreparationFailure(err)
 	}
 	session, sessionOutput, err := e.openRepositorySession(ctx, repo, false)
 	if err != nil {
-		return models.Snapshot{}, sessionOutput, kopiaPreparationFailure(repo, err)
+		return models.Snapshot{}, sessionOutput, kopiaPreparationFailure(err)
 	}
 	tag := options.Tag
 	if tag != "" && !strings.Contains(tag, ":") {
@@ -518,7 +459,9 @@ func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source
 	}
 	args := []string{"snapshot", "create", source, "--json", "--parallel", strconv.Itoa(concurrency.backup)}
 	if tag != "" {
-		args = append(args, "--tags", tag)
+		// One argument, so a tag that starts with "-" (such as "-env:prod")
+		// stays the flag's value. Kopia's parser rejects "--tags -env:prod".
+		args = append(args, "--tags="+tag)
 	}
 	if options.OwnerProfileID != "" {
 		args = append(args, "--tags", "replicaro-profile:"+options.OwnerProfileID)
@@ -551,7 +494,7 @@ func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source
 	}
 	args = append(args, extra...)
 	if admissionErr := admitSourceBackup(ctx); admissionErr != nil {
-		return models.Snapshot{}, sessionOutput, kopiaPreparationFailure(repo, admissionErr)
+		return models.Snapshot{}, sessionOutput, kopiaPreparationFailure(admissionErr)
 	}
 	capture, out, runErr := session.runCaptured(ctx, args, command.NoTotalDeadline)
 	if capture != nil {
@@ -561,18 +504,19 @@ func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source
 		if partial, confirmed := kopiaPartialSnapshot(capture, runErr, source); confirmed {
 			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr}
 		}
+		reportBackupStorageFull(ctx, repo, capture, source, options.LogicalSource)
 		return models.Snapshot{}, out, runErr
 	}
 	// Kopia progress and warnings are stderr diagnostics. Only the exact stdout
 	// stream is eligible for strict snapshot-result parsing.
 	stdout, openErr := capture.OpenStdout()
 	if openErr != nil {
-		return models.Snapshot{}, out, kopiaFollowupFailure(repo, &command.OutputProcessingFailure{Err: openErr})
+		return models.Snapshot{}, out, kopiaFollowupFailure(&command.OutputProcessingFailure{Err: openErr})
 	}
 	snapshot, parseErr := parseKopiaSnapshotReader(stdout)
 	_ = stdout.Close()
 	if parseErr != nil {
-		return models.Snapshot{}, out, kopiaFollowupFailure(repo, &command.OutputProcessingFailure{Err: parseErr})
+		return models.Snapshot{}, out, kopiaFollowupFailure(&command.OutputProcessingFailure{Err: parseErr})
 	}
 	return snapshot, out, nil
 }
@@ -634,15 +578,11 @@ func (e *kopiaEngine) snapshotRows(ctx context.Context, repo models.Repository) 
 	}
 	stdout, openErr := capture.OpenStdout()
 	if openErr != nil {
-		return nil, out, kopiaOutputProcessingFailure(repo, openErr)
+		return nil, out, kopiaOutputProcessingFailure(openErr)
 	}
 	rows, parseErr := parseKopiaSnapshotRowsReader(stdout)
 	_ = stdout.Close()
-	return rows, sessionOutput + out, kopiaOutputProcessingFailure(repo, parseErr)
-}
-
-func parseKopiaSnapshotRows(out string) ([]kopiaSnapshotRow, error) {
-	return parseKopiaSnapshotRowsReader(strings.NewReader(out))
+	return rows, sessionOutput + out, kopiaOutputProcessingFailure(parseErr)
 }
 
 func parseKopiaSnapshotRowsReader(reader io.Reader) ([]kopiaSnapshotRow, error) {
@@ -711,23 +651,23 @@ func (e *kopiaEngine) ListPathRecursive(ctx context.Context, repo models.Reposit
 func (e *kopiaEngine) listPath(ctx context.Context, repo models.Repository, id, path string, recursive bool) (entries []models.SnapshotEntry, output string, err error) {
 	session, statusOutput, err := e.openRepositorySession(ctx, repo, false)
 	if err != nil {
-		return nil, statusOutput, kopiaPreparationFailure(repo, err)
+		return nil, statusOutput, kopiaPreparationFailure(err)
 	}
 	snapshotCapture, snapshotOutput, err := session.runCaptured(ctx, []string{"snapshot", "list", "--all", "--show-identical", "--json"}, command.NoTotalDeadline)
 	if snapshotCapture != nil {
 		defer snapshotCapture.Close()
 	}
 	if err != nil {
-		return nil, snapshotOutput, kopiaPreparationFailure(repo, err)
+		return nil, snapshotOutput, kopiaPreparationFailure(err)
 	}
 	snapshotStdout, openErr := snapshotCapture.OpenStdout()
 	if openErr != nil {
-		return nil, snapshotOutput, kopiaPreparationFailure(repo, &command.OutputProcessingFailure{Err: openErr})
+		return nil, snapshotOutput, kopiaPreparationFailure(&command.OutputProcessingFailure{Err: openErr})
 	}
 	rows, err := parseKopiaSnapshotRowsReader(snapshotStdout)
 	_ = snapshotStdout.Close()
 	if err != nil {
-		return nil, snapshotOutput, kopiaPreparationFailure(repo, &command.OutputProcessingFailure{Err: err})
+		return nil, snapshotOutput, kopiaPreparationFailure(&command.OutputProcessingFailure{Err: err})
 	}
 	objectPath := ""
 	var summary json.RawMessage
@@ -735,7 +675,7 @@ func (e *kopiaEngine) listPath(ctx context.Context, repo models.Repository, id, 
 		if row.ID == id {
 			objectPath = row.RootEntry.Obj
 			if strings.TrimSpace(objectPath) == "" || strings.TrimSpace(objectPath) != objectPath {
-				return nil, snapshotOutput, kopiaPreparationFailure(repo, fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
+				return nil, snapshotOutput, kopiaPreparationFailure(fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
 			}
 			if recursive && path == "" && row.RootEntry.Type == "f" {
 				// Entry-only resume/retry has no index session. Validate the
@@ -743,15 +683,14 @@ func (e *kopiaEngine) listPath(ctx context.Context, repo models.Repository, id, 
 				return []models.SnapshotEntry{}, snapshotOutput, nil
 			}
 			if row.RootEntry.Type != "d" {
-				return nil, snapshotOutput, kopiaPreparationFailure(repo, fmt.Errorf("Kopia snapshot root is not a directory"))
+				return nil, snapshotOutput, kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a directory"))
 			}
 			summary = row.RootEntry.Summary
 			break
 		}
 	}
 	if objectPath == "" {
-		return nil, snapshotOutput, kopiaPreparationFailure(repo,
-			fmt.Errorf("Kopia snapshot %s was not found", id))
+		return nil, snapshotOutput, kopiaPreparationFailure(fmt.Errorf("Kopia snapshot %s was not found", id))
 	}
 	run := func(ctx context.Context, _ models.Repository, args []string, timeout time.Duration) (*command.CapturedOutput, string, error) {
 		return session.runCaptured(ctx, args, timeout)
@@ -786,7 +725,7 @@ func appendKopiaIndexDiagnostic(previous, next string) string {
 func (e *kopiaEngine) listPathFromObject(ctx context.Context, repo models.Repository, objectPath, path string, recursive bool, run kopiaCapturedCommandRunner, summaries ...json.RawMessage) ([]models.SnapshotEntry, string, error) {
 	relative, err := normalizeSnapshotRelativePath(path)
 	if err != nil {
-		return nil, "", kopiaPreparationFailure(repo, err)
+		return nil, "", kopiaPreparationFailure(err)
 	}
 	var summary json.RawMessage
 	if len(summaries) > 0 {
@@ -814,7 +753,7 @@ func (e *kopiaEngine) listPathFromObject(ctx context.Context, repo models.Reposi
 			}
 		}
 		if !found {
-			return nil, output, kopiaOutputProcessingFailure(repo, fmt.Errorf("Kopia path component %q is not a directory", component))
+			return nil, output, kopiaOutputProcessingFailure(fmt.Errorf("Kopia path component %q is not a directory", component))
 		}
 	}
 	if recursive {
@@ -830,7 +769,7 @@ func (e *kopiaEngine) listPathFromObject(ctx context.Context, repo models.Reposi
 		}
 		stdout, err := capture.OpenStdout()
 		if err != nil {
-			return nil, output, kopiaOutputProcessingFailure(repo, err)
+			return nil, output, kopiaOutputProcessingFailure(err)
 		}
 		entries, parseErr := parseCheckedKopiaEntries(stdout, summary)
 		_ = stdout.Close()
@@ -858,7 +797,7 @@ func (e *kopiaEngine) listPathFromObject(ctx context.Context, repo models.Reposi
 		for _, entry := range manifest.Entries {
 			converted, err := entry.snapshotEntry(next.prefix)
 			if err != nil {
-				return nil, output, kopiaOutputProcessingFailure(repo, err)
+				return nil, output, kopiaOutputProcessingFailure(err)
 			}
 			entries = append(entries, converted)
 			if recursive && entry.Type == "d" {
@@ -880,8 +819,7 @@ func (s *kopiaSnapshotIndexSession) Close() error                   { return nil
 func (s *kopiaSnapshotIndexSession) ListPathRecursive(ctx context.Context, snapshot SnapshotIndexItem, path string) ([]models.SnapshotEntry, string, error) {
 	object, ok := snapshot.NativeReference.(string)
 	if !ok || strings.TrimSpace(object) == "" {
-		return nil, "", kopiaPreparationFailure(s.repository.repo,
-			fmt.Errorf("kopia snapshot %q has no reusable root object", snapshot.Snapshot.ID))
+		return nil, "", kopiaPreparationFailure(fmt.Errorf("kopia snapshot %q has no reusable root object", snapshot.Snapshot.ID))
 	}
 	// File roots have no browsable directory content. They participate in the
 	// ordinary ready/complete cache state and remain whole-snapshot restorable.
@@ -889,7 +827,7 @@ func (s *kopiaSnapshotIndexSession) ListPathRecursive(ctx context.Context, snaps
 		return []models.SnapshotEntry{}, "", nil
 	}
 	if snapshot.Snapshot.NativeRootType != "d" {
-		return nil, "", kopiaPreparationFailure(s.repository.repo, fmt.Errorf("Kopia snapshot has an unsupported root type"))
+		return nil, "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot has an unsupported root type"))
 	}
 	run := func(ctx context.Context, _ models.Repository, args []string, timeout time.Duration) (*command.CapturedOutput, string, error) {
 		return s.repository.runCaptured(ctx, args, timeout)
@@ -904,7 +842,7 @@ func (s *kopiaSnapshotIndexSession) ListPathRecursive(ctx context.Context, snaps
 func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Repository) (SnapshotIndexSession, string, error) {
 	session, statusOutput, err := e.openRepositorySession(ctx, repo, false)
 	if err != nil {
-		return nil, statusOutput, kopiaPreparationFailure(repo, err)
+		return nil, statusOutput, kopiaPreparationFailure(err)
 	}
 	capture, out, err := session.runCaptured(ctx, []string{"snapshot", "list", "--all", "--show-identical", "--json"}, command.NoTotalDeadline)
 	if capture != nil {
@@ -915,12 +853,12 @@ func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Reposi
 	}
 	stdout, openErr := capture.OpenStdout()
 	if openErr != nil {
-		return nil, out, kopiaOutputProcessingFailure(repo, openErr)
+		return nil, out, kopiaOutputProcessingFailure(openErr)
 	}
 	rows, err := parseKopiaSnapshotRowsReader(stdout)
 	_ = stdout.Close()
 	if err != nil {
-		return nil, out, kopiaOutputProcessingFailure(repo, err)
+		return nil, out, kopiaOutputProcessingFailure(err)
 	}
 	items := make([]SnapshotIndexItem, 0, len(rows))
 	summaries := make(map[string]json.RawMessage, len(rows))
@@ -930,11 +868,11 @@ func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Reposi
 			TotalFileCount: kopiaNativeFileCount(row.RootEntry.Summary), NativeSourceUser: row.Source.UserName, NativeSourceHost: row.Source.Host, Size: formatBytes(row.Stats.TotalSize)}, kopiaSnapshotTags(row.Tags))
 		identity := row.RootEntry.Obj
 		if row.RootEntry.Type != "d" && row.RootEntry.Type != "f" {
-			return nil, out, kopiaOutputProcessingFailure(repo, fmt.Errorf("Kopia snapshot has an unsupported root type"))
+			return nil, out, kopiaOutputProcessingFailure(fmt.Errorf("Kopia snapshot has an unsupported root type"))
 		}
 		summaries[row.ID] = row.RootEntry.Summary
 		if strings.TrimSpace(identity) == "" || strings.TrimSpace(identity) != identity {
-			return nil, out, kopiaOutputProcessingFailure(repo, fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
+			return nil, out, kopiaOutputProcessingFailure(fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
 		}
 		items = append(items, SnapshotIndexItem{Snapshot: snapshot, NativeContentIdentity: row.RootEntry.Type + ":" + identity, NativeReference: identity})
 	}
@@ -943,31 +881,31 @@ func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Reposi
 func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id string, options RestoreOptions) (output string, err error) {
 	concurrency, err := kopiaConcurrency(repo)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	selection, err := validateRestoreOptions(options)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	rows, _, err := e.snapshotRows(ctx, repo)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	source := ""
 	for _, row := range rows {
 		if row.ID == id {
 			source = row.RootEntry.Obj
 			if selection != "" && row.RootEntry.Type != "d" {
-				return "", kopiaPreparationFailure(repo, fmt.Errorf("Kopia snapshot root is not a directory"))
+				return "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a directory"))
 			}
 			break
 		}
 	}
 	if source == "" {
-		return "", kopiaPreparationFailure(repo, fmt.Errorf("kopia snapshot %q was not found", id))
+		return "", kopiaPreparationFailure(fmt.Errorf("kopia snapshot %q was not found", id))
 	}
 	if options.OriginalLocation {
-		return "", kopiaPreparationFailure(repo, fmt.Errorf("kopia original-location restore is unsupported"))
+		return "", kopiaPreparationFailure(fmt.Errorf("kopia original-location restore is unsupported"))
 	}
 	// A content object can be shared by manifests with different root attributes.
 	// Pinned Kopia resolves an ambiguous object to the newest manifest; the exact
@@ -985,7 +923,7 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 		}
 		session, sessionOutput, metadataErr := e.openRepositorySession(ctx, repo, false)
 		if metadataErr != nil {
-			return sessionOutput, kopiaPreparationFailure(repo, metadataErr)
+			return sessionOutput, kopiaPreparationFailure(metadataErr)
 		}
 		run := func(ctx context.Context, _ models.Repository, args []string, timeout time.Duration) (*command.CapturedOutput, string, error) {
 			return session.runCaptured(ctx, args, timeout)
@@ -1001,7 +939,7 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 			manifest, out, metadataErr = readKopiaDirectory(ctx, repo, parentObject, run)
 			metadata += out
 			if metadataErr != nil {
-				return metadata, kopiaPreparationFailure(repo, metadataErr)
+				return metadata, kopiaPreparationFailure(metadataErr)
 			}
 			if component == "" {
 				break
@@ -1015,17 +953,22 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 				}
 			}
 			if !found {
-				return metadata, kopiaPreparationFailure(repo, fmt.Errorf("Kopia selected parent %q is not a directory", component))
+				return metadata, kopiaPreparationFailure(fmt.Errorf("Kopia selected parent %q is not a directory", component))
 			}
 			manifest = nil
 		}
 		entryType, metadataErr := manifest.selectedType(pathpkg.Base(selection))
 		if metadataErr != nil {
-			return metadata, kopiaPreparationFailure(repo, &command.OutputProcessingFailure{Err: metadataErr})
+			return metadata, kopiaPreparationFailure(&command.OutputProcessingFailure{Err: metadataErr})
 		}
 
 		switch entryType {
 		case kopiaSelectedRegularFile:
+			// The request handler refuses this from the cached entry types;
+			// this is the native check for when the cache couldn't tell.
+			if RestoreDestinationMissing(options.Destination) {
+				return sessionOutput + metadata, kopiaPreparationFailure(ErrKopiaSelectedFileDestinationMissing)
+			}
 			basename := kopiaDestinationBasename(pathpkg.Base(selection), runtime.GOOS)
 			if options.KopiaFileNames != nil {
 				basename = options.KopiaFileNames.assign(basename)
@@ -1035,12 +978,22 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 				options.ReportDestination(fmt.Sprintf("Replicaro destination naming: selected file %q will use %q. Native overwrite policy remains %q.", selection, destination, options.ConflictMode))
 			}
 			if metadataErr != nil {
-				return sessionOutput + metadata, kopiaPreparationFailure(repo, metadataErr)
+				return sessionOutput + metadata, kopiaPreparationFailure(metadataErr)
 			}
 		case kopiaSelectedDirectory:
+			// The request handler already refuses a multi-item request with a
+			// folder, using the cached entry types. This is the native check
+			// for when the cache could not place an item or disagreed with
+			// Kopia: Kopia would restore the folder's contents straight into
+			// the shared destination (see ErrKopiaSelectionIncludesFolder).
+			// The items run one after another, so this item only knows the
+			// request's size, not the other items' types; earlier regular
+			// files may already be restored, but no folder ever merges.
+			if options.KopiaFileNames.selections() > 1 {
+				return sessionOutput + metadata, kopiaPreparationFailure(ErrKopiaSelectionIncludesFolder)
+			}
 		default:
-			return sessionOutput + metadata, kopiaPreparationFailure(repo,
-				fmt.Errorf("kopia selected path %q has unsupported native object type %q", selection, entryType))
+			return sessionOutput + metadata, kopiaPreparationFailure(fmt.Errorf("kopia selected path %q has unsupported native object type %q", selection, entryType))
 		}
 	}
 	// Kopia's default auto mode treats archive suffixes as output-format requests
@@ -1063,13 +1016,17 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 	case "no-overwrite":
 		args = append(args, "--no-overwrite-files", "--no-overwrite-directories", "--no-overwrite-symlinks")
 	default:
-		return "", kopiaPreparationFailure(repo,
-			fmt.Errorf("unsupported Kopia conflict mode %q", options.ConflictMode))
+		return "", kopiaPreparationFailure(fmt.Errorf("unsupported Kopia conflict mode %q", options.ConflictMode))
 	}
-	args = append(args, restoreSource, destination)
+	// Kopia parses flags anywhere on its command line, so "--" ends them
+	// before the two positional arguments. Pinned Kopia 0.23.1 accepts it, and
+	// a destination such as "--shallow=1" then stays a path. Destinations are
+	// already required to be absolute; this keeps the arguments positional
+	// whatever the restore source spells.
+	args = append(args, "--", restoreSource, destination)
 	session, sessionOutput, err := e.openRepositorySession(ctx, repo, false)
 	if err != nil {
-		return sessionOutput, kopiaPreparationFailure(repo, err)
+		return sessionOutput, kopiaPreparationFailure(err)
 	}
 	capture, out, err := session.runCaptured(ctx, args, command.NoTotalDeadline)
 	if capture != nil {
@@ -1133,6 +1090,12 @@ const (
 )
 
 func parseKopiaLongEntry(line string) (mode, name string, err error) {
+	mode, _, name, err = parseKopiaLongRecord(line)
+	return mode, name, err
+}
+
+// parseKopiaLongRecord also returns the record's native object ID.
+func parseKopiaLongRecord(line string) (mode, object, name string, err error) {
 	position := 0
 	var fields [6]string
 	for index := range fields {
@@ -1144,7 +1107,7 @@ func parseKopiaLongEntry(line string) (mode, name string, err error) {
 			position++
 		}
 		if start == position {
-			return "", "", fmt.Errorf("parse kopia listing: malformed long-list record")
+			return "", "", "", fmt.Errorf("parse kopia listing: malformed long-list record")
 		}
 		fields[index] = line[start:position]
 	}
@@ -1157,11 +1120,11 @@ func parseKopiaLongEntry(line string) (mode, name string, err error) {
 		separatorWidth += 34 - len(fields[5])
 	}
 	if position+separatorWidth > len(line) {
-		return "", "", fmt.Errorf("parse kopia listing: malformed name separator")
+		return "", "", "", fmt.Errorf("parse kopia listing: malformed name separator")
 	}
 	for index := 0; index < separatorWidth; index++ {
 		if line[position+index] != ' ' {
-			return "", "", fmt.Errorf("parse kopia listing: malformed name separator")
+			return "", "", "", fmt.Errorf("parse kopia listing: malformed name separator")
 		}
 	}
 	name = line[position+separatorWidth:]
@@ -1178,9 +1141,9 @@ func parseKopiaLongEntry(line string) (mode, name string, err error) {
 		}
 	}
 	if fields[0] == "" || name == "" {
-		return "", "", fmt.Errorf("parse kopia listing: missing mode or name")
+		return "", "", "", fmt.Errorf("parse kopia listing: missing mode or name")
 	}
-	return fields[0], name, nil
+	return fields[0], fields[5], name, nil
 }
 
 func kopiaSelectedFileDestination(directory, basename string) (string, error) {
@@ -1204,7 +1167,7 @@ func (e *kopiaEngine) DeleteSnapshot(ctx context.Context, repo models.Repository
 func (e *kopiaEngine) DeleteSnapshots(ctx context.Context, repo models.Repository, ids []string) (output string, err error) {
 	for _, id := range ids {
 		if err := ValidateSnapshotIDArgument(id); err != nil {
-			return "", kopiaPreparationFailure(repo, err)
+			return "", kopiaPreparationFailure(err)
 		}
 	}
 	args := append([]string{"snapshot", "delete"}, ids...)
@@ -1230,11 +1193,8 @@ func (e *kopiaEngine) prepareIntegrityCheckCache(ctx context.Context, repo model
 	if err := os.Mkdir(preparationCache, 0o700); err != nil {
 		return "", fmt.Errorf("create operation-owned Kopia preparation cache: %w", err)
 	}
-	if err := appdata.SecurePath(preparationCache, true); err != nil {
+	if err := os.Chmod(preparationCache, 0o700); err != nil {
 		return "", fmt.Errorf("secure operation-owned Kopia preparation cache: %w", err)
-	}
-	if _, err := secureIntegrityArtifactPath(operationRoot, preparationCache); err != nil {
-		return "", err
 	}
 
 	// `cache set` opens the repository before its action changes the copied
@@ -1269,7 +1229,7 @@ func (e *kopiaEngine) prepareIntegrityCheckCache(ctx context.Context, repo model
 func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository) (output string, err error) {
 	concurrency, err := kopiaConcurrency(repo)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	// Always the whole repository: `snapshot verify` with no snapshot ID. The
 	// snapshot-scoped form went away with the unused snapshot check endpoint,
@@ -1281,14 +1241,14 @@ func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository) (output
 		"--file-parallelism", strconv.Itoa(concurrency.verifyFiles)}
 	operationConfig := integrityCheckKopiaConfig(ctx)
 	if operationConfig == "" {
-		return "", kopiaPreparationFailure(repo, fmt.Errorf("operation-owned Kopia integrity configuration is unavailable"))
+		return "", kopiaPreparationFailure(fmt.Errorf("operation-owned Kopia integrity configuration is unavailable"))
 	}
 	base, env, err := e.kopiaIntegrityBase(repo, operationConfig)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 
 	// The canonical configuration must not be resized and restored around the
@@ -1296,10 +1256,10 @@ func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository) (output
 	// with a changed cache policy. The operation copy is disposable, so the
 	// native cache mutation cannot escape this integrity check.
 	if readyOutput, readyErr := e.ensureKopiaRepository(ctx, repo, base, env, false); readyErr != nil {
-		return readyOutput, kopiaPreparationFailure(repo, readyErr)
+		return readyOutput, kopiaPreparationFailure(readyErr)
 	}
 	if admissionErr := admitIntegrityCheck(ctx); admissionErr != nil {
-		return "", kopiaPreparationFailure(repo, admissionErr)
+		return "", kopiaPreparationFailure(admissionErr)
 	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	commandContext = command.ContextWithLiveOutputEnabled(commandContext)
@@ -1348,6 +1308,51 @@ func (e *kopiaEngine) changeRepositoryPassword(ctx context.Context, repo models.
 		command.NoTotalDeadline, "KOPIA_NEW_PASSWORD", newPassword)
 	return output, err
 }
+
+// Kopia's two format blobs, by the IDs `kopia blob show` takes.
+// kopia.repository holds the repository format (with its stable uniqueID),
+// encrypted with a key derived from the password; kopia.blobcfg holds the
+// storage configuration, encrypted the same way.
+const (
+	KopiaRepositoryBlob = "kopia.repository"
+	KopiaBlobcfgBlob    = "kopia.blobcfg"
+)
+
+// showFormatBlob prints one format blob's raw bytes with native `kopia blob
+// show`, opening the repository with repo.Passphrase.
+func (e *kopiaEngine) showFormatBlob(ctx context.Context, repo models.Repository, blobID string) ([]byte, error) {
+	if blobID != KopiaRepositoryBlob && blobID != KopiaBlobcfgBlob {
+		return nil, fmt.Errorf("invalid Kopia format blob")
+	}
+	output, err := e.repoRun(ctx, repo, []string{"blob", "show", blobID}, 10*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(output), nil
+}
+
+// forgetKopiaCachedFormat removes the copies of the two format blobs Kopia keeps
+// in the vault's own cache folder. Kopia reuses them for up to 15 minutes
+// instead of reading storage, so after a password change made by another
+// process, or one cut off before Kopia cleared them itself, the cached old
+// format rejects the new password ("invalid repository password") until they
+// expire. Kopia reads them from storage again on its next command.
+func forgetKopiaCachedFormat(repo models.Repository) error {
+	if strings.TrimSpace(repo.ID) == "" {
+		return fmt.Errorf("kopia vault ID is required for isolated configuration")
+	}
+	cacheDir, err := appdata.CacheDirectory(filepath.Join("engines", KopiaID, repo.ID, "cache"))
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{KopiaRepositoryBlob, KopiaBlobcfgBlob} {
+		if err := os.Remove(filepath.Join(cacheDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *kopiaEngine) repoRun(ctx context.Context, repo models.Repository, args []string, timeout time.Duration) (string, error) {
 	return e.repoRunWithInput(ctx, repo, args, "", timeout)
 }
@@ -1356,16 +1361,26 @@ func (e *kopiaEngine) repoRunWithEnvironment(ctx context.Context, repo models.Re
 	repo = normalizedStorageRepository(repo, KopiaID)
 	base, env, err := e.baseArgs(repo)
 	if err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	env = replaceEnvironment(env, key, value)
 	if output, readyErr := e.ensureKopiaRepository(ctx, repo, base, env, false); readyErr != nil {
-		return output, kopiaPreparationFailure(repo, readyErr)
+		return output, kopiaPreparationFailure(readyErr)
 	}
 	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
+	// Only the password change comes through here; another command reusing
+	// this helper must not inherit the next line. Kopia writes the storage
+	// config blob (kopia.blobcfg) with the new password first and the format
+	// blob (kopia.repository) second. Between the two writes the repository
+	// opens with neither password, and password-change recovery has to put
+	// back the kopia.blobcfg it saved before the launch and run the command
+	// again. If Replicaro crashes or is killed, letting Kopia finish leaves a
+	// repository the new password opens; recovery waits for it through the
+	// change's native-process fence.
+	commandContext = command.ContextOutlivingReplicaro(commandContext)
 	output, runErr := e.run(commandContext, env, append(base, args...), timeout)
 	started := processStarted() || runErr == nil
 	return output, requestedOperationCommandFailure(KopiaID, runErr, nil, started)
@@ -1403,7 +1418,7 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 		if session := scopedKopiaSession(ctx, repo); session != nil {
 			if len(args) >= 2 && args[0] == "snapshot" && args[1] == "delete" {
 				if admissionErr := admitNativeDeletion(ctx); admissionErr != nil {
-					return "", kopiaPreparationFailure(repo, admissionErr)
+					return "", kopiaPreparationFailure(admissionErr)
 				}
 			}
 			return session.run(ctx, args, timeout)
@@ -1414,11 +1429,11 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 		if kopiaBootstrapCommand(args) {
 			return "", err
 		}
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	if !kopiaBootstrapCommand(args) {
 		if output, readyErr := e.ensureKopiaRepository(ctx, repo, base, env, false); readyErr != nil {
-			return output, kopiaPreparationFailure(repo, readyErr)
+			return output, kopiaPreparationFailure(readyErr)
 		}
 	}
 	var output string
@@ -1427,11 +1442,11 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 		if kopiaBootstrapCommand(args) {
 			return "", err
 		}
-		return "", kopiaPreparationFailure(repo, err)
+		return "", kopiaPreparationFailure(err)
 	}
 	if len(args) >= 2 && args[0] == "snapshot" && args[1] == "delete" {
 		if admissionErr := admitNativeDeletion(ctx); admissionErr != nil {
-			return "", kopiaPreparationFailure(repo, admissionErr)
+			return "", kopiaPreparationFailure(admissionErr)
 		}
 	}
 	commandContext := ctx
@@ -1705,22 +1720,6 @@ func schemeForKopiaS3(config map[string]any) string {
 	return "https"
 }
 
-func findKopiaStoragePath(value any) string {
-	document, ok := value.(map[string]any)
-	if !ok {
-		return ""
-	}
-	storage, ok := document["storage"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	config, ok := storage["config"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	path, _ := config["path"].(string)
-	return path
-}
 func (e *kopiaEngine) connect(ctx context.Context, repo models.Repository) (string, error) {
 	args, input, err := kopiaStorageInvocation(repo, "connect")
 	if err != nil {
@@ -1828,7 +1827,14 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 			args = append(args, "from-config", "--token-stdin")
 			return append(args, common...), nil
 		}
-		sshArgs := []string{"-p", address.Port}
+		// Kopia stores these ssh options in repository.config when it connects,
+		// so a vault connected by an earlier version keeps its old options until
+		// it is reconnected or its credentials are updated; both run
+		// "repository connect" again. Replicaro doesn't reconnect a working vault
+		// just to refresh them, because Kopia deletes the config and cache when
+		// the check after a connect fails. Don't add an automatic refresh here
+		// without a product decision.
+		sshArgs := []string{"-p", address.Port, "-o", externalSSHBatchMode}
 		identity, err := materializeSSHPrivateKey(repo)
 		if err != nil {
 			return nil, err
@@ -1853,6 +1859,11 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 		if insecure {
 			sshArgs = append(sshArgs, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile="+os.DevNull)
 		}
+		// Keep --host and --username as separate arguments here, unlike the
+		// one-argument "--flag=value" form used elsewhere. In external mode
+		// Kopia passes "user@host" to ssh, so "--username=-oFoo=bar" would
+		// reach ssh as the option "-oFoo=bar@host". With separate arguments,
+		// Kopia's own parser refuses a value that starts with "-" first.
 		args = append(args, "sftp", "--host", address.Host, "--port", address.Port,
 			"--username", address.Username, "--path", address.Prefix, "--external", "--ssh-args="+strings.Join(sshArgs, " "))
 	case "s3":

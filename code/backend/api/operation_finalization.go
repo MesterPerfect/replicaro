@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/local/replicaro/command"
@@ -28,8 +27,8 @@ func beginOperationRuntime(parent context.Context, manager *operationruntime.Man
 	operationCtx = command.ContextWithLiveOutput(operationCtx, func(stream, text string) {
 		manager.Append(operationID, stream, text)
 	})
-	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic string, stdout, stderr io.Reader) bool {
-		return operationlog.StageNativeOutput(operationID, engine, kind, status, diagnostic, stdout, stderr) == nil
+	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic, stdoutPath, stderrPath string) bool {
+		return operationlog.StageNativeOutput(operationID, engine, kind, status, diagnostic, stdoutPath, stderrPath) == nil
 	})
 	closeGate := func() { manager.CloseCancel(operationID) }
 	release := func(terminalPersisted bool) {
@@ -43,11 +42,25 @@ func beginOperationRuntime(parent context.Context, manager *operationruntime.Man
 	return operationCtx, closeGate, release, nil
 }
 
+// finishTrackedNativeStep records the native step's result. ctx is the
+// operation's own context: only its cancel or shutdown labels the step
+// interrupted.
 func finishTrackedNativeStep(
-	db *sql.DB, operationID, kind, output string, operationErr error, processStarted bool,
+	ctx context.Context, db *sql.DB, operationID, kind, output string, operationErr error, processStarted bool,
 ) error {
 	operationStatus, stageStarted, preparationErr, nativeStageErr, outputProcessingErr, stageKnown :=
 		engines.RequestedOperationOutcome(operationErr)
+	if stageKnown && operationStatus == engines.RequestedOperationInterrupted &&
+		operationruntime.TerminalStatus(ctx, operationErr) != "interrupted" {
+		// The engine reports any context error as interrupted, including an
+		// internal time limit. Label that the way the operation's status
+		// treats it: a failed native child, or a preparation failure before
+		// one started.
+		operationStatus = engines.RequestedOperationFailed
+		if !stageStarted {
+			operationStatus = engines.RequestedOperationNotStarted
+		}
+	}
 	status := "succeeded"
 	stepOutput := output
 	admissionRejected := false
@@ -113,19 +126,6 @@ func finishTrackedNativeStep(
 	return persistErr
 }
 
-func terminalOperationStatus(_ context.Context, err error) string {
-	// A request can be cancelled after the native operation has already
-	// completed successfully. The native/orchestration result remains
-	// authoritative in that race; only a reported cancellation is interrupted.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return "interrupted"
-	}
-	if err != nil {
-		return "failed"
-	}
-	return "success"
-}
-
 // terminalStatusAfterNative applies the outcome rule to an operation with one
 // requested native child. A failure is completed_with_issues, not failed, only
 // when there is positive evidence that the main work was done:
@@ -135,16 +135,18 @@ func terminalOperationStatus(_ context.Context, err error) string {
 //   - the native child succeeded and only a later Replicaro step failed, such
 //     as output processing, local cleanup, or persisting a step result.
 //
-// Everything else stays failed, and cancellation stays interrupted. The caller
-// decides nativeCompleted; for restores that is restoreNativeCompleted, which
-// deliberately leaves out a Kopia exit 0 whose summary could not be read even
-// though its native child succeeded (see engines.RestoreOutcomeUnknown). Warning-only
-// application failures (notification delivery, rebuildable cache refresh,
-// dashboard refresh, statistics) never reach err, so they leave the result
-// unchanged. Do not widen nativeCompleted to "the process started" or to
-// anything read from counts: Replicaro never infers a partial success.
+// Everything else stays failed, and the operation's own cancel or shutdown
+// stays interrupted (see operationruntime.TerminalStatus: an internal timeout
+// is a failure). The caller decides nativeCompleted; for restores that is
+// restoreNativeCompleted, which deliberately leaves out a Kopia exit 0 whose
+// summary could not be read even though its native child succeeded (see
+// engines.RestoreOutcomeUnknown). Warning-only application failures
+// (notification delivery, rebuildable cache refresh, dashboard refresh,
+// statistics) never reach err, so they leave the result unchanged. Do not
+// widen nativeCompleted to "the process started" or to anything read from
+// counts: Replicaro never infers a partial success.
 func terminalStatusAfterNative(ctx context.Context, err error, nativeCompleted bool) string {
-	status := terminalOperationStatus(ctx, err)
+	status := operationruntime.TerminalStatus(ctx, err)
 	if status == "failed" && nativeCompleted {
 		return "completed_with_issues"
 	}
@@ -174,15 +176,11 @@ func restoreNativeCompleted(err error) bool {
 // finishOperationDurably retries ordinary transient failures. If it still
 // fails, the running marker is intentionally preserved for startup recovery.
 func finishOperationDurably(db *sql.DB, operationID, status, output string, finishedAt time.Time) error {
-	var err error
-	for attempt := 1; attempt <= 4; attempt++ {
-		err = finishOperationWrite(db, operationID, status, output, finishedAt)
-		if err == nil || errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if attempt < 4 {
-			time.Sleep(time.Duration(attempt) * 25 * time.Millisecond)
-		}
+	err := operationruntime.RetryWrite(context.Background(), 4, 25*time.Millisecond, func() error {
+		return finishOperationWrite(db, operationID, status, output, finishedAt)
+	}, func(err error) bool { return errors.Is(err, sql.ErrNoRows) })
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 	return fmt.Errorf("operation completed but final state requires startup reconciliation: %w", err)
 }

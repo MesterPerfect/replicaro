@@ -159,25 +159,6 @@ func AcquireShared(id string) func() {
 	return lock.lock.RUnlock
 }
 
-// AcquireSharedContext waits for a shared lock without outliving ctx.
-func AcquireSharedContext(ctx context.Context, id string) (func(), error) {
-	lock := mutex(id)
-	for {
-		if lock.lock.TryRLock() {
-			return lock.lock.RUnlock, nil
-		}
-		timer := time.NewTimer(5 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 // AcquireLowPrioritySharedContext admits a read-only background operation and
 // returns a derived context that is canceled when any public exclusive
 // acquisition needs the vault. The caller must stop native work and release the

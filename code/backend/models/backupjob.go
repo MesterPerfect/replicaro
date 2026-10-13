@@ -22,15 +22,32 @@ type BackupJob struct {
 	RetentionMonthly            *int              `json:"retentionMonthly,omitempty"`
 	RetentionYearly             *int              `json:"retentionYearly,omitempty"`
 	Excludes                    string            `json:"excludes"` // newline-separated glob patterns
-	Tag                         string            `json:"tag"`
-	BeforeScriptPath            string            `json:"beforeScriptPath"`
-	BeforeScriptMustSucceed     bool              `json:"beforeScriptMustSucceed"`
-	AfterScriptPath             string            `json:"afterScriptPath"`
-	AfterScriptMustSucceed      bool              `json:"afterScriptMustSucceed"`
-	EngineSettings              EngineSettings    `json:"engineSettings"`
-	PortableTargetIDs           []string          `json:"-"`
-	SizeBytes                   *int64            `json:"sizeBytes"`
-	SizeMeasuredAt              string            `json:"sizeMeasuredAt"`
+	// The "skip the contents of any folder that contains ..." choices (see
+	// marker_files.go). These are the user's own choices; the CACHEDIR.TAG
+	// one is also forced on while the job has a Kopia vault, without
+	// rewriting this saved value (see SkipsCacheDirFolders).
+	SkipNoBackupFolders     bool           `json:"skipNoBackupFolders"`
+	SkipCacheDirFolders     bool           `json:"skipCacheDirFolders"`
+	SkipMarkerFileName      string         `json:"skipMarkerFileName"`
+	Tag                     string         `json:"tag"`
+	BeforeScriptPath        string         `json:"beforeScriptPath"`
+	BeforeScriptMustSucceed bool           `json:"beforeScriptMustSucceed"`
+	AfterScriptPath         string         `json:"afterScriptPath"`
+	AfterScriptMustSucceed  bool           `json:"afterScriptMustSucceed"`
+	EngineSettings          EngineSettings `json:"engineSettings"`
+	PortableTargetIDs       []string       `json:"-"`
+	SizeBytes               *int64         `json:"sizeBytes"`
+	SizeMeasuredAt          string         `json:"sizeMeasuredAt"`
+	// UnattachedTargets is filled in when a job is loaded and never stored:
+	// the job also backs up to a vault that isn't attached on this computer
+	// (see HasUnattachedTargets). The job form needs it to apply the same
+	// Kopia rule as UsesKopia, because PortableTargetIDs isn't sent.
+	UnattachedTargets bool `json:"unattachedTargets,omitempty"`
+	// Revision is a digest of the stored editable definition. The database
+	// sets it when it loads a job for the API, and a job edit sends it back
+	// so an edit made from an outdated copy is refused. It is never stored;
+	// omitempty keeps it out of job definitions that are saved as JSON.
+	Revision string `json:"revision,omitempty"`
 }
 
 type EngineSettings map[string]EngineJobSettings

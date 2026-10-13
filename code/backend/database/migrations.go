@@ -20,11 +20,44 @@ import (
 // compatibility step.
 const CurrentSchemaVersion = 70
 
-var ErrDatabaseResetRequired = errors.New("database schema is incompatible; delete replicaro.db and restart")
+// ErrDatabaseResetRequired covers every replicaro.db this version can't use.
+// Startup shows its text to the user as the reason Replicaro couldn't start.
+// The database holds the only local copy of the vault credentials and jobs,
+// so the advice is to move it aside, never to delete it.
+var ErrDatabaseResetRequired = errors.New("This data isn't in a format this version of Replicaro can use. To start over with this version, move replicaro.db, and replicaro.db-wal and replicaro.db-shm if they exist, somewhere else first (don't delete them)")
 
-// Migrate initializes only the current schema. Older application databases
-// are rejected without migration, import, or metadata-cache backfill.
-func Migrate(db *sql.DB) error {
+// ErrDatabaseFromNewerVersion is the incompatible case users actually hit:
+// they went back to an older Replicaro after a newer one had already written
+// replicaro.db. Reinstalling the newer version is the fix that keeps their
+// data, so it gets its own wording. It still matches ErrDatabaseResetRequired
+// with errors.Is.
+var ErrDatabaseFromNewerVersion error = newerDatabaseError{}
+
+type newerDatabaseError struct{}
+
+func (newerDatabaseError) Error() string {
+	return "This data was written by a newer version of Replicaro. Install that version again. To start over with this version instead, move replicaro.db, and replicaro.db-wal and replicaro.db-shm if they exist, somewhere else first (don't delete them)."
+}
+
+func (newerDatabaseError) Is(target error) bool { return target == ErrDatabaseResetRequired }
+
+// incompatibleSchemaVersion is the error for a database whose schema version
+// this version can't use: a user_version other than CurrentSchemaVersion, or
+// version 0 with tables already in it. The two numbers go on their own log
+// line rather than into the error, because the error is the sentence the
+// user reads and support is the one who needs the numbers.
+func incompatibleSchemaVersion(found int) error {
+	log.Printf("replicaro.db has schema version %d; this version of Replicaro uses schema version %d", found, CurrentSchemaVersion)
+	if found > CurrentSchemaVersion {
+		return ErrDatabaseFromNewerVersion
+	}
+	return ErrDatabaseResetRequired
+}
+
+// checkSchemaVersion accepts a database this version can use: one at
+// CurrentSchemaVersion, or an empty one (user_version 0 and no tables) that
+// Migrate initializes.
+func checkSchemaVersion(db *sql.DB) error {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
@@ -36,10 +69,21 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 		if existing > 0 {
-			return ErrDatabaseResetRequired
+			return incompatibleSchemaVersion(version)
 		}
-	} else if version != CurrentSchemaVersion {
-		return fmt.Errorf("%w (found version %d, expected %d)", ErrDatabaseResetRequired, version, CurrentSchemaVersion)
+		return nil
+	}
+	if version != CurrentSchemaVersion {
+		return incompatibleSchemaVersion(version)
+	}
+	return nil
+}
+
+// Migrate initializes only the current schema. Older application databases
+// are rejected without migration, import, or metadata-cache backfill.
+func Migrate(db *sql.DB) error {
+	if err := checkSchemaVersion(db); err != nil {
+		return err
 	}
 
 	tx, err := db.Begin()
@@ -76,6 +120,7 @@ func Migrate(db *sql.DB) error {
 		vault_size_bytes INTEGER CHECK (vault_size_bytes IS NULL OR vault_size_bytes >= 0),
 		vault_size_measured_at TEXT NOT NULL DEFAULT '',
 		vault_size_dirty INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty IN (0,1)),
+		vault_size_dirty_count INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0),
 		vault_size_last_attempt_at TEXT NOT NULL DEFAULT '',
 		check_schedule TEXT NOT NULL DEFAULT 'manual',
 		next_check TEXT NOT NULL DEFAULT '',
@@ -125,6 +170,9 @@ func Migrate(db *sql.DB) error {
 		retention_monthly INTEGER CHECK (retention_monthly BETWEEN 1 AND 2147483647),
 		retention_yearly INTEGER CHECK (retention_yearly BETWEEN 1 AND 2147483647),
 		excludes TEXT NOT NULL DEFAULT '',
+		skip_nobackup_folders INTEGER NOT NULL DEFAULT 0 CHECK (skip_nobackup_folders IN (0,1)),
+		skip_cachedir_folders INTEGER NOT NULL DEFAULT 0 CHECK (skip_cachedir_folders IN (0,1)),
+		skip_marker_file_name TEXT NOT NULL DEFAULT '',
 		tag TEXT NOT NULL DEFAULT '',
 		before_script_path TEXT NOT NULL DEFAULT '',
 		before_script_must_succeed INTEGER NOT NULL DEFAULT 0 CHECK (before_script_must_succeed IN (0,1)),
@@ -479,6 +527,30 @@ func Migrate(db *sql.DB) error {
 			}
 		}
 	}
+	// The job's "skip the contents of any folder that contains ..." choices.
+	// Existing jobs start with all three of the user's own choices off. A job
+	// with a Kopia vault still skips CACHEDIR.TAG folders, because that box
+	// is forced on while the job has one (see models.BackupJob.UsesKopia);
+	// for a job that also has Restic vaults, that means its Restic backups
+	// now pass --exclude-caches as well.
+	for _, column := range []struct{ name, definition string }{
+		{"skip_nobackup_folders", `INTEGER NOT NULL DEFAULT 0 CHECK (skip_nobackup_folders IN (0,1))`},
+		{"skip_cachedir_folders", `INTEGER NOT NULL DEFAULT 0 CHECK (skip_cachedir_folders IN (0,1))`},
+		{"skip_marker_file_name", `TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := addColumnIfMissing(tx, "backup_jobs", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	// Vault Size measures without holding the vault lock, so a backup can
+	// mark the vault dirty while a measurement runs. The count lets the
+	// measurement's result clear the flag only when nothing marked the vault
+	// after the measurement started (see PublishVaultSize). Existing vaults
+	// start at 0; the count only has to change, not mean anything absolute.
+	if err := addColumnIfMissing(tx, "repositories", "vault_size_dirty_count",
+		`INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0)`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)
 		ON CONFLICT(key) DO NOTHING`, uuid.NewString()); err != nil {
 		return err
@@ -517,6 +589,15 @@ func Migrate(db *sql.DB) error {
 		return err
 	}
 
+	// A database can already hold a never-started group that retention, vault
+	// removal or job target removal emptied (see
+	// deleteEmptyUnstartedAdmissionGroups); the group check below would refuse
+	// every start. Remove such groups before anything here reconciles a job.
+	// It deletes nothing on a consistent database, so running it on every
+	// start is harmless.
+	if _, err := tx.Exec(deleteEmptyUnstartedAdmissionGroups); err != nil {
+		return err
+	}
 	// Put back admitted scheduled occurrences whose requested native backup never
 	// started. Starting the operation process does not consume an occurrence. After
 	// a crash, any non-skipped native backup step is conservatively treated as a
@@ -543,7 +624,7 @@ func Migrate(db *sql.DB) error {
 		}
 		queuedIDs = append(queuedIDs, operationID)
 	}
-	if err := queuedRows.Close(); err != nil {
+	if err := closeRows(queuedRows); err != nil {
 		return err
 	}
 	for _, operationID := range queuedIDs {
@@ -584,7 +665,7 @@ func Migrate(db *sql.DB) error {
 		}
 		reconciliationJobs = append(reconciliationJobs, jobID)
 	}
-	if err := reconciliationRows.Close(); err != nil {
+	if err := closeRows(reconciliationRows); err != nil {
 		return err
 	}
 	for _, jobID := range reconciliationJobs {
@@ -612,7 +693,7 @@ func Migrate(db *sql.DB) error {
 		}
 		neverStartedIDs = append(neverStartedIDs, operationID)
 	}
-	if err := neverStartedRows.Close(); err != nil {
+	if err := closeRows(neverStartedRows); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE operations SET status='interrupted', finished_at=?
@@ -635,15 +716,15 @@ func Migrate(db *sql.DB) error {
 		}
 		startupSteps = append(startupSteps, step)
 	}
-	if err := stepRows.Close(); err != nil {
+	if err := closeRows(stepRows); err != nil {
 		return err
 	}
 	type startupOperation struct{ id, engine, kind string }
 	startupOperations := []startupOperation{}
 	// A running vault password change is the one exception to "every running
 	// operation becomes interrupted": its saved phase record is the recovery
-	// authority, and startup password recovery (runner.RecoverVaultPasswordChangesOnce,
-	// which runs right after Migrate) resumes it and finishes this record with
+	// authority, and startup password recovery (runner.StartupPasswordRecovery,
+	// prepared right after Migrate) resumes it and finishes this record with
 	// the phase outcome. Marking it interrupted here would report a change that
 	// recovery then completes. A queued one never started and is interrupted
 	// above like every other queued operation.
@@ -659,7 +740,7 @@ func Migrate(db *sql.DB) error {
 		}
 		startupOperations = append(startupOperations, operation)
 	}
-	if err := operationRows.Close(); err != nil {
+	if err := closeRows(operationRows); err != nil {
 		return err
 	}
 	retentionOperations := []startupOperation{}
@@ -681,7 +762,7 @@ func Migrate(db *sql.DB) error {
 		}
 		retentionOperations = append(retentionOperations, operation)
 	}
-	if err := retentionRows.Close(); err != nil {
+	if err := closeRows(retentionRows); err != nil {
 		return err
 	}
 	interruptedAt := formatSortableTimestamp(time.Now())
@@ -834,4 +915,21 @@ func retireAutomaticRelocationState(tx *sql.Tx) ([]discardedKopiaReconnect, erro
 		return nil, err
 	}
 	return discarded, nil
+}
+
+// addColumnIfMissing adds one column to a schema 70 table in place when a
+// database created by an earlier build doesn't have it yet. New tables get the
+// column from CREATE TABLE above; the definition must give existing rows a
+// safe default. The schema version stays 70, so an older Replicaro still opens
+// the database and simply ignores the column.
+func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {
+	var present int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&present); err != nil {
+		return err
+	}
+	if present > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }

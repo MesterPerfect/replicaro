@@ -14,7 +14,7 @@
 //     other reason: 24 hours for profile sync, 6 hours for the Kopia policy
 //     reconciler. Each worker keeps one failing-since time per vault in the
 //     database, because the profile sync attempt count is reset by every local
-//     edit and Kopia policy errors are reset to dirty at startup; an in-memory
+//     edit and Kopia policy errors are reopened at startup; an in-memory
 //     or attempt-based clock would never reach the bound. Next to it the
 //     worker keeps its last failure time, so that time with the app closed or
 //     the computer asleep is not counted as failure time (see maxFailureGap).
@@ -22,12 +22,27 @@
 // Some failures never count toward the bound, and each one resets the clock:
 // a paused filesystem vault (pause takes priority, the pause rules already
 // report it their own way), an unfinished vault password change (it has its
-// own dashboard issue and Retry) and an unfinished ownership transfer (it is
-// finished by repeating the takeover, not by reconnecting). These exclusions
+// own dashboard issue and Retry), an unfinished ownership transfer (it is
+// finished by repeating the takeover, not by reconnecting), an earlier
+// Kopia policy process that still holds its fence (a reconnect would clear
+// the saved fence while that process may still run) and a profile upload that
+// failed because the vault is out of space (reconnecting can't free space;
+// the vault's backups already fail and notify with the out-of-space note,
+// and the card shows the note with the saved profile error). These exclusions
 // apply to the clock only; a conclusive error still sets the state. The pause
 // exclusion follows the pause rules exactly, and those pause filesystem vaults
 // only: the same typed "storage unavailable" error from an SFTP or cloud vault
 // is an outage like any other and counts.
+//
+// A Kopia policy update that fails because the vault is out of space is
+// handled differently on purpose. While a job policy is in error, scheduled
+// Kopia backups to that vault are skipped as "policy not ready" without an
+// operation or a notification, and the UI doesn't show policy errors, so
+// resetting the clock would leave a full Kopia vault completely silent. Its
+// clock keeps running, and when it reaches the 6-hour bound the vault gets the
+// same dashboard issue and notification as a reconnect, but with the
+// out-of-space note as the text, and the reconnect state is not set
+// (reconnecting would fail the same way).
 //
 // An Any Rclone Remote vault is also checked after a failed job or profile
 // sync (CheckRcloneRemoteAfterFailure): the vault's rclone settings are
@@ -66,6 +81,7 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/locale"
+	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/notifications"
 	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultprofile"
@@ -75,6 +91,14 @@ import (
 // dashboard issue, in the state's notification and in a backup's own
 // reconnect_required notification.
 const MessageKey = "notifications.message.vaultReconnectRequired"
+
+// OutOfSpaceMessageKey is the catalog key of the notification a Kopia policy
+// update sends once it has been out of space for 6 hours. It is its own
+// message rather than the general out-of-space note because the notification
+// has no operation around it: the note says "during this operation" and
+// doesn't name the vault, which works next to a backup's result or on the
+// vault card but not on its own. {vaultName} is the vault's saved name.
+const OutOfSpaceMessageKey = "notifications.message.kopiaVaultOutOfSpace"
 
 // Workers that keep a failure clock.
 const (
@@ -301,9 +325,21 @@ func RecordWorkerFailure(db *sql.DB, repositoryID, worker string, startedAt time
 		markRequired(db, repositoryID, worker, true)
 		return
 	}
-	if excludedFromClock(db, repositoryID, cause) {
+	if excludedFromClock(db, repositoryID, cause) ||
+		worker == WorkerProfileSync && vaultprofile.IsStorageFull(cause) {
 		resetClock(db, repositoryID, worker)
 		return
+	}
+	storageFull := worker == WorkerKopiaPolicy && kopiaPolicyStorageFull(db, repositoryID, cause)
+	var previousLast time.Time
+	if storageFull {
+		// Read before this failure is saved, to tell whether this is the
+		// failure that crosses the bound (see below).
+		var err error
+		if previousLast, err = database.VaultWorkerLastFailure(db, repositoryID, worker); err != nil {
+			log.Printf("read %s failure clock for vault %s: %v", worker, repositoryID, err)
+			return
+		}
 	}
 	at := now()
 	if startedAt.IsZero() || startedAt.After(at) {
@@ -314,9 +350,40 @@ func RecordWorkerFailure(db *sql.DB, repositoryID, worker string, startedAt time
 		log.Printf("record %s failure clock for vault %s: %v", worker, repositoryID, err)
 		return
 	}
-	if at.Sub(since) >= bound {
-		markRequired(db, repositoryID, worker, true)
+	if at.Sub(since) < bound {
+		return
 	}
+	if storageFull {
+		// Only the failure that crosses the bound reports it, so a vault that
+		// stays full gets one issue and one notification per run of failures,
+		// as a reconnect does, without saving any state of its own. A failure
+		// before the bound, or one that started a new run, leaves previousLast
+		// before the bound or before since.
+		if previousLast.Before(since) || previousLast.Sub(since) < bound {
+			reportOutOfSpace(db, repositoryID)
+		}
+		return
+	}
+	markRequired(db, repositoryID, worker, true)
+}
+
+// kopiaPolicyStorageFull reports whether a failed Kopia policy update ran out
+// of space on this vault (engines.KopiaPolicyStorageFull has the details).
+// The job source paths the policy covers are passed along so a source folder
+// named after a marker can't make an unrelated failure look like a full
+// vault. If the jobs can't be read, the check runs with the vault path only.
+func kopiaPolicyStorageFull(db *sql.DB, repositoryID string, cause error) bool {
+	repo, err := database.GetRepository(db, repositoryID)
+	if err != nil {
+		return false
+	}
+	var sources []string
+	if desired, desiredErr := database.DeriveKopiaPolicyDesired(db, repositoryID); desiredErr == nil {
+		for _, source := range desired.Sources {
+			sources = append(sources, source.Source)
+		}
+	}
+	return engines.KopiaPolicyStorageFull(repo, cause, sources...)
 }
 
 // filesystemVault reports whether the vault is a filesystem vault. A vault
@@ -329,7 +396,8 @@ func filesystemVault(db *sql.DB, repositoryID string) bool {
 
 func excludedFromClock(db *sql.DB, repositoryID string, cause error) bool {
 	if errors.Is(cause, database.ErrVaultPasswordChangeRecoveryRequired) ||
-		errors.Is(cause, vaultprofile.ErrOwnerTransferUnfinished) {
+		errors.Is(cause, vaultprofile.ErrOwnerTransferUnfinished) ||
+		errors.Is(cause, database.ErrKopiaPolicyFenceHeld) {
 		return true
 	}
 	// The saved records are checked too, not only the error: while this
@@ -371,7 +439,8 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 		language = settings.Language
 	}
 	effective := locale.Effective(language)
-	if err := database.LogError(db, locale.Text(effective, MessageKey, nil)); err != nil {
+	values := map[string]string{"vaultName": vaultName(db, repositoryID)}
+	if err := database.LogError(db, locale.Text(effective, MessageKey, values)); err != nil {
 		log.Printf("record reconnect issue for vault %s: %v", repositoryID, err)
 	}
 	if !notify || settingsErr != nil {
@@ -386,7 +455,7 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 		return
 	}
 	event := notifications.Event{
-		Event: "reconnect", Status: status, Locale: effective, MessageKey: MessageKey,
+		Event: "reconnect", Status: status, Locale: effective, MessageKey: MessageKey, MessageValues: values,
 	}
 	dispatchNotification(settings.WebhookURL, native, webhook, event, func(err error) {
 		if err != nil {
@@ -395,12 +464,69 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 	})
 }
 
-// Message returns the reconnect message in the saved UI language, for a
-// backup's own operation result.
-func Message(db *sql.DB) string {
+// reportOutOfSpace writes the dashboard issue and sends the notification a
+// reconnect would, with the out-of-space message as the text. The Activity
+// entry is in English like other log text: the vault's name followed by the
+// general out-of-space note, since the note itself doesn't say which vault is
+// full. The notification is in the UI language and uses OutOfSpaceMessageKey,
+// which names the vault itself. The webhook carries the same title and message
+// as the desktop notification, under event "kopia_policy" and status "failed".
+// It doesn't set or clear the reconnect state.
+func reportOutOfSpace(db *sql.DB, repositoryID string) {
+	name := vaultName(db, repositoryID)
+	note := locale.Text(models.LanguageEnglish, engines.OutOfSpaceNoteKey, nil)
+	if err := database.LogError(db, name+": "+note); err != nil {
+		log.Printf("record out-of-space issue for vault %s: %v", repositoryID, err)
+	}
+	settings, err := database.GetSettings(db)
+	if err != nil {
+		return
+	}
+	// The status is the ordinary "failed", not "reconnect_required": nothing
+	// here needs a reconnect, and webhook receivers shouldn't be told so.
+	const status = "failed"
+	native, webhook := settings.NotificationChannels(status)
+	if !native && !webhook {
+		return
+	}
+	event := notifications.Event{
+		Event: "kopia_policy", Status: status, Locale: locale.Effective(settings.Language),
+		MessageKey: OutOfSpaceMessageKey, MessageValues: map[string]string{"vaultName": name},
+	}
+	dispatchNotification(settings.WebhookURL, native, webhook, event, func(err error) {
+		if err != nil {
+			_ = database.LogError(db, "Notification failed: "+err.Error())
+		}
+	})
+}
+
+// OutOfSpaceNote returns the out-of-space note in the saved UI language, for
+// text the vault card shows.
+func OutOfSpaceNote(db *sql.DB) string {
 	language := ""
 	if settings, err := database.GetSettings(db); err == nil {
 		language = settings.Language
 	}
-	return locale.Text(locale.Effective(language), MessageKey, nil)
+	return locale.Text(locale.Effective(language), engines.OutOfSpaceNoteKey, nil)
+}
+
+// Message returns the reconnect message for the named vault in the saved UI
+// language, for a backup's own operation result.
+func Message(db *sql.DB, vaultName string) string {
+	language := ""
+	if settings, err := database.GetSettings(db); err == nil {
+		language = settings.Language
+	}
+	return locale.Text(locale.Effective(language), MessageKey, map[string]string{"vaultName": vaultName})
+}
+
+// vaultName is the name the message shows. The state was just saved for this
+// vault, so the row exists unless the vault was removed in between; the ID
+// then still says which vault it was.
+func vaultName(db *sql.DB, repositoryID string) string {
+	repo, err := database.GetRepository(db, repositoryID)
+	if err != nil {
+		return repositoryID
+	}
+	return repo.Name
 }

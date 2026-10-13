@@ -259,6 +259,12 @@ func deleteSnapshotInBackground(op *trackedOperation, repoModel models.Repositor
 		nativeStatus = "succeeded"
 	} else if admissionRejected || stageKnown && !stageStarted {
 		nativeStatus = "skipped"
+	} else if stageKnown && operationStatus == engines.RequestedOperationInterrupted &&
+		operationruntime.TerminalStatus(op.ctx, deleteErr) == "interrupted" {
+		// Shutdown ended the started deletion. The engine reports an internal
+		// time limit as interrupted too; that stays a failed step, as the
+		// operation's own status treats it.
+		nativeStatus = "interrupted"
 	}
 	resultJSON, _ := json.Marshal(result)
 	nativeStepErr := finishOperationStep(db, operationID, "snapshot_deletion", nativeStatus,
@@ -423,7 +429,7 @@ func restoreInBackground(op *trackedOperation, repoModel models.Repository, req 
 	// joined onto it; a follow-up failure after a completed restore makes it
 	// completed_with_issues, not failed.
 	nativeCompleted := restoreNativeCompleted(err)
-	if stepErr := finishTrackedNativeStep(db, op.id, "restore", output, err, nativeProcessStarted()); stepErr != nil {
+	if stepErr := finishTrackedNativeStep(op.ctx, db, op.id, "restore", output, err, nativeProcessStarted()); stepErr != nil {
 		err = errors.Join(err, fmt.Errorf("persist native restore result: %w", stepErr))
 	}
 	if errors.Is(err, errOperationStepFinalization) {
@@ -451,6 +457,13 @@ var jobDeletionIdlePoll = time.Second
 // translated text.
 func writeJobBeingDeleted(w http.ResponseWriter) {
 	writeCodedError(w, http.StatusConflict, "job_being_deleted", database.ErrJobDefinitionBusy.Error())
+}
+
+// writeJobDefinitionChanged refuses a job edit made from an outdated copy of
+// the job. Nothing was saved; the UI reloads the job so the user can redo the
+// edit on the current settings.
+func writeJobDefinitionChanged(w http.ResponseWriter) {
+	writeCodedError(w, http.StatusConflict, "job_definition_changed", database.ErrJobDefinitionChanged.Error())
 }
 
 // startJobDeletion queues a job deletion. The UI closes its dialog at once,

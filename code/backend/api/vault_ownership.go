@@ -19,7 +19,6 @@ import (
 	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
 )
@@ -70,7 +69,7 @@ func (e *ownerTransferElsewhereError) Error() string {
 }
 
 func readFreshVaultOwnershipForTransfer(ctx context.Context, repo models.Repository, allowed *database.OwnerTransferOperation) (vaultprofile.Root, vaultprofile.Profile, []byte, error) {
-	store := vaultprofile.Store{Repository: repo}.WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	store := vaultprofile.Store{Repository: repo}
 	rootRead, err := store.ReadDetailed(ctx)
 	if err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, nil, vaultprofile.ExplainSavedVaultPasswordFailure(err)
@@ -101,8 +100,7 @@ func validateFreshVaultOwnershipRoot(
 		return vaultprofile.Root{}, fmt.Errorf("vault ownership requires the canonical protected root")
 	}
 	root, err := vaultprofile.ParseRoot(rootRead.Data, repo.Connector)
-	if err != nil || root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
-		root.Repository.NativeRepositoryID != repo.NativeRepositoryID {
+	if err != nil || !root.Identifies(repo) {
 		return vaultprofile.Root{}, fmt.Errorf("vault ownership metadata is invalid or transitional")
 	}
 	if root.PasswordChange != nil {
@@ -146,7 +144,7 @@ func validateFreshVaultOwnerProfile(
 // takeover request accepts it, so the status can report the transfer as
 // unfinished instead of failing.
 func readFreshVaultOwnershipStatus(ctx context.Context, repo models.Repository, allowed *database.OwnerTransferOperation) (vaultprofile.Root, vaultprofile.Profile, vaultprofile.Profile, error) {
-	store := vaultprofile.Store{Repository: repo}.WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	store := vaultprofile.Store{Repository: repo}
 	objects, err := store.ReadOwnershipObjects(ctx, repo.ProfileUUID)
 	if err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, vaultprofile.Profile{}, explainOwnershipObjectsReadFailure(objects, err)
@@ -296,8 +294,7 @@ func adoptReviewedRootVaultCare(db *sql.DB, repo models.Repository, root vaultpr
 }
 
 func readLocalOwnerCandidate(ctx context.Context, repo models.Repository) (vaultprofile.Profile, error) {
-	data, err := (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).Read(ctx)
+	data, err := (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).Read(ctx)
 	if err != nil {
 		return vaultprofile.Profile{}, err
 	}
@@ -314,7 +311,6 @@ var readOwnershipStatus = readFreshVaultOwnershipStatus
 var readOwnershipLocalCandidate = readLocalOwnerCandidate
 var assertOwnershipLocalAttachment = func(ctx context.Context, repo models.Repository) error {
 	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		AssertAttachment(ctx, repo.ClientUUID, repo.AttachmentGeneration)
 }
 var ensureTakeoverKopiaMaintenanceOwner = engines.EnsureKopiaMaintenanceOwner
@@ -323,7 +319,6 @@ var queueTakeoverKopiaPolicy = kopiapolicy.QueueDirty
 func currentRootOwnerMaintenanceMutationContext(ctx context.Context, repo models.Repository) context.Context {
 	return engines.ContextWithKopiaMaintenanceMutationAdmission(ctx, func(admissionContext context.Context) error {
 		authority, err := (vaultprofile.Store{Repository: repo}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 			AssertRootCare(admissionContext, repo.CheckSchedule, repo.MaintenanceSchedule, repo.ObjectLock)
 		if err != nil {
 			return err
@@ -376,7 +371,6 @@ func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository
 		// root unchanged. Reauthorize the current canonical attachment before
 		// the reviewed root can enter publication.
 		err = (vaultprofile.Store{Repository: admitted}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 			ForProfile(admitted.ProfileUUID).
 			AssertAttachment(ctx, admitted.ClientUUID, admitted.AttachmentGeneration)
 	}
@@ -385,7 +379,6 @@ func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository
 
 func readOwnerVaultCare(ctx context.Context, repo models.Repository) (vaultprofile.Root, []byte, error) {
 	objects, err := (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		ReadOwnershipObjects(ctx, repo.ProfileUUID)
 	if err != nil {
 		return vaultprofile.Root{}, nil, explainOwnershipObjectsReadFailure(objects, err)
@@ -440,6 +433,30 @@ func publishReviewedOwnerVaultCare(ctx context.Context, repo models.Repository, 
 	return publishRecoveryRoot(ctx, repo, encoded, vaultprofile.PublishOptions{
 		OperationID: uuid.NewString(), ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
 	})
+}
+
+// takeoverPublishOptions returns the options for one takeover root publish.
+//
+// Every publish gets a new publication ID. That ID only names the pending
+// object the store uploads before it copies the root into place, and the store
+// refuses different bytes under a pending name that already exists. A takeover
+// retry rebuilds the root with a new timestamp (and a later revision once a
+// phase has been published), so its bytes never match an earlier attempt. If
+// the publishes shared one ID, a single failure between the pending upload and
+// its cleanup (a dropped connection, a failed copy, a closed page) would leave
+// a pending object that every later Finish takeover runs into. The takeover
+// itself is identified by the marker's OperationUUID inside the root, not by
+// this ID. A pending object left by an abandoned attempt is harmless: reads
+// and discovery ignore it, and the next vault password change removes it.
+//
+// Don't pass the transfer's operation UUID, or any other ID that stays the same
+// across retries, here: Finish takeover would then fail for good after one
+// interrupted publish.
+func takeoverPublishOptions(currentRootData []byte) vaultprofile.PublishOptions {
+	hash := sha256.Sum256(currentRootData)
+	return vaultprofile.PublishOptions{
+		OperationID: uuid.NewString(), ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
+	}
 }
 
 func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
@@ -637,10 +654,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 						writeError(w, http.StatusInternalServerError, encodeErr)
 						return
 					}
-					hash := sha256.Sum256(rootData)
-					if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-						OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-					}); err != nil {
+					if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 						writeError(w, http.StatusConflict, fmt.Errorf("publish vault owner transition: %w", err))
 						return
 					}
@@ -668,10 +682,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 						writeError(w, http.StatusInternalServerError, encodeErr)
 						return
 					}
-					hash := sha256.Sum256(rootData)
-					if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-						OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-					}); err != nil {
+					if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 						writeError(w, http.StatusConflict, fmt.Errorf("publish native-owner transfer phase: %w", err))
 						return
 					}
@@ -725,10 +736,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 					writeError(w, http.StatusInternalServerError, encodeErr)
 					return
 				}
-				hash := sha256.Sum256(rootData)
-				if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-					OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-				}); err != nil {
+				if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 					writeError(w, http.StatusConflict, fmt.Errorf("publish vault owner takeover: %w", err))
 					return
 				}

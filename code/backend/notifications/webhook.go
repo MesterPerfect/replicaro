@@ -3,6 +3,7 @@ package notifications
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/desktop"
 	"github.com/local/replicaro/locale"
+	"github.com/local/replicaro/models"
 )
 
 type Event struct {
@@ -23,8 +27,9 @@ type Event struct {
 	TaskName   string `json:"-"`
 	TaskTarget string `json:"-"`
 	// MessageKey optionally replaces the generic status message with one
-	// specific catalog message (the 30-day unavailable-storage notices and the
-	// vault reconnect message). MessageValues fills its placeholders.
+	// specific catalog message (the 30-day unavailable-storage notices, the
+	// vault reconnect message, and the Kopia out-of-space notice).
+	// MessageValues fills its placeholders.
 	MessageKey            string            `json:"-"`
 	MessageValues         map[string]string `json:"-"`
 	Event                 string            `json:"event"`
@@ -88,6 +93,51 @@ func Wait(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// PrepareOperation registers the notification step of a finished operation
+// and returns the function that sends its notification, or nil when there is
+// nothing to send. The step is registered before the operation is shown as
+// finished, and the caller runs the returned function only after it has saved
+// the operation's final state, so the running step is the whole handoff and no
+// other durable state is needed.
+//
+// event builds the notification from the saved settings. It runs only when a
+// channel is on for status, so any lookups it does are skipped otherwise.
+func PrepareOperation(
+	db *sql.DB,
+	operationID, status string,
+	loadSettings func(*sql.DB) (models.Settings, error),
+	event func(settings models.Settings) Event,
+) func() {
+	settings, err := loadSettings(db)
+	if err != nil {
+		_ = database.SkipOperationStep(db, operationID, "application", "notification",
+			"notification settings unavailable: "+err.Error(), time.Now())
+		return nil
+	}
+	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
+	if !nativeEnabled && !webhookEnabled {
+		return nil
+	}
+	notification := event(settings)
+	if !ShouldNotify(notification) {
+		return nil
+	}
+	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
+		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
+		return nil
+	}
+	return func() {
+		Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, notification, func(err error) {
+			stepStatus, result := "succeeded", "notification delivery completed"
+			if err != nil {
+				stepStatus, result = "warning", err.Error()
+				_ = database.LogError(db, "Notification failed: "+err.Error())
+			}
+			_ = database.FinishOperationStep(db, operationID, "notification", stepStatus, result, time.Now())
+		})
 	}
 }
 
@@ -156,7 +206,13 @@ func prepare(event *Event) {
 		event.Message = locale.Text(event.Locale, event.MessageKey, event.MessageValues)
 	}
 	if len(event.Message) > maxWebhookMessageBytes {
-		event.Message = event.Message[:maxWebhookMessageBytes] + "…"
+		// Cut at the start of a character so a multi-byte character is never
+		// split into invalid UTF-8.
+		cut := maxWebhookMessageBytes
+		for cut > 0 && !utf8.RuneStart(event.Message[cut]) {
+			cut--
+		}
+		event.Message = event.Message[:cut] + "…"
 	}
 	event.Title = localizedNotificationTitle(*event)
 }

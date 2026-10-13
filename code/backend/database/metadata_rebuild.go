@@ -247,7 +247,7 @@ func RebuildMetadataCache(ctx context.Context, db *sql.DB, repositoryID string, 
 	}
 	// Pools and WAL files are closed before replacement, which is required on
 	// Windows and prevents an old pool from opening a connection to the new file.
-	if err := publishMetadataReplacement(temporary, source.path); err != nil {
+	if err := publishMetadataReplacement(ctx, temporary, source.path); err != nil {
 		return err
 	}
 	return nil

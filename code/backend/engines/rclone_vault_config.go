@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,23 +16,12 @@ import (
 )
 
 var runRcloneVaultConfigCommand = command.RunWithInputSecretsPrivateOutput
-var syncRcloneVaultPublicationDirectory func(string) error
-var rcloneVaultPublicationAfterOpenForTest func(string) error
-var rcloneVaultPublicationBeforeCreateForTest func(string) error
-var rcloneVaultPublicationAfterRenameForTest func(string) error
-var rcloneVaultRemovalBeforeMutationForTest func() error
 
 const maximumRcloneVaultConfigBytes = 8 << 20
 
-type rcloneVaultConfigGuard struct {
-	path    string
-	inspect func() error
-	close   func() error
-}
-
 // RcloneVaultConfigBinding selects one ordinary canonical private config path.
-// Revalidate reopens that path; it never retains a file or directory across a
-// native child lifetime.
+// Revalidate checks that path again; nothing is kept open across a native
+// command, because rclone replaces the file when it saves a refreshed token.
 type RcloneVaultConfigBinding struct {
 	path       string
 	revalidate func(context.Context) error
@@ -57,14 +47,6 @@ func (binding *RcloneVaultConfigBinding) Revalidate(ctx context.Context) error {
 		return nil
 	}
 	return binding.revalidate(ctx)
-}
-
-type rcloneVaultPublication struct {
-	target        string
-	syncDirectory func() error
-	inspectTarget func() error
-	close         func() error
-	activate      func(string) (RcloneConfigDisposition, error)
 }
 
 func SetRcloneVaultConfigRunnerForTests(next func(
@@ -108,24 +90,6 @@ func rcloneConfigPathForRepository(repo models.Repository) (string, error) {
 	return RcloneVaultConfigPath(repo.ID)
 }
 
-func prepareRcloneVaultDirectory(repositoryID string) (string, error) {
-	return prepareRcloneVaultDirectorySecure(repositoryID)
-}
-
-func inspectBoundedRcloneVaultConfig(file *os.File) error {
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return invalidRcloneLocalBinding(fmt.Errorf("rclone vault config has the wrong type"))
-	}
-	if info.Size() < 0 || info.Size() > maximumRcloneVaultConfigBytes {
-		return fmt.Errorf("rclone vault config is oversized")
-	}
-	return nil
-}
-
 func localRcloneBindingFailure(message string, err error) error {
 	result := fmt.Errorf("%s: %w", message, err)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidRcloneLocalBinding) {
@@ -134,20 +98,12 @@ func localRcloneBindingFailure(message string, err error) error {
 	return result
 }
 
-func validateRcloneVaultFile(filename string) error {
-	file, err := openRcloneConfigFileReadOnly(filename)
-	if err != nil {
-		return err
-	}
-	return errors.Join(inspectBoundedRcloneVaultConfig(file), file.Close())
-}
-
 func privateRcloneOperationDirectories() (root, cache, temporary string, cleanup func() error, err error) {
 	parent, err := appdata.RcloneSessionRoot()
 	if err != nil {
 		return "", "", "", nil, err
 	}
-	if err := prepareRcloneSessionRoot(parent); err != nil {
+	if err := makePrivateRcloneDirectory(parent); err != nil {
 		return "", "", "", nil, err
 	}
 	root, err = os.MkdirTemp(parent, "op-")
@@ -156,21 +112,23 @@ func privateRcloneOperationDirectories() (root, cache, temporary string, cleanup
 	}
 	cleanup = func() error { return removeRcloneSession(root) }
 	cache, temporary = filepath.Join(root, "cache"), filepath.Join(root, "tmp")
+	// On Windows these inherit the application folder's protected DACL; the
+	// chmod keeps the Unix mode at 0700 whatever the umask.
 	for _, directory := range []string{root, cache, temporary} {
 		if directory != root {
 			if err := os.Mkdir(directory, 0o700); err != nil {
 				return "", "", "", cleanup, errors.Join(err, cleanup())
 			}
 		}
-		if err := appdata.SecurePath(directory, true); err != nil {
+		if err := os.Chmod(directory, 0o700); err != nil {
 			return "", "", "", cleanup, errors.Join(err, cleanup())
 		}
 	}
 	return root, cache, temporary, cleanup, nil
 }
 
-// ValidateRcloneVaultConfig checks the vault's private rclone config file and
-// its local path safeguards; it deliberately does not contact the provider. OAuth
+// ValidateRcloneVaultConfig checks that the vault's private rclone config file
+// is present and usable; it deliberately does not contact the provider. OAuth
 // authorization discovers the account, drive, or namespace for the vault's
 // physical address once. After that, pinned rclone owns this opaque file and
 // its token refresh, and Replicaro does not reparse its credential fields.
@@ -178,7 +136,7 @@ func privateRcloneOperationDirectories() (root, cache, temporary string, cleanup
 // identity and the protected sidecar. Probing the provider on every command
 // would mainly catch someone replacing or reauthorizing the config by hand as
 // the same OS user, and would not strengthen that vault verification. Local
-// path safety plus the normal engine checks are the intended limit for attached
+// file checks plus the normal engine checks are the intended limit for attached
 // operations.
 func ValidateRcloneVaultConfig(ctx context.Context, repo models.Repository) error {
 	if err := ctx.Err(); err != nil {
@@ -213,41 +171,25 @@ func openRcloneVaultConfigBindingLocal(repo models.Repository) (*RcloneVaultConf
 			return nil, reconnectRequired(fmt.Errorf("rclone vault config binding is invalid"))
 		}
 	}
-	var guard *rcloneVaultConfigGuard
-	if repo.RcloneConfigPath == "" {
-		guard, err = openRcloneVaultConfigGuard(repo.ID)
-	} else {
-		guard, err = openStagedRcloneConfigGuard(config)
+	// Check the path again after the native command rather than holding the
+	// file: rclone replaces it with a rename when it refreshes the token.
+	check := func() error {
+		if err := validateRcloneVaultFile(config); err != nil {
+			return localRcloneBindingFailure("rclone vault requires native reconnect", err)
+		}
+		return nil
 	}
-	if err != nil {
-		return nil, localRcloneBindingFailure("rclone vault requires native reconnect", err)
-	}
-	defer guard.close()
-	if err := guard.inspect(); err != nil {
-		return nil, localRcloneBindingFailure("rclone vault requires native reconnect", err)
+	if err := check(); err != nil {
+		return nil, err
 	}
 	return &RcloneVaultConfigBinding{
-		path: guard.path,
-		revalidate: func(context.Context) error {
-			// Reopen after native access: rclone may atomically replace the
-			// file during token refresh, so no inode or handle is retained.
-			var nextGuard *rcloneVaultConfigGuard
-			var err error
-			if repo.RcloneConfigPath == "" {
-				nextGuard, err = openRcloneVaultConfigGuard(repo.ID)
-			} else {
-				nextGuard, err = openStagedRcloneConfigGuard(config)
-			}
-			if err != nil {
-				return localRcloneBindingFailure("rclone vault requires native reconnect", err)
-			}
-			return errors.Join(nextGuard.inspect(), nextGuard.close())
-		},
+		path:       config,
+		revalidate: func(context.Context) error { return check() },
 	}, nil
 }
 
 // OpenRcloneVaultConfigBinding validates a Restic-rclone config locally and
-// selects its canonical private path. Revalidate re-checks local path safety
+// selects its canonical private path. Revalidate checks the file again
 // immediately before or after use. The vault's identity is confirmed by the
 // native repository and the sidecar; a provider listing here would add nothing.
 // The binding keeps no file or directory open.
@@ -262,9 +204,9 @@ func OpenRcloneVaultConfigBinding(
 }
 
 // RcloneVaultCredentialsReady reports whether an attached vault is ready to
-// use: its address options are complete and hold no secrets, and it has one
-// secure private rclone config file. Whether the provider is reachable is left
-// to the operation itself.
+// use: its address options are complete and hold no secrets, and its private
+// rclone config file is present and usable. Whether the provider is reachable
+// is left to the operation itself.
 func RcloneVaultCredentialsReady(ctx context.Context, repo models.Repository) bool {
 	if repo.Engine != ResticID || !IsRcloneNativeLoginProvider(repo.Connector) {
 		return false
@@ -282,55 +224,16 @@ func RcloneVaultCredentialsReady(ctx context.Context, repo models.Repository) bo
 		}
 	}
 	_ = ctx
-	guard, err := openRcloneVaultConfigGuard(repo.ID)
-	if err != nil {
-		return false
-	}
-	defer guard.close()
-	return guard.inspect() == nil
+	return checkRcloneVaultConfig(repo.ID) == nil
 }
 
 func promoteRcloneVaultConfig(
 	ctx context.Context,
 	binary, stagedConfig, repositoryID string,
-) (result RcloneConfigActivation, err error) {
+) (RcloneConfigActivation, error) {
 	_ = ctx
 	_ = binary
-	target, pathErr := RcloneVaultConfigPath(repositoryID)
-	result = retainedRcloneConfig(target)
-	if pathErr != nil {
-		return result, pathErr
-	}
-	if err := validateRcloneVaultFile(stagedConfig); err != nil {
-		return result, fmt.Errorf("staged rclone config is unsafe: %w", err)
-	}
-	publication, err := newRcloneVaultPublication(repositoryID)
-	if err != nil {
-		return result, fmt.Errorf("prepare rclone config publication: %w", err)
-	}
-	defer func() { err = errors.Join(err, publication.close()) }()
-	disposition, activateErr := publication.activate(stagedConfig)
-	result = RcloneConfigActivation{Path: publication.target, Disposition: disposition}
-	if activateErr != nil {
-		return result, fmt.Errorf("activate rclone vault config: %w", activateErr)
-	}
-	if hook := rcloneVaultPublicationAfterRenameForTest; hook != nil {
-		if err := hook(filepath.Dir(publication.target)); err != nil {
-			return result, err
-		}
-	}
-	if syncRcloneVaultPublicationDirectory != nil {
-		err = syncRcloneVaultPublicationDirectory(filepath.Dir(publication.target))
-	} else {
-		err = publication.syncDirectory()
-	}
-	if err != nil {
-		return result, fmt.Errorf("sync rclone vault directory: %w", err)
-	}
-	if err := publication.inspectTarget(); err != nil {
-		return result, err
-	}
-	return result, nil
+	return publishRcloneVaultConfig(stagedConfig, repositoryID)
 }
 
 // EnsureRcloneSidecarConfig returns the vault-owned opaque native config.
@@ -368,16 +271,10 @@ func openNonResticRcloneSidecarConfigBinding(
 	if err != nil {
 		return nil, err
 	}
-	guard, openErr := openRcloneVaultConfigGuard(repo.ID)
-	if openErr == nil {
-		inspectErr := guard.inspect()
-		closeErr := guard.close()
-		if err := errors.Join(inspectErr, closeErr); err != nil {
-			return nil, err
-		}
+	if checkErr := validateRcloneVaultFile(config); checkErr == nil {
 		return nonResticRcloneSidecarBinding(repo.ID, config), nil
-	} else if !errors.Is(openErr, os.ErrNotExist) {
-		return nil, openErr
+	} else if !errors.Is(checkErr, os.ErrNotExist) {
+		return nil, checkErr
 	}
 	config, err = prepareRcloneVaultDirectory(repo.ID)
 	if err != nil {
@@ -403,11 +300,7 @@ func nonResticRcloneSidecarBinding(
 	return &RcloneVaultConfigBinding{
 		path: config,
 		revalidate: func(context.Context) error {
-			guard, err := openRcloneVaultConfigGuard(repositoryID)
-			if err != nil {
-				return err
-			}
-			return errors.Join(guard.inspect(), guard.close())
+			return checkRcloneVaultConfig(repositoryID)
 		},
 	}
 }
@@ -432,7 +325,7 @@ func OpenRcloneSidecarConfigBinding(
 // OpenExistingRcloneStatisticsConfigBinding admits only an already-existing
 // attached vault config. Unlike the sidecar binding it never creates a vault
 // directory, touches a config, or initializes any remote. OAuth repositories
-// retain their exact private config path and local safety checks.
+// keep their canonical private config path and the same file checks.
 func OpenExistingRcloneStatisticsConfigBinding(
 	ctx context.Context,
 	repo models.Repository,
@@ -447,11 +340,7 @@ func OpenExistingRcloneStatisticsConfigBinding(
 	if err != nil {
 		return nil, err
 	}
-	guard, err := openRcloneVaultConfigGuard(repo.ID)
-	if err != nil {
-		return nil, err
-	}
-	if err := errors.Join(guard.inspect(), guard.close()); err != nil {
+	if err := validateRcloneVaultFile(config); err != nil {
 		return nil, err
 	}
 	return nonResticRcloneSidecarBinding(repo.ID, config), nil
@@ -508,26 +397,81 @@ func newTemporaryRcloneConfig(
 	return config, cache, temporary, cleanup, nil
 }
 
-// RemoveRcloneVaultConfig removes only one validated repository-ID directory.
+// RemoveRcloneVaultConfig removes one vault's config folder,
+// rclone/vaults/<uuid>, with everything in it, including rclone's leftover
+// save files. The UUID check keeps the removal inside the vault-config root.
+// os.RemoveAll deletes a link in that folder (or a folder that is itself a
+// link) without touching what it points to.
 func RemoveRcloneVaultConfig(repositoryID string) error {
 	if !validRepositoryUUID(repositoryID) {
 		return fmt.Errorf("rclone vault repository ID must be a canonical UUID")
 	}
-	return removeRcloneVaultConfigSecure(repositoryID)
+	config, err := RcloneVaultConfigPath(repositoryID)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Dir(config))
 }
 
-// ReconcileRcloneVaultConfigs removes only exact, otherwise-empty UUID config
-// directories with no attached or workflow owner. Unknown or ambiguous
-// entries are deliberately untouched.
+// ReconcileRcloneVaultConfigs cleans up the config folder of every canonical
+// vault UUID in the vault-config root that has no attached vault or workflow
+// owner, left behind when a removal or an abandoned creation was interrupted.
+// Names that aren't canonical UUIDs are left alone.
+//
+// ownerIDs must be the complete owner list. The caller has to stop, rather
+// than pass a partial or empty set, when the list can't be read; otherwise a
+// live vault would lose its sign-in. A folder that can't be cleaned up doesn't
+// stop the others; the joined error is only logged at startup.
 func ReconcileRcloneVaultConfigs(ownerIDs map[string]bool) error {
 	root, err := appdata.RcloneVaultConfigRoot()
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return err
 	}
-	return reconcileRcloneVaultConfigsSecure(ownerIDs)
+	var result error
+	for _, entry := range entries {
+		id := entry.Name()
+		if !validRepositoryUUID(id) || ownerIDs[id] {
+			continue
+		}
+		if err := removeOrphanedRcloneVaultFolder(filepath.Join(root, id)); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+// removeOrphanedRcloneVaultFolder removes only what Replicaro and rclone put
+// in a vault's config folder: rclone.conf and rclone's leftover save files
+// (the same names publication clears). The folder itself goes only once it's
+// empty. Unlike RemoveRcloneVaultConfig, nobody asked for this removal, and
+// the folder may hold a file the user put there by mistake, so a folder with
+// anything else in it is reported and left in place.
+//
+// Each removal is os.Remove, which deletes a link rather than its target. An
+// entry that isn't a plain folder (a link, junction, or stray file) is removed
+// itself, without looking inside, so a link's target is never touched.
+func removeOrphanedRcloneVaultFolder(directory string) error {
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Type() != fs.ModeDir {
+		return os.Remove(directory)
+	}
+	if err := os.Remove(filepath.Join(directory, "rclone.conf")); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	removeRcloneConfigLeftovers(directory)
+	if err := os.Remove(directory); err != nil {
+		return fmt.Errorf("leave orphaned rclone vault folder in place: %w", err)
+	}
+	return nil
 }

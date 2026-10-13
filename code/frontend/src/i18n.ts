@@ -12,8 +12,8 @@ export type Catalog = { locale: string; direction: "ltr" | "rtl"; messages: Reco
 // and warnings. Report source issues separately; translations must preserve the
 // same meaning and keep Replicaro, Restic, Kopia, and rclone unchanged.
 const supportedLocales = [
-    "en", "de", "fr", "ar", "ur", "hi", "es", "it", "zh-Hans", "yue-Hant", "ja", "ga", "ko", "ms", "id",
-    "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm",
+    "en", "de", "fr", "ar", "ur", "hi", "es", "it", "zh-Hans", "zh-Hant", "yue-Hant", "yue-Hans", "ja", "ga",
+    "ko", "ms", "id", "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm",
 ] as const;
 type SupportedLocale = typeof supportedLocales[number];
 export type LanguagePreference = "system" | SupportedLocale;
@@ -39,6 +39,9 @@ const pendingCatalogs = new Map<SupportedLocale, Promise<Catalog>>();
 
 // Endonyms let users find a language even when the current UI is unfamiliar.
 // English and the system option keep their existing translated catalog labels.
+// The Mandarin and Cantonese names are written in the script of the catalog
+// they select, so a Traditional reader finds Traditional characters and a
+// Simplified reader finds Simplified ones.
 export const languageNames = {
     de: "Deutsch",
     fr: "Français",
@@ -48,7 +51,9 @@ export const languageNames = {
     es: "Español",
     it: "Italiano",
     "zh-Hans": "普通话（简体中文）",
+    "zh-Hant": "普通話（繁體中文）",
     "yue-Hant": "粵語（繁體中文）",
+    "yue-Hans": "粤语（简体中文）",
     ja: "日本語",
     ga: "Gaeilge",
     ko: "한국어",

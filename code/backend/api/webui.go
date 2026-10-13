@@ -18,31 +18,19 @@ import (
 	"github.com/local/replicaro/appupdate"
 	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/operationruntime"
-	"github.com/local/replicaro/rendezvous"
 	"github.com/local/replicaro/runtimeendpoint"
 )
 
 func ApplicationHandler(db *sql.DB) http.Handler {
-	return ApplicationHandlerAt(db, runtimeendpoint.Preferred(), rendezvous.Record{}, nil)
-}
-
-func ApplicationHandlerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error) http.Handler {
-	return ApplicationHandlerAtWithSecurityMode(db, endpoint, record, activate, SecurityModeProduction)
-}
-
-func ApplicationHandlerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, mode SecurityMode) http.Handler {
-	return applicationHandlerAtWithSecurityModeAndRcloneAuth(
-		db, db, endpoint, nil, record, activate, mode, newRcloneAuthStore(), appupdate.New(db), false, false,
+	return applicationHandlerAtWithRcloneAuth(
+		db, db, runtimeendpoint.Preferred(), nil, newDesktopRcloneAuthStore(), appupdate.New(db), false, false,
 	)
 }
 
-func applicationHandlerAtWithSecurityModeAndRcloneAuth(
+func applicationHandlerAtWithRcloneAuth(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
 	lanOrigins runtimeendpoint.LANOrigins,
-	record rendezvous.Record,
-	activate func() error,
-	mode SecurityMode,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
 	keepStartAtLogin bool,
@@ -56,10 +44,10 @@ func applicationHandlerAtWithSecurityModeAndRcloneAuth(
 	// Page loads are checked with this copy. The API handler below builds its
 	// own copy from the same lanOrigins, which replaces this one for /api/.
 	security := requestSecurity{
-		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
+		endpoint: endpoint, lanOrigins: lanOrigins, clientUUID: installationUUID(db),
 	}
-	apiHandler := handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
+	apiHandler := handlerAtWithRcloneAuthAndRuntime(
+		db, readDB, endpoint, lanOrigins, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
 	)
 	webUI, err := webUIFileSystem()
 	if err == nil {

@@ -15,7 +15,13 @@ const windowsFileAllAccess windows.ACCESS_MASK = 0x001f01ff
 
 // SecurePath makes the current user the explicit owner and installs a protected
 // DACL for that user, LocalSystem, and administrators. Directory ACEs inherit
-// to connector configs and sidecars.
+// to everything created below the directory later.
+//
+// Use it for a root Replicaro creates (the application folder when it is first
+// made, a test or scoped-process root), not for folders and files under the
+// application folder: those already inherit these entries. Setting an
+// inheritable DACL on an existing directory also rewrites every child below
+// it, so calling this on every open turns into a walk of the whole tree.
 func SecurePath(path string, directory bool) error {
 	token, err := windows.OpenCurrentProcessToken()
 	if err != nil {

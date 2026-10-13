@@ -195,6 +195,11 @@ func jobTargetRepositoryIDs(db *sql.DB, jobID string) []string {
 			result = append(result, repositoryID)
 		}
 	}
+	// Best effort like the query error above: a failed read refreshes nothing
+	// rather than an arbitrary subset of the job's vaults.
+	if rows.Err() != nil {
+		return nil
+	}
 	return result
 }
 
@@ -263,7 +268,7 @@ func LatestReadyJobSnapshotTopLevelNames(ctx context.Context, db *sql.DB, jobID 
 		}
 		vaults = append(vaults, item)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return JobSnapshotTopLevelNames{}, false, err
 	}
 	var best JobSnapshotTopLevelNames

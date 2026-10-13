@@ -14,7 +14,6 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 )
 
@@ -167,9 +166,7 @@ func SetRepositoryAdmissionForTests(next func(context.Context, *sql.DB, models.R
 }
 
 var resolveMetadataEngine = func(repo models.Repository) (engines.Engine, error) {
-	return engines.ResolveWithRepositoryAvailabilityCheck(
-		repo, storageavailability.RequireRepositoryAvailable,
-	)
+	return engines.Resolve(repo)
 }
 var replaceMetadataSnapshot = database.ReplaceMetadataSnapshotForRefreshContext
 var replaceMetadataSnapshotWithIdentity = database.ReplaceMetadataSnapshotWithIdentityForRefreshContext
@@ -259,12 +256,6 @@ func withoutCooperativeCancellation(err error) error {
 	return err
 }
 
-// ScheduleRepositorySync starts at most one synchronization for a repository.
-// The caller must release any shared vault lock before invoking it.
-func ScheduleRepositorySync(db *sql.DB, repo models.Repository) bool {
-	return scheduleRepositorySync(db, syncRequest{repository: repo, intent: intentHeaders, bypassEntryCooldown: true}, false)
-}
-
 // ScheduleRepositorySyncAfterBackup preserves the complete mutation inventory
 // pass. Only the preliminary sizing decision differs for Keep all: it uses the
 // new backup header, while retention requires the retained maximum. Joining an
@@ -273,13 +264,6 @@ func ScheduleRepositorySync(db *sql.DB, repo models.Repository) bool {
 func ScheduleRepositorySyncAfterBackup(db *sql.DB, repo models.Repository, snapshotID string, retention bool) bool {
 	return scheduleRepositorySyncWithPendingJoin(db, syncRequest{repository: repo, intent: intentHeaders, bypassEntryCooldown: true,
 		postBackup: true, backupSnapshotIDs: []string{snapshotID}, retainedSizing: retention}, false, true)
-}
-
-// ScheduleRepositoryAccess applies the shared Restore/File History freshness
-// decision and respects the independent ordinary failure cooldowns.
-func ScheduleRepositoryAccess(db *sql.DB, repo models.Repository) bool {
-	admitted, _ := ScheduleRepositoryAccessWithReader(db, db, repo)
-	return admitted
 }
 
 // ScheduleRepositoryAccessWithReader keeps coordinator ownership and all
@@ -771,13 +755,6 @@ func RepositoryCoordinatorState(db *sql.DB, repo models.Repository) CoordinatorS
 
 var repositoryStatusSnapshotBarrier func()
 
-// RepositoryStatusSnapshot brackets one coherent SQLite status snapshot with
-// coordinator observations. If work was active or crossed the database read,
-// it returns a conservative nonterminal state so callers poll once more.
-func RepositoryStatusSnapshot(ctx context.Context, db *sql.DB, repo models.Repository) (database.MetadataIndexState, []string, CoordinatorState, error) {
-	return RepositoryStatusSnapshotWithReader(ctx, db, db, repo)
-}
-
 // RepositoryStatusSnapshotWithReader keeps coordinator observation attached to
 // the writer identity while allowing the coherent SQLite snapshot to use the
 // API's read-only pool.
@@ -860,11 +837,6 @@ func lockRepositoryContext(ctx context.Context, id string) (func(), error) {
 		case <-timer.C:
 		}
 	}
-}
-
-func lockRepository(id string) func() {
-	unlock, _ := lockRepositoryContext(context.Background(), id)
-	return unlock
 }
 
 // Start owns the coordinator lifecycle. Metadata work is access-driven; start
@@ -963,16 +935,6 @@ func SyncRepositoryContext(ctx context.Context, db *sql.DB, repo models.Reposito
 		return errors.Join(vaultlock.ErrLowPriorityYield, withoutCooperativeCancellation(err))
 	}
 	return err
-}
-
-// SyncRepositoryUnderExclusive is used by the runner while it already owns
-// the repository's exclusive mutation lock.
-func SyncRepositoryUnderExclusive(db *sql.DB, repo models.Repository) error {
-	return SyncRepositoryUnderExclusiveContext(context.Background(), db, repo)
-}
-
-func SyncRepositoryUnderExclusiveContext(ctx context.Context, db *sql.DB, repo models.Repository) error {
-	return syncRepositoryRecorded(ctx, db, repo)
 }
 
 func syncRepositoryRecorded(ctx context.Context, db *sql.DB, repo models.Repository) error {
@@ -1478,35 +1440,6 @@ func listSnapshotIndexWindow(
 	}
 	readers.Wait()
 	return results
-}
-
-// IndexSnapshot refreshes one snapshot. It is useful for API fallback paths,
-// but normal backup completion uses SyncRepository to discover new snapshots.
-func IndexSnapshot(db *sql.DB, repo models.Repository, snapshot models.Snapshot) error {
-	unlockVault, lockErr := vaultlock.AcquireExclusiveContext(context.Background(), repositoryLockKey(repo))
-	if lockErr != nil {
-		return lockErr
-	}
-	defer unlockVault()
-	key := repositoryLockKey(repo)
-	unlock := lockRepository(key)
-	defer unlock()
-	manager, err := engines.ResolveWithRepositoryAvailabilityCheck(
-		repo, storageavailability.RequireRepositoryAvailable,
-	)
-	if err != nil {
-		return err
-	}
-	return indexSnapshot(db, repo, manager, snapshot)
-}
-
-func indexSnapshot(db *sql.DB, repo models.Repository, manager engines.Engine, snapshot models.Snapshot) error {
-	entries, output, err := manager.ListPathRecursive(context.Background(), repo, snapshot.ID, "")
-	if err != nil {
-		_ = database.MarkMetadataSnapshotFailed(db, repo.ID, snapshot, err)
-		return &engineError{output: output, err: err}
-	}
-	return database.ReplaceMetadataSnapshot(db, repo.ID, snapshot, entries)
 }
 
 type engineError struct {

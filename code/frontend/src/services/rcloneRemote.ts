@@ -82,6 +82,7 @@ const rcloneRemoteErrorMessages: Record<string, (fields: RcloneRemoteErrorFields
 	rclone_remote_environment_unreadable: () => t("ui.protect.rcloneRemoteError.environmentUnreadable"),
 	rclone_remote_environment_name_required: () => t("ui.protect.rcloneRemoteError.environmentNameRequired"),
 	rclone_remote_environment_name_equals: () => t("ui.protect.rcloneRemoteError.environmentNameEquals"),
+	rclone_remote_environment_name_spaces: (fields) => t("ui.protect.rcloneRemoteError.environmentNameSpaces", { names: names(fields) }),
 	rclone_remote_environment_nul: () => t("ui.protect.rcloneRemoteError.environmentNul"),
 	rclone_remote_environment_duplicate: (fields) => t("ui.protect.rcloneRemoteError.environmentDuplicate", { names: names(fields) }),
 	rclone_remote_environment_refused: (fields) => t("ui.protect.rcloneRemoteError.environmentRefused", { names: names(fields) }),

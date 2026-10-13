@@ -25,6 +25,10 @@ import (
 	"github.com/local/replicaro/vaultprofile"
 )
 
+// Tests replace these to fail a creation between its database steps.
+var prepareRepositoryCreationProfile = database.PrepareRepositoryCreationProfile
+var beginRepositoryCreationNative = database.BeginRepositoryCreationNative
+
 func explainObjectLockProviderRequirement(connector string, err error) error {
 	return engines.ExplainKopiaObjectLockProviderRequirement(connector, err)
 }
@@ -114,11 +118,6 @@ func pendingCreationValidationFailure(output string, validationErr error) (int, 
 func creationNativeRepositoryIdentity(ctx context.Context, repo models.Repository, validationOutput string) (string, error) {
 	if repo.Engine == engines.ResticID && engines.IsResticRcloneConnector(repo.Connector) {
 		return engines.ResticRcloneRepositoryFingerprint(ctx, repo)
-	}
-	if repo.Connector == "fs" {
-		if err := requirePersistedRepositoryStorageAvailable(ctx, repo); err != nil {
-			return "", err
-		}
 	}
 	// Creation still holds the new vault's lock here, so the filesystem marker
 	// read is bounded by the request context like the preflight reads.
@@ -338,6 +337,13 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		badRequest(w, err.Error())
 		return
 	}
+	// The address check above refuses this host only for Restic. A Kopia
+	// create would fail on it too, but only later and with a generic native
+	// command error, so check every engine here and give the same clear error.
+	if err := engines.ValidateSFTPHost(req.Connector, req.Location, options); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
 	if err := engines.ValidateExternalSSHAvailable(models.Repository{
 		Engine: req.Engine, Connector: req.Connector, ConnectorOptions: options,
 	}); err != nil {
@@ -462,12 +468,15 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 			return
 		}
 		hash := sha256.Sum256(profileData)
-		intent, profileErr = database.PrepareRepositoryCreationProfile(db, intent.ID,
+		// The deferred cancel above needs the reserved intent, so a failed
+		// update must not replace it with the zero value it returns.
+		prepared, prepareErr := prepareRepositoryCreationProfile(db, intent.ID,
 			hex.EncodeToString(hash[:]), string(profileData))
-		if profileErr != nil {
-			writeError(w, http.StatusConflict, profileErr)
+		if prepareErr != nil {
+			writeError(w, http.StatusConflict, prepareErr)
 			return
 		}
+		intent = prepared
 	}
 
 	clientUUID, err := database.InstallationID(db)
@@ -515,13 +524,14 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 			writeError(w, http.StatusConflict, preflightErr)
 			return
 		}
-		intent, err = database.BeginRepositoryCreationNative(db, intent.ID, nativeOperationID)
-		if err != nil {
+		started, beginErr := beginRepositoryCreationNative(db, intent.ID, nativeOperationID)
+		if beginErr != nil {
 			_ = fence.Close()
 			_ = command.CleanupClosedNativeProcessFence(fencePath)
-			writeError(w, http.StatusConflict, err)
+			writeError(w, http.StatusConflict, beginErr)
 			return
 		}
+		intent = started
 		cancelFreshPrepared = false
 		reportVaultProgress(r.Context(), "Creating the native encrypted repository...")
 		output, createErr := engine.Create(command.WithNativeProcessFence(r.Context(), fence), repoModel)
@@ -607,11 +617,6 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	}
 
 	if repoModel.Engine == engines.KopiaID {
-		if err := requirePersistedRepositoryStorageAvailable(r.Context(), repoModel); err != nil {
-			_ = database.MarkRepositoryCreationError(db, intent.ID, err.Error())
-			writeError(w, http.StatusConflict, err)
-			return
-		}
 		identityOutput, identityErr := engines.EnsureKopiaClientIdentity(r.Context(), engine, repoModel)
 		if identityErr != nil {
 			_ = database.MarkRepositoryCreationError(db, intent.ID, "Kopia client identity alignment is pending.")
@@ -637,9 +642,6 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		ProfileUUID: preparedProfile.ProfileUUID, AttachmentGeneration: preparedProfile.Attachment.Generation,
 		ClientUUID: clientUUID, NativeRepositoryID: nativeFingerprint, RcloneConfigPath: rcloneConfigPath}
 	initialRepo = applyIntentStorage(initialRepo, intent)
-	if profileErr == nil {
-		profileErr = requirePersistedRepositoryStorageAvailable(r.Context(), initialRepo)
-	}
 	if profileErr == nil {
 		var rootData []byte
 		rootData, profileErr = profilesync.BuildInitialRoot(initialRepo)

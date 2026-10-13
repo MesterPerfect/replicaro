@@ -30,6 +30,8 @@ export function storageAvailabilityReasonLabel(reason: string) {
             return t("ui.storageAvailability.observationFailed");
         case "observation_timeout":
             return t("ui.storageAvailability.observationTimeout");
+        case "observation_slots_exhausted":
+            return t("ui.storageAvailability.observationSlotsExhausted");
         default:
             return "";
     }

@@ -1,9 +1,10 @@
 import type {
-    ActivityEntry,
     BackupJob,
     JobSourceUpdateResult,
     DashboardStats,
     DashboardIssues,
+    DashboardTimeline,
+    DashboardTimelineFilter,
     EngineInfo,
     EngineDescriptor,
     OperationEntry,
@@ -28,14 +29,8 @@ import type {
 } from "../types";
 import { t } from "../i18n";
 import { holdLeavePagePrompt } from "./leavePagePrompt";
-import { rcloneRemoteErrorMessage } from "./rcloneRemote";
-
-// Packaged builds are served by the bound backend and must stay same-origin.
-// Vite development is the only fixed-port client.
-export const apiBaseURL = (development: boolean) =>
-    development ? "http://127.0.0.1:9460" : "";
-
-const API_URL = apiBaseURL(import.meta.env.DEV);
+import { ltrIsolate, rcloneRemoteErrorMessage } from "./rcloneRemote";
+import { RESTORE_SELECTION_NAME_INVALID } from "../restoreCapabilities";
 
 export class APIError extends Error {
 	readonly status: number;
@@ -44,8 +39,10 @@ export class APIError extends Error {
 	readonly attached?: boolean;
 	readonly usable?: boolean;
 	readonly failureStage?: RcloneApplicationFailureStage;
+	// The saved vault an existing_vault_attachment_changed refusal is about.
+	readonly vaultId?: string;
 
-	constructor(message: string, status: number, code?: string, lifecycle?: RcloneLifecycleOutcome) {
+	constructor(message: string, status: number, code?: string, lifecycle?: RcloneLifecycleOutcome, vaultId?: string) {
 		super(message);
 		this.name = "APIError";
 		this.status = status;
@@ -54,11 +51,62 @@ export class APIError extends Error {
 		this.attached = lifecycle?.attached;
 		this.usable = lifecycle?.usable;
 		this.failureStage = lifecycle?.failureStage;
+		this.vaultId = vaultId;
 	}
 }
 
 export const isOperationNotFound = (reason: unknown) =>
 	reason instanceof APIError && reason.status === 404;
+
+// Retired Advanced options flags, each with the label of the job setting that
+// replaced it. The refusal quotes that label from the same catalog entry the
+// checkbox shows, so the quote can't drift from the box in any language. A
+// flag missing here keeps the backend's English text.
+const retiredBackupOptionLabels: Record<string, () => string> = {
+	"--exclude-caches": () => t("ui.protect.markerFiles.cacheDirLabel"),
+};
+
+// A job save refused because its Advanced options still use a retired flag.
+// The backend sends the flag next to the code; it stays in left-to-right order
+// inside a right-to-left sentence.
+function retiredBackupOptionMessage(body: unknown): string | undefined {
+	const flag = body && typeof body === "object" ? (body as Record<string, unknown>).flag : undefined;
+	if (typeof flag !== "string" || !Object.hasOwn(retiredBackupOptionLabels, flag)) return undefined;
+	return t("ui.protect.retiredBackupOption", { flag: ltrIsolate(flag), label: retiredBackupOptionLabels[flag]() });
+}
+
+// Refusals the backend sends with a code get the catalog's text instead of
+// the backend's English. Both the ordinary requests and the vault requests
+// that stream progress read them here, so every code is translated the same
+// way on either path. Undefined means the backend's own text stays.
+function codedErrorMessage(code: string | undefined, body: unknown): string | undefined {
+	switch (code) {
+		// Any work on a job whose deletion is queued or running.
+		case "job_being_deleted": return t("ui.protect.jobBeingDeleted");
+		// New work for a vault whose removal is pending, and a second password
+		// change, settings save or removal of a vault.
+		case "vault_being_removed": return t("ui.protect.vaultBeingRemoved");
+		case "vault_change_active": return t("ui.protect.vaultChangeActive");
+		// Restore refusals made before any work is queued.
+		case "restore_destination_not_absolute": return t("ui.restore.destinationNotAbsolute");
+		case RESTORE_SELECTION_NAME_INVALID: return t("ui.restore.selectionNameInvalid");
+		case "restore_kopia_folder_selection": return t("ui.restore.kopiaFolderSelection");
+		case "restore_kopia_destination_missing": return t("ui.restore.kopiaDestinationMissing");
+		// The vault's backup data is being rebuilt; the request can be retried shortly.
+		case "metadata_not_ready": return t("ui.restore.metadataNotReady");
+		// A job edit made from an outdated copy of the job; nothing was saved.
+		case "job_definition_changed": return t("ui.protect.jobDefinitionChanged");
+		// Creating, copying, editing or bulk editing a job with a retired flag
+		// in Advanced options; nothing was saved.
+		case "retired_backup_option": return retiredBackupOptionMessage(body);
+	}
+	// An Any Rclone Remote setting or check refused with a code gets the
+	// catalog's text, filled in from the values sent next to the code.
+	return rcloneRemoteErrorMessage(code, body);
+}
+
+// The HTTP status goes in as text so it stays in ASCII digits in every language.
+const requestFailedMessage = (status: number) => t("ui.app.requestFailed", { status: String(status) });
 
 async function request<T>(
     path: string,
@@ -69,24 +117,22 @@ async function request<T>(
 	// out of user settings/localStorage: a stale or separately configured value
 	// could address the wrong installation. This is intentionally not a token.
 	const clientUUID = document.querySelector<HTMLMetaElement>('meta[name="replicaro-client-uuid"]')?.content;
-	if (!clientUUID) throw new Error("Installation UUID is unavailable. Reopen Replicaro.");
+	if (!clientUUID) throw new Error(t("ui.app.installationIdUnavailable"));
 
     try {
         const headers = new Headers(init?.headers);
         headers.set("X-Replicaro-Client-UUID", clientUUID);
-        response = await fetch(`${API_URL}${path}`, { ...init, headers });
+        response = await fetch(path, { ...init, headers });
     } catch (reason) {
         if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
-        throw new Error(
-            "Replicaro app appears closed. Please run it and try again.",
-            { cause: reason }
-        );
+        throw new Error(t("ui.app.appClosed"), { cause: reason });
     }
 
     if (!response.ok) {
-        let message = `Request failed (${response.status})`;
+        let message = requestFailedMessage(response.status);
 		let code: string | undefined;
 		let lifecycle: RcloneLifecycleOutcome | undefined;
+		let vaultId: string | undefined;
 
         try {
             const body = await response.json();
@@ -94,16 +140,8 @@ async function request<T>(
                 message = body.error;
             }
 			if (body && typeof body.code === "string") code = body.code;
-			// Any work on a job whose deletion is queued or running is refused with
-			// this code; the backend's English text is replaced by the catalog's.
-			if (code === "job_being_deleted") message = t("ui.protect.jobBeingDeleted");
-			// New work for a vault whose removal is pending, and a second password
-			// change, settings save or removal of a vault, are refused the same way.
-			if (code === "vault_being_removed") message = t("ui.protect.vaultBeingRemoved");
-			if (code === "vault_change_active") message = t("ui.protect.vaultChangeActive");
-			// An Any Rclone Remote setting or check refused with a code gets the
-			// catalog's text, filled in from the values sent next to the code.
-			message = rcloneRemoteErrorMessage(code, body) ?? message;
+			if (body && typeof body.vaultId === "string") vaultId = body.vaultId;
+			message = codedErrorMessage(code, body) ?? message;
 			if (body && body.activation && typeof body.activation.disposition === "string") {
 				lifecycle = {
 					activation: body.activation,
@@ -116,7 +154,7 @@ async function request<T>(
             /* non-JSON error body */
         }
 
-		throw new APIError(message, response.status, code, lifecycle);
+		throw new APIError(message, response.status, code, lifecycle, vaultId);
     }
 
     if (response.status === 204) {
@@ -175,16 +213,16 @@ export interface VaultProgressRecord {
 async function postWithVaultProgress<T>(path: string, body: unknown, onProgress?: (record: VaultProgressRecord) => void, signal?: AbortSignal): Promise<T> {
 	if (!onProgress) return post<T>(path, body);
 	const clientUUID = document.querySelector<HTMLMetaElement>('meta[name="replicaro-client-uuid"]')?.content;
-	if (!clientUUID) throw new Error("Installation UUID is unavailable. Reopen Replicaro.");
+	if (!clientUUID) throw new Error(t("ui.app.installationIdUnavailable"));
 	let response: Response;
 	try {
-		response = await fetch(`${API_URL}${path}`, {
+		response = await fetch(path, {
 			method: "POST", signal, body: JSON.stringify(body),
 			headers: { "Content-Type": "application/json", "X-Replicaro-Client-UUID": clientUUID, "X-Replicaro-Vault-Progress": "1" },
 		});
 	} catch (reason) {
 		if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
-		throw new Error("Replicaro app appears closed. Please run it and try again.", { cause: reason });
+		throw new Error(t("ui.app.appClosed"), { cause: reason });
 	}
 	if (!response.ok || !response.body || !response.headers.get("Content-Type")?.includes("application/x-ndjson")) {
 		const payload = await response.json().catch(() => ({}));
@@ -226,21 +264,21 @@ async function postWithVaultProgress<T>(path: string, body: unknown, onProgress?
 	}
 	pending += decoder.decode();
 	if (pending.trim()) processLine(pending);
-	if (!completed) throw new Error("The vault operation ended before Replicaro received its result. Refresh to check its current state.");
+	if (!completed) throw new Error(t("ui.protect.vaultOperationResultMissing"));
 	return result as T;
 }
 
 function vaultProgressError(status: number, payload: unknown): APIError {
 	const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
 	const code = typeof body.code === "string" ? body.code : undefined;
-	const message = rcloneRemoteErrorMessage(code, body) ?? (typeof body.error === "string" ? body.error : `Request failed (${status})`);
+	const message = codedErrorMessage(code, body) ?? (typeof body.error === "string" ? body.error : requestFailedMessage(status));
 	return new APIError(message, status, code,
 		body.activation && typeof body.activation === "object" ? {
 			activation: body.activation as RcloneConfigActivation,
 			attached: Boolean(body.attached),
 			...(typeof body.usable === "boolean" ? { usable: body.usable } : {}),
 			...(typeof body.failureStage === "string" ? { failureStage: body.failureStage as RcloneApplicationFailureStage } : {}),
-		} : undefined);
+		} : undefined, typeof body.vaultId === "string" ? body.vaultId : undefined);
 }
 
 /* ------------------------------------------------------------------ */
@@ -258,18 +296,20 @@ export const markDashboardIssuesReviewed = () =>
 export const getDashboardIssues = (limit = 10, cursor = "") =>
     request<DashboardIssues>(`/api/dashboard/issues?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
 
-export const getRecentActivity = () =>
-    request<ActivityEntry[]>("/api/dashboard/activity");
+export const getDashboardTimeline = (filter: DashboardTimelineFilter, cursor = "") =>
+    request<DashboardTimeline>(`/api/dashboard/timeline?filter=${filter}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
 
-export const getOperations = (limit = 0) =>
-    request<OperationEntry[]>(`/api/operations${limit ? `?limit=${limit}` : ""}`);
+// The newest operation of each vault, of any kind and status or, with kind,
+// of that kind only.
+export const getLatestVaultOperations = (kind = "") =>
+    request<OperationEntry[]>(`/api/operations/latest-by-vault${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`);
 
 export const getOperation = (id: string, signal?: AbortSignal) =>
     request<OperationEntry[]>(`/api/operations?id=${encodeURIComponent(id)}`, { signal });
 
 export function requireExactOperation(operationId: string, operations: OperationEntry[]) {
 	const exact = operations.find((operation) => operation.id === operationId);
-	if (!exact) throw new Error("Exact operation lookup returned an unexpected response.");
+	if (!exact) throw new Error(t("ui.overview.operationLookupUnexpected"));
 	return exact;
 }
 
@@ -417,7 +457,6 @@ export interface ExistingVaultStorageInput {
 	options: Record<string, string>;
 	rcloneAuthSessionId?: string;
 	profile_uuid?: string;
-	expectedVaultUUID?: string;
 }
 
 export interface RepositoryReconnectFields extends ExistingVaultStorageInput {
@@ -440,7 +479,6 @@ export interface RcloneAuthStatus {
 		prompt: string;
 		defaultValue: string;
 		choices: Array<{ value: string; label: string }>;
-		notice?: string;
 	};
 }
 
@@ -610,6 +648,8 @@ export interface VaultPasswordChangeResult {
 	cleanupPending: boolean;
 	message: string;
 	resticKeyTruth?: string;
+	// Startup recovery is finishing this change right now; a Retry would be refused.
+	recovering?: boolean;
 }
 
 // The password change and its retry run in the background; the saved phase
@@ -621,6 +661,11 @@ export const changeVaultPassword = (repositoryId: string, newPassword: string, p
 
 export const getVaultPasswordChangeStatus = (repositoryId: string) =>
 	request<VaultPasswordChangeResult>(`/api/repository/password?id=${encodeURIComponent(repositoryId)}`);
+
+// Every vault's unfinished password change in one request; a vault without
+// one is not listed.
+export const getVaultPasswordChangeStatuses = () =>
+	request<VaultPasswordChangeResult[]>("/api/repository/password/statuses");
 
 export const retryVaultPasswordChange = (repositoryId: string) =>
 	post<TrackedOperationStart>("/api/repository/password/retry", { repositoryId });
@@ -657,18 +702,29 @@ export const refreshRestoreSnapshots = (repositoryId: string, signal?: AbortSign
 		{ signal }
 	);
 
+// One page of a snapshot folder, paged like File History.
+export interface SnapshotFilesPage {
+	entries: SnapshotEntry[];
+	raw: string;
+	offset?: number;
+	nextOffset?: number;
+	hasMore?: boolean;
+}
+
 export const listSnapshotFiles = (
     repositoryId: string,
     snapshotId: string,
 	nativeRootId: string,
     path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+	offset = 0
 ) =>
-    request<{ entries: SnapshotEntry[]; raw: string }>(
+    request<SnapshotFilesPage>(
         `/api/snapshot/files?id=${encodeURIComponent(repositoryId)}` +
             `&snapshotId=${encodeURIComponent(snapshotId)}` +
 			`&nativeRootId=${encodeURIComponent(nativeRootId)}` +
-            `&path=${encodeURIComponent(path)}`,
+            `&path=${encodeURIComponent(path)}` +
+			`&offset=${offset}`,
         { signal }
     );
 
@@ -773,11 +829,6 @@ export const restoreSelection = (input: {
     conflictMode: string;
 }) => post<TrackedOperationStart>("/api/restore-selection", input);
 
-export const backupNow = (
-    repositoryId: string,
-    source: string
-) => post("/api/repository/snapshot", { repositoryId, source });
-
 /* ------------------------------------------------------------------ */
 /* Backup jobs                                                         */
 /* ------------------------------------------------------------------ */
@@ -797,6 +848,9 @@ export interface JobInput {
 	retentionMonthly?: number;
 	retentionYearly?: number;
     excludes: string;
+	skipNoBackupFolders: boolean;
+	skipCacheDirFolders: boolean;
+	skipMarkerFileName: string;
 	tag: string;
 	beforeScriptPath: string;
 	beforeScriptMustSucceed: boolean;
@@ -804,6 +858,9 @@ export interface JobInput {
 	afterScriptMustSucceed: boolean;
 	    engineSettings: Record<string, { additionalOptions?: string[] }>;
 	    enabled?: boolean;
+	// Sent with every update: the revision of the job the edit was made from.
+	// The backend refuses an update without it. A new job has no revision yet.
+	revision?: string;
 }
 
 export const createJob = (input: JobInput) => foreground(() => post<JobSaveResult>("/api/jobs", input));
@@ -848,10 +905,6 @@ export const getJobStatus = () =>
 /* ------------------------------------------------------------------ */
 
 export const getEngineInfo = () => request<EngineInfo>("/api/engine");
-
-export const getLogs = () => request<ActivityEntry[]>("/api/logs");
-
-export const clearLogs = () => post("/api/logs", undefined, "DELETE");
 
 export const getSettings = () => request<Settings>("/api/settings");
 

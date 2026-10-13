@@ -427,6 +427,7 @@ func deleteToastHString(value toastHString) {
 }
 
 func buildToastXML(title, message, target, iconURI string, persistent bool) string {
+	title, message = toastXMLText(title), toastXMLText(message)
 	if persistent {
 		return fmt.Sprintf(
 			`<toast activationType="protocol" launch="%s" duration="long" scenario="reminder"><visual><binding template="ToastGeneric"><image placement="appLogoOverride" src="%s" alt="Replicaro" /><text>%s</text><text>%s</text></binding></visual><audio src="ms-winsoundevent:Notification.Default" /><actions><action content="Open Replicaro" activationType="protocol" arguments="%s" /></actions></toast>`,

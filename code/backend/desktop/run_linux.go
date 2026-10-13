@@ -14,7 +14,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -91,9 +93,24 @@ type linuxDesktop struct {
 	activationToken        string
 	activationTokenMu      sync.Mutex
 	open                   func(string) error
+	// The pending Quit prompt, if any (see requestQuitFromMenu). quitPromptID
+	// is 0 when none is pending.
+	quitPromptMu    sync.Mutex
+	quitPromptID    uint32
+	quitPromptTimer *time.Timer
 }
 
-func Run(service func() error) error {
+// quitPromptLimit is how long the Quit prompt waits for an answer. A prompt
+// that isn't answered in time counts as Cancel. Tests shorten it.
+var quitPromptLimit = 30 * time.Second
+
+// Run serves until the service stops, the tray's Quit is chosen, or the
+// process gets SIGINT or SIGTERM. A Linux session that ends either stops
+// Replicaro with SIGTERM, which reaches the same return as any other stop, or
+// leaves it running without its session bus (see receiveDesktopSignals). So
+// the caller runs the staged shutdown after Run returns, and Run never calls
+// stop itself.
+func Run(service func() error, _ func() error) error {
 	desktop, desktopErr := newLinuxDesktop()
 	if desktopErr == nil {
 		activeLinuxMu.Lock()
@@ -175,6 +192,20 @@ func (desktop *linuxDesktop) requestQuit() {
 
 func (desktop *linuxDesktop) close() {
 	desktop.quitOnce.Do(func() { close(desktop.quit) })
+	// A Quit prompt can still be showing when Replicaro stops some other way
+	// (SIGTERM, systemctl stop, the session ending) or through a second Quit
+	// click. Close it before the bus connection goes, because some servers
+	// (GNOME Shell) ignore the expiry and would keep a "Quit Replicaro?"
+	// notification for a process that is gone. Only the close request is
+	// sent, bounded by closeNotification's limit; shutdown never waits for
+	// an answer.
+	desktop.quitPromptMu.Lock()
+	promptID := desktop.quitPromptID
+	desktop.clearQuitPromptLocked()
+	desktop.quitPromptMu.Unlock()
+	if promptID != 0 && desktop.conn != nil {
+		desktop.closeNotification(promptID)
+	}
 	select {
 	case <-desktop.stopSignals:
 	default:
@@ -339,6 +370,11 @@ func statusIconPixmaps() []statusPixmap {
 
 type linuxStatusItem struct{ desktop *linuxDesktop }
 
+// maxActivationTokenBytes bounds an XDG activation token before it's held or
+// forwarded to the portal. Real tokens are short; anything this large is
+// garbage, whether it came from the tray host or a launcher's environment.
+const maxActivationTokenBytes = 4096
+
 func (item *linuxStatusItem) Activate(_, _ int32) *dbus.Error {
 	if err := item.desktop.open(currentWebUIURL()); err != nil {
 		return dbus.MakeFailedError(err)
@@ -346,7 +382,7 @@ func (item *linuxStatusItem) Activate(_, _ int32) *dbus.Error {
 	return nil
 }
 func (item *linuxStatusItem) ProvideXdgActivationToken(token string) *dbus.Error {
-	if len(token) > 4096 {
+	if len(token) > maxActivationTokenBytes {
 		return dbus.NewError("org.freedesktop.DBus.Error.InvalidArgs", []any{"activation token is too large"})
 	}
 	item.desktop.activationTokenMu.Lock()
@@ -395,9 +431,118 @@ func (menu *linuxStatusMenu) Event(id int32, eventID string, _ dbus.Variant, _ u
 			return dbus.MakeFailedError(err)
 		}
 	case 2:
-		menu.desktop.requestQuit()
+		menu.desktop.requestQuitFromMenu()
 	}
 	return nil
+}
+
+// requestQuitFromMenu asks before Quit stops Replicaro: the tray icon is the
+// same process as the service, so Quit stops every scheduled and running
+// backup until Replicaro is started again, and users can read it as "hide
+// the icon". Only this menu click asks. Sign-out, SIGTERM, systemctl stop and
+// the service ending on its own still quit at once through Run, and so does
+// Quit itself once confirmed.
+//
+// The prompt is a notification with Quit and Cancel buttons, because the
+// tray has no window of its own. A notification can't take an answer
+// reliably (Do Not Disturb or hidden banners mean it is never seen), so:
+//   - a second Quit click while the prompt is pending quits at once;
+//   - the prompt expires after 30 seconds, and closing or ignoring it
+//     counts as Cancel;
+//   - without a notification server, or with one that can't show buttons,
+//     Quit quits at once.
+func (desktop *linuxDesktop) requestQuitFromMenu() {
+	// The lock is held while the prompt is sent, so a second click that
+	// arrives meanwhile finds it pending instead of sending a second one.
+	desktop.quitPromptMu.Lock()
+	defer desktop.quitPromptMu.Unlock()
+	if desktop.quitPromptID != 0 {
+		// The prompt stays pending here; close, which Run always reaches
+		// after a quit, closes it before the bus connection goes. Closing it
+		// from a separate goroutine instead could lose the request to the
+		// connection closing first.
+		desktop.requestQuit()
+		return
+	}
+	id, err := desktop.showQuitPrompt()
+	if err != nil || id == 0 {
+		desktop.requestQuit()
+		return
+	}
+	desktop.quitPromptID = id
+	desktop.quitPromptTimer = time.AfterFunc(quitPromptLimit, func() {
+		// Some servers ignore a notification's expiry, so the prompt is
+		// closed here as well; closing it counts as Cancel.
+		if desktop.takeQuitPrompt(id) {
+			desktop.closeNotification(id)
+		}
+	})
+}
+
+func (desktop *linuxDesktop) clearQuitPromptLocked() {
+	desktop.quitPromptID = 0
+	if desktop.quitPromptTimer != nil {
+		desktop.quitPromptTimer.Stop()
+		desktop.quitPromptTimer = nil
+	}
+}
+
+// takeQuitPrompt clears the pending prompt if it is id, and reports whether
+// it was.
+func (desktop *linuxDesktop) takeQuitPrompt(id uint32) bool {
+	desktop.quitPromptMu.Lock()
+	defer desktop.quitPromptMu.Unlock()
+	if id == 0 || desktop.quitPromptID != id {
+		return false
+	}
+	desktop.clearQuitPromptLocked()
+	return true
+}
+
+// showQuitPrompt sends the Quit prompt notification and returns its ID. It
+// returns an error when notifications are unavailable or the server can't
+// show buttons, so the caller quits without asking.
+func (desktop *linuxDesktop) showQuitPrompt() (uint32, error) {
+	if _, notifications := desktop.capabilities(); !notifications {
+		return 0, errors.New("desktop notifications are unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	server := desktop.conn.Object(notificationService, notificationPath)
+	var capabilities []string
+	if call := server.CallWithContext(ctx, notificationService+".GetCapabilities", 0); call.Err != nil || call.Store(&capabilities) != nil {
+		return 0, errors.New("notification server capabilities are unavailable")
+	}
+	if !slices.Contains(capabilities, "actions") {
+		return 0, errors.New("notification server can't show buttons")
+	}
+	texts := desktopTexts(TextQuitButton, TextCancelButton, TextTrayQuit, TextQuitPrompt)
+	actions := []string{"quit", texts[0], "cancel", texts[1]}
+	hints := map[string]dbus.Variant{"desktop-entry": dbus.MakeVariant("replicaro")}
+	if image, ok := desktopNotificationImage("completed_with_issues"); ok {
+		hints["image-data"] = dbus.MakeVariant(image)
+	}
+	var id uint32
+	call := server.CallWithContext(ctx, notificationService+".Notify", 0,
+		"Replicaro", uint32(0), "replicaro", texts[2],
+		freedesktopBodyText(texts[3], slices.Contains(capabilities, "body-markup")),
+		actions, hints, int32(quitPromptLimit/time.Millisecond))
+	if call.Err != nil {
+		return 0, call.Err
+	}
+	if err := call.Store(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// closeNotification asks the server to close a notification; errors are
+// ignored, since the notification may already be gone.
+func (desktop *linuxDesktop) closeNotification(id uint32) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = desktop.conn.Object(notificationService, notificationPath).
+		CallWithContext(ctx, notificationService+".CloseNotification", 0, id).Err
 }
 
 func (menu *linuxStatusMenu) EventGroup(events []struct {
@@ -429,11 +574,12 @@ func statusMenuLayoutForID(id int32) (menuLayout, bool) {
 	label := func(value string) map[string]dbus.Variant {
 		return map[string]dbus.Variant{"label": dbus.MakeVariant(value), "enabled": dbus.MakeVariant(true), "visible": dbus.MakeVariant(true)}
 	}
+	open, quit := trayLabels()
 	switch id {
 	case 1:
-		return menuLayout{ID: 1, Properties: label("Open Replicaro"), Children: []dbus.Variant{}}, true
+		return menuLayout{ID: 1, Properties: label(open), Children: []dbus.Variant{}}, true
 	case 2:
-		return menuLayout{ID: 2, Properties: label("Quit Replicaro"), Children: []dbus.Variant{}}, true
+		return menuLayout{ID: 2, Properties: label(quit), Children: []dbus.Variant{}}, true
 	case 3:
 		return menuLayout{ID: 3, Properties: map[string]dbus.Variant{"type": dbus.MakeVariant("separator"), "visible": dbus.MakeVariant(true)}, Children: []dbus.Variant{}}, true
 	case 0:
@@ -462,59 +608,83 @@ func (desktop *linuxDesktop) startDesktopSignals() {
 		dbus.WithMatchInterface("org.freedesktop.DBus"),
 		dbus.WithMatchMember("NameOwnerChanged"),
 	)
-	go func() {
-		for {
-			select {
-			case signal := <-desktop.signals:
-				if signal == nil {
-					continue
-				}
-				if signal.Name == "org.freedesktop.DBus.NameOwnerChanged" && len(signal.Body) >= 3 {
-					name, nameOK := signal.Body[0].(string)
-					newOwner, ownerOK := signal.Body[2].(string)
-					if !nameOK || !ownerOK {
-						continue
-					}
-					switch name {
-					case statusWatcherService:
-						desktop.setTray(newOwner != "" && desktop.registerStatusNotifier() == nil)
-					case notificationService:
-						desktop.setNotifications(newOwner != "" && desktop.probeNotifications())
-					}
-					continue
-				}
-				if len(signal.Body) < 2 {
-					continue
-				}
-				id, idOK := signal.Body[0].(uint32)
-				if signal.Name == notificationService+".NotificationClosed" && idOK {
-					desktop.notificationMu.Lock()
-					delete(desktop.notificationOperations, id)
-					desktop.notificationMu.Unlock()
-					continue
-				}
-				if signal.Name != notificationService+".ActionInvoked" {
-					continue
-				}
-				action, actionOK := signal.Body[1].(string)
-				if !idOK || !actionOK || (action != "default" && action != "open") {
-					continue
-				}
-				desktop.notificationMu.Lock()
-				operationID, known := desktop.notificationOperations[id]
-				if known {
-					delete(desktop.notificationOperations, id)
-				}
-				desktop.notificationMu.Unlock()
-				if !known {
-					continue
-				}
-				_ = desktop.open(operationURL(operationID))
-			case <-desktop.stopSignals:
+	go desktop.receiveDesktopSignals()
+}
+
+// receiveDesktopSignals handles the D-Bus signals Replicaro subscribes to
+// until close stops it or the connection to the session bus is lost.
+func (desktop *linuxDesktop) receiveDesktopSignals() {
+	for {
+		select {
+		case signal, ok := <-desktop.signals:
+			if !ok {
+				// godbus closes the channel when the connection is lost, for
+				// example when the session bus exits at the end of a
+				// session. The connection doesn't come back, so the tray and
+				// notifications are reported unavailable and Replicaro keeps
+				// serving without them. Receiving from the closed channel
+				// again would return at once, forever, and spin a core.
+				desktop.setTray(false)
+				desktop.setNotifications(false)
 				return
 			}
+			if signal == nil {
+				continue
+			}
+			if signal.Name == "org.freedesktop.DBus.NameOwnerChanged" && len(signal.Body) >= 3 {
+				name, nameOK := signal.Body[0].(string)
+				newOwner, ownerOK := signal.Body[2].(string)
+				if !nameOK || !ownerOK {
+					continue
+				}
+				switch name {
+				case statusWatcherService:
+					desktop.setTray(newOwner != "" && desktop.registerStatusNotifier() == nil)
+				case notificationService:
+					desktop.setNotifications(newOwner != "" && desktop.probeNotifications())
+				}
+				continue
+			}
+			if len(signal.Body) < 2 {
+				continue
+			}
+			id, idOK := signal.Body[0].(uint32)
+			if signal.Name == notificationService+".NotificationClosed" && idOK {
+				desktop.notificationMu.Lock()
+				delete(desktop.notificationOperations, id)
+				desktop.notificationMu.Unlock()
+				// A Quit prompt closed without its Quit button (dismissed or
+				// expired) is a Cancel.
+				desktop.takeQuitPrompt(id)
+				continue
+			}
+			if signal.Name != notificationService+".ActionInvoked" {
+				continue
+			}
+			action, actionOK := signal.Body[1].(string)
+			if idOK && actionOK && (action == "quit" || action == "cancel") {
+				if desktop.takeQuitPrompt(id) && action == "quit" {
+					desktop.requestQuit()
+				}
+				continue
+			}
+			if !idOK || !actionOK || (action != "default" && action != "open") {
+				continue
+			}
+			desktop.notificationMu.Lock()
+			operationID, known := desktop.notificationOperations[id]
+			if known {
+				delete(desktop.notificationOperations, id)
+			}
+			desktop.notificationMu.Unlock()
+			if !known {
+				continue
+			}
+			_ = desktop.open(operationURL(operationID))
+		case <-desktop.stopSignals:
+			return
 		}
-	}()
+	}
 }
 
 func operationURL(operationID string) string {
@@ -549,9 +719,10 @@ func (desktop *linuxDesktop) notifyWithPersistence(title, message, operationID s
 	if iconPath, err := notificationIconPath(status); err == nil {
 		appIcon = (&url.URL{Scheme: "file", Path: iconPath}).String()
 	}
-	call := desktop.conn.Object(notificationService, notificationPath).CallWithContext(
+	notifications := desktop.conn.Object(notificationService, notificationPath)
+	call := notifications.CallWithContext(
 		ctx, notificationService+".Notify", 0,
-		"Replicaro", uint32(0), appIcon, title, message, actions,
+		"Replicaro", uint32(0), appIcon, title, notificationBody(ctx, notifications, message), actions,
 		hints, expireTimeout,
 	)
 	if call.Err != nil {
@@ -564,6 +735,80 @@ func (desktop *linuxDesktop) notifyWithPersistence(title, message, operationID s
 	desktop.notificationOperations[id] = operationID
 	desktop.notificationMu.Unlock()
 	return nil
+}
+
+// ShowStartupFailure shows why Replicaro couldn't start as a desktop
+// notification. A desktop launch sends stderr to the journal or to
+// ~/.xsession-errors, where a user doesn't look, so the notification is the
+// place they see the reason. Only a graphical session with a session bus gets
+// one; headless installs keep the error on stderr and in the startup log, and
+// the container on stderr alone, where systemd or Docker already capture it.
+// Errors are ignored, because the caller exits next either way.
+func ShowStartupFailure(message string) {
+	if !graphicalLinuxSession() || os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
+		return
+	}
+	// One deadline covers connecting and notifying, so a session bus that
+	// doesn't answer can't keep the failed process from exiting.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dbus.ConnectSessionBus(dbus.WithContext(ctx))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = (&linuxDesktop{conn: conn}).notifyStartupFailure(ctx, message)
+}
+
+// ConfirmStartupRepair never asks on Linux. A desktop notification can't take
+// an answer reliably, and many installs are headless services, so startup
+// fails with a message that says how to start Replicaro to repair it.
+func ConfirmStartupRepair(string) (answered, repair bool) { return false, false }
+
+// notifyStartupFailure sends the notification without actions, since there's
+// no running Replicaro to open. It uses the server's default expiry (-1)
+// rather than 0 (never expire): the systemd user unit restarts Replicaro on
+// failure, so a lasting problem sends one notice per attempt, and those should
+// not pile up until the user dismisses each one. The icon comes from the
+// embedded image only: the file-based icon is written under the data folder,
+// which may be the reason startup failed.
+func (desktop *linuxDesktop) notifyStartupFailure(ctx context.Context, message string) error {
+	notifications := desktop.conn.Object(notificationService, notificationPath)
+	// Startup errors quote option syntax such as --loopback-port=<port>.
+	message = notificationBody(ctx, notifications, message)
+	hints := map[string]dbus.Variant{"desktop-entry": dbus.MakeVariant("replicaro")}
+	if image, ok := desktopNotificationImage("failed"); ok {
+		hints["image-data"] = dbus.MakeVariant(image)
+	}
+	return notifications.CallWithContext(
+		ctx, notificationService+".Notify", 0,
+		"Replicaro", uint32(0), "replicaro", "Replicaro", message, []string{},
+		hints, int32(-1),
+	).Err
+}
+
+// notificationBody prepares a message for the notification server. A server
+// with the "body-markup" capability reads the body as markup, so a vault, job
+// or file name with "&" or "<", or an option such as --port=<port>, would be
+// read as an entity or tag and shown wrongly or dropped. The server is asked
+// on every notification rather than once, because another server can take
+// over the name while Replicaro runs. The summary is never markup.
+func notificationBody(ctx context.Context, notifications dbus.BusObject, message string) string {
+	var capabilities []string
+	if call := notifications.CallWithContext(ctx, notificationService+".GetCapabilities", 0); call.Err == nil {
+		_ = call.Store(&capabilities)
+	}
+	return freedesktopBodyText(message, slices.Contains(capabilities, "body-markup"))
+}
+
+// freedesktopBodyText escapes the three characters the notification markup
+// gives meaning to when the server reads markup, and leaves the text alone
+// otherwise, since a plain-text server shows the body as it is.
+func freedesktopBodyText(message string, markup bool) string {
+	if !markup {
+		return message
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(message)
 }
 
 func desktopNotificationImage(status string) (notificationImage, bool) {
@@ -614,7 +859,12 @@ func (desktop *linuxDesktop) openURLWithFallback(target string, fallback func(st
 }
 
 func openURLFallback(target string) error {
-	return startAndReap(exec.Command("xdg-open", target))
+	command := exec.Command("xdg-open", target)
+	// xdg-open can start a new browser rather than hand the URL to a running
+	// one. In its own session, a browser started here isn't in Replicaro's
+	// process group, so Ctrl+C on Replicaro in a terminal doesn't reach it.
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return startAndReap(command)
 }
 
 func startAndReap(command *exec.Cmd) error {
@@ -623,6 +873,42 @@ func startAndReap(command *exec.Cmd) error {
 	}
 	go func() { _ = command.Wait() }()
 	return nil
+}
+
+// OpenWebUI opens a running instance's web interface from a second launch,
+// which has no tray or D-Bus connection of its own yet. With a session bus it
+// asks the desktop portal, like Run does on a first launch. When the launcher
+// provided an XDG_ACTIVATION_TOKEN, it's passed through to the portal (and
+// xdg-open, which the portal call falls back to, inherits the variable);
+// whether the browser actually gets focus is up to the compositor. A token
+// over maxActivationTokenBytes isn't sent to the portal, the same limit the
+// tray path applies.
+//
+// Without a session bus it uses xdg-open, but only in a graphical session,
+// the same check Run makes on a first launch. Over SSH or on a headless
+// install there's no browser to show, and xdg-open would start and fail in
+// the background while this launch reported success; returning an error
+// makes the second launch exit non-zero after it has logged the URL. A
+// missing xdg-open is reported the same way.
+func OpenWebUI(target string) error {
+	if _, err := url.ParseRequestURI(target); err != nil {
+		return err
+	}
+	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
+		if conn, err := dbus.ConnectSessionBus(); err == nil {
+			defer conn.Close()
+			token := os.Getenv("XDG_ACTIVATION_TOKEN")
+			if len(token) > maxActivationTokenBytes {
+				token = ""
+			}
+			opener := &linuxDesktop{conn: conn, activationToken: token}
+			return opener.openURLWithFallback(target, openURLFallback)
+		}
+	}
+	if !graphicalLinuxSession() {
+		return errors.New("no graphical session to open the web interface in")
+	}
+	return openURLFallback(target)
 }
 
 func openWebUIURL(target string) error {
@@ -666,22 +952,6 @@ func ShowPersistentNotification(title, message, operationID string, successful b
 	}
 	return desktop.notifyPersistent(title, message, operationID, status)
 }
-
-func MinimizeToTray() error {
-	activeLinuxMu.RLock()
-	desktop := activeLinux
-	activeLinuxMu.RUnlock()
-	if desktop == nil {
-		return errors.New("StatusNotifier tray host is unavailable")
-	}
-	tray, _ := desktop.capabilities()
-	if !tray {
-		return errors.New("StatusNotifier tray host is unavailable")
-	}
-	return nil
-}
-
-func RestoreWindow() error { return openWebUIURL(currentWebUIURL()) }
 
 func Capabilities() map[string]bool {
 	activeLinuxMu.RLock()

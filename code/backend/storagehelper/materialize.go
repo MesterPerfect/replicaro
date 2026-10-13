@@ -1,14 +1,11 @@
-// Package storagehelper securely materializes and launches Replicaro's
-// target-native, embedded filesystem storage helper.
+// Package storagehelper materializes and launches Replicaro's target-native,
+// embedded filesystem storage helper.
 package storagehelper
 
 import (
-	"crypto/sha256"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/local/replicaro/appdata"
@@ -32,149 +29,46 @@ func Materialize() (string, error) {
 	return materializeBinary(binary, expected, root, executableName())
 }
 
+// materializeBinary installs the helper at
+// root/components/storage-helper/<name> with appdata.InstallExecutable,
+// creating the component folders first. A regular file with the embedded
+// checksum is kept and set back to 0700; anything else at the path, a file
+// whose mode can't be reset included, is replaced (see InstallExecutable).
+// If the entry can't be replaced (a folder at that name, or a folder we can't
+// write to), the ordinary filesystem error comes back and the helper stays
+// unavailable.
+//
+// What heals on its own and what doesn't: an unreadable, mismatched, or
+// root-owned helper file inside folders the user owns is simply reinstalled,
+// because the rename only needs write access to the folder. Running Replicaro
+// once under sudo can also leave components/ or components/storage-helper/
+// root-owned with mode 0700, and those can't even be entered, so the helper
+// stays unavailable until the user chowns them back. That's the same
+// trade-off appdata accepts for its own folders (see the sudo note on
+// secureEnsureDirectory in appdata/security_other.go).
+//
+// There are intentionally no owner, link, or letter-case checks on the
+// folders or the binary, and no sudo detection. Those only matter against
+// someone with access to the computer tampering with Replicaro's files, which
+// Replicaro doesn't defend against, and they turned ordinary setups
+// (symlinked home folders, case-variant siblings) into a disabled helper.
+// Don't add owner or link checks back here without a product decision.
 func materializeBinary(binary []byte, expected, root, name string) (string, error) {
 	materializeMu.Lock()
 	defer materializeMu.Unlock()
 
-	if checksum(binary) != expected {
-		return "", componentError(fmt.Errorf("embedded bytes do not match their build checksum"))
-	}
-	if err := validateManagedDirectory(root, false); err != nil {
-		return "", componentError(fmt.Errorf("application-data root is unsafe: %w", err))
-	}
-	if err := rejectCaseAmbiguity(root, "components"); err != nil {
-		return "", componentError(err)
-	}
-	components := filepath.Join(root, "components")
-	if err := ensurePrivateDirectory(components); err != nil {
-		return "", componentError(fmt.Errorf("prepare component root: %w", err))
-	}
-	if err := rejectCaseAmbiguity(components, componentDirectory); err != nil {
-		return "", componentError(err)
-	}
-	directory := filepath.Join(components, componentDirectory)
-	if err := ensurePrivateDirectory(directory); err != nil {
+	// New folders get 0700 on Unix. On Windows they inherit the application
+	// folder's protected DACL; this runs on every full preparation, so it
+	// doesn't re-apply an ACL or mode to folders that already exist.
+	directory := filepath.Join(root, "components", componentDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", componentError(fmt.Errorf("prepare component directory: %w", err))
 	}
-	if err := rejectCaseAmbiguity(directory, name); err != nil {
+	path, err := appdata.InstallExecutable(appdata.ExecutableFromBytes(binary, expected), directory, name)
+	if err != nil {
 		return "", componentError(err)
 	}
-	destination := filepath.Join(directory, name)
-	if err := verifyExecutable(destination, expected); err == nil {
-		if err := secureExecutable(destination); err != nil {
-			return "", componentError(fmt.Errorf("secure installed executable: %w", err))
-		}
-		return destination, nil
-	} else if !os.IsNotExist(err) {
-		info, statErr := inspectRegularFile(destination)
-		if statErr != nil && !os.IsNotExist(statErr) {
-			return "", componentError(fmt.Errorf("refuse unsafe installed executable: %w", statErr))
-		}
-		if statErr == nil && info == nil {
-			return "", componentError(fmt.Errorf("refuse unsafe installed executable"))
-		}
-	}
-
-	temporary, err := os.CreateTemp(directory, "."+name+".updated-*")
-	if err != nil {
-		return "", componentError(fmt.Errorf("create temporary executable: %w", err))
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	fail := func(cause error) (string, error) {
-		_ = temporary.Close()
-		return "", componentError(cause)
-	}
-	if err := temporary.Chmod(0o700); err != nil {
-		return fail(fmt.Errorf("secure temporary executable: %w", err))
-	}
-	if err := protectExecutable(temporaryPath); err != nil {
-		return fail(fmt.Errorf("protect temporary executable: %w", err))
-	}
-	if _, err := temporary.Write(binary); err != nil {
-		return fail(fmt.Errorf("write temporary executable: %w", err))
-	}
-	if err := temporary.Sync(); err != nil {
-		return fail(fmt.Errorf("flush temporary executable: %w", err))
-	}
-	if err := temporary.Close(); err != nil {
-		return "", componentError(fmt.Errorf("close temporary executable: %w", err))
-	}
-	if err := verifyExecutable(temporaryPath, expected); err != nil {
-		return "", componentError(fmt.Errorf("verify temporary executable: %w", err))
-	}
-	if err := appdata.AtomicReplace(temporaryPath, destination); err != nil {
-		return "", componentError(fmt.Errorf("atomically install executable: %w", err))
-	}
-	if err := secureExecutable(destination); err != nil {
-		return "", componentError(fmt.Errorf("secure installed executable: %w", err))
-	}
-	if err := verifyExecutable(destination, expected); err != nil {
-		return "", componentError(fmt.Errorf("verify installed executable: %w", err))
-	}
-	return destination, nil
-}
-
-func ensurePrivateDirectory(path string) error {
-	if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
-		return err
-	}
-	if err := validateManagedDirectory(path, true); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return err
-	}
-	return appdata.SecurePath(path, true)
-}
-
-func secureExecutable(path string) error {
-	return protectExecutable(path)
-}
-
-func verifyExecutable(path, expected string) error {
-	if _, err := inspectRegularFile(path); err != nil {
-		return err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return err
-	}
-	if fmt.Sprintf("%x", hash.Sum(nil)) != expected {
-		return fmt.Errorf("executable checksum mismatch")
-	}
-	return nil
-}
-
-func checksum(value []byte) string {
-	sum := sha256.Sum256(value)
-	return fmt.Sprintf("%x", sum[:])
-}
-
-func rejectCaseAmbiguity(directory, exact string) error {
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return err
-	}
-	matches := 0
-	exactMatches := 0
-	for _, entry := range entries {
-		if strings.EqualFold(entry.Name(), exact) {
-			matches++
-			if entry.Name() == exact {
-				exactMatches++
-			}
-		}
-	}
-	if matches > 1 || matches == 1 && exactMatches != 1 {
-		return fmt.Errorf("component path has ambiguous casing for %q", exact)
-	}
-	return nil
+	return path, nil
 }
 
 func componentError(err error) error {

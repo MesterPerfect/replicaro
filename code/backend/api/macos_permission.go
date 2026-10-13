@@ -22,6 +22,9 @@ func errorToastMessage(err error) string {
 
 func errorToastMessageForPlatform(platform string, err error) string {
 	message := err.Error()
+	if help := engines.SSHHostKeyHelp(err); help != "" {
+		return message + "\n\n" + help
+	}
 	if platform != "darwin" {
 		return message
 	}

@@ -149,6 +149,8 @@ func StageRecoveredLocalJobAdmissions(
 		}
 		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, settingsJSON, portableJSON, nextRun string
+		var skipNoBackup, skipCacheDir bool
+		var skipMarkerName string
 		var beforeScriptPath, afterScriptPath string
 		var beforeScriptMustSucceed, afterScriptMustSucceed bool
 		var retention int
@@ -156,13 +158,15 @@ func StageRecoveredLocalJobAdmissions(
 		var enabled bool
 		if err := tx.QueryRow(`SELECT name,source,source_storage_version,source_storage_key,
 				source_storage_json,source_binding_state,schedule,retention,retention_hourly,retention_daily,
-				retention_weekly,retention_monthly,retention_yearly,excludes,tag,
+				retention_weekly,retention_monthly,retention_yearly,excludes,
+				skip_nobackup_folders,skip_cachedir_folders,skip_marker_file_name,tag,
 				before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 				engine_settings,portable_target_ids,enabled,COALESCE(next_run,'')
 				FROM backup_jobs WHERE id=?`, reviewed.ID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 			&sourceBindingState, &schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
-			&retentionMonthly, &retentionYearly, &excludes, &tag, &beforeScriptPath, &beforeScriptMustSucceed,
+			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
+			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
 			&afterScriptPath, &afterScriptMustSucceed,
 			&settingsJSON, &portableJSON, &enabled, &nextRun,
 		); err != nil {
@@ -186,7 +190,7 @@ func StageRecoveredLocalJobAdmissions(
 			}
 			activeTargetIDs = append(activeTargetIDs, repositoryID)
 		}
-		if err := activeRows.Close(); err != nil {
+		if err := closeRows(activeRows); err != nil {
 			return err
 		}
 		reviewedSettings, err := encodeEngineSettings(reviewed.EngineSettings)
@@ -201,6 +205,8 @@ func StageRecoveredLocalJobAdmissions(
 			!equivalentSourceBinding(sourceStorageVersion, sourceStorageKey, sourceStorageJSON,
 				reviewed.SourceStorageVersion, reviewed.SourceStorageKey, reviewed.SourceStorageDescriptorJSON) ||
 			!models.RetentionPolicyEqual(loadedRetention, reviewed) || excludes != reviewed.Excludes || tag != reviewed.Tag ||
+			skipNoBackup != reviewed.SkipNoBackupFolders || skipCacheDir != reviewed.SkipCacheDirFolders ||
+			skipMarkerName != reviewed.SkipMarkerFileName ||
 			beforeScriptPath != reviewed.BeforeScriptPath ||
 			beforeScriptMustSucceed != reviewed.BeforeScriptMustSucceed ||
 			afterScriptPath != reviewed.AfterScriptPath ||
@@ -320,18 +326,22 @@ func normalizeRecoveredJobTargets(queryer recoveredJobQueryer, repositoryID stri
 
 		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, existingSettings, existingTargets string
+		var skipNoBackup, skipCacheDir bool
+		var skipMarkerName string
 		var beforeScriptPath, afterScriptPath string
 		var beforeScriptMustSucceed, afterScriptMustSucceed bool
 		var retention, enabled int
 		var retentionHourly, retentionDaily, retentionWeekly, retentionMonthly, retentionYearly sql.NullInt64
 		err := queryer.QueryRow(`SELECT name, source, source_storage_version, source_storage_key,
 			source_storage_json, source_binding_state, schedule, retention, retention_hourly, retention_daily,
-			retention_weekly, retention_monthly, retention_yearly, excludes, tag,
+			retention_weekly, retention_monthly, retention_yearly, excludes,
+			skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 			before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 			engine_settings, portable_target_ids, enabled FROM backup_jobs WHERE id = ?`, job.ID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 			&sourceBindingState, &schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
-			&retentionMonthly, &retentionYearly, &excludes, &tag, &beforeScriptPath, &beforeScriptMustSucceed,
+			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
+			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
 			&afterScriptPath, &afterScriptMustSucceed, &existingSettings, &existingTargets, &enabled)
 		if err == sql.ErrNoRows {
 			job.PortableTargetIDs = requestedTargets
@@ -353,6 +363,7 @@ func normalizeRecoveredJobTargets(queryer recoveredJobQueryer, repositoryID stri
 			sourceStorageVersion, sourceStorageKey, sourceStorageJSON
 		job.SourceBindingState = sourceBindingState
 		job.Schedule, job.Retention, job.Excludes, job.Tag = schedule, retention, excludes, tag
+		job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName = skipNoBackup, skipCacheDir, skipMarkerName
 		job.RetentionHourly, job.RetentionDaily = nullableRetentionValue(retentionHourly), nullableRetentionValue(retentionDaily)
 		job.RetentionWeekly, job.RetentionMonthly = nullableRetentionValue(retentionWeekly), nullableRetentionValue(retentionMonthly)
 		job.RetentionYearly = nullableRetentionValue(retentionYearly)
@@ -418,7 +429,7 @@ func RenameRecoveredJobNameConflicts(db *sql.DB, jobs []models.BackupJob) ([]mod
 			used[strings.ToLower(strings.TrimSpace(name))] = true
 		}
 	}
-	if err := reservedRows.Close(); err != nil {
+	if err := closeRows(reservedRows); err != nil {
 		return nil, err
 	}
 	renamed := append([]models.BackupJob(nil), jobs...)
@@ -472,7 +483,7 @@ func RenameRecoveredRepositoryNameConflict(db *sql.DB, repo models.Repository) (
 		}
 		used[strings.ToLower(strings.TrimSpace(name))] = true
 	}
-	if err := reservedRows.Close(); err != nil {
+	if err := closeRows(reservedRows); err != nil {
 		return repo, err
 	}
 	candidate := base
@@ -524,7 +535,7 @@ func validateRecoveredJobEngineSettings(queryer recoveredJobQueryer, repositoryI
 			}
 			represented[engine] = true
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return err
 		}
 		if err := engines.ValidatePortableJobSettings(job.EngineSettings, represented); err != nil {
@@ -695,6 +706,8 @@ func AttachRecoveredRepository(
 		}
 		if existing != 0 {
 			var name, source, schedule, excludes, tag, encoded, existingTargets string
+			var skipNoBackup, skipCacheDir bool
+			var skipMarkerName string
 			var beforeScriptPath, afterScriptPath string
 			var beforeScriptMustSucceed, afterScriptMustSucceed bool
 			var retention int
@@ -703,14 +716,16 @@ func AttachRecoveredRepository(
 			var sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 			if err := tx.QueryRow(`SELECT name, source, source_storage_version, source_storage_key, source_storage_json,
 				source_binding_state, schedule, retention, retention_hourly, retention_daily, retention_weekly,
-				retention_monthly, retention_yearly, excludes, tag,
+				retention_monthly, retention_yearly, excludes,
+				skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 				before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 				engine_settings, portable_target_ids, enabled
 				FROM backup_jobs WHERE id = ?`, job.ID).Scan(&name, &source,
 				&sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 				&sourceBindingState, &schedule, &retention,
 				&retentionHourly, &retentionDaily, &retentionWeekly, &retentionMonthly, &retentionYearly,
-				&excludes, &tag, &beforeScriptPath, &beforeScriptMustSucceed,
+				&excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
+				&tag, &beforeScriptPath, &beforeScriptMustSucceed,
 				&afterScriptPath, &afterScriptMustSucceed, &encoded, &existingTargets, &enabled); err != nil {
 				return "", nil, err
 			}
@@ -736,6 +751,8 @@ func AttachRecoveredRepository(
 					job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON) ||
 				sourceBindingState != normalizedJobSourceBindingState(job.SourceBindingState) ||
 				schedule != job.Schedule || !models.RetentionPolicyEqual(loadedRetention, job) || excludes != job.Excludes ||
+				skipNoBackup != job.SkipNoBackupFolders || skipCacheDir != job.SkipCacheDirFolders ||
+				skipMarkerName != job.SkipMarkerFileName ||
 				tag != job.Tag || beforeScriptPath != job.BeforeScriptPath ||
 				beforeScriptMustSucceed != job.BeforeScriptMustSucceed ||
 				afterScriptPath != job.AfterScriptPath ||
@@ -765,21 +782,23 @@ func AttachRecoveredRepository(
 				}
 				affectedProfileIDs = append(affectedProfileIDs, repositoryID)
 			}
-			if err := rows.Close(); err != nil {
+			if err := closeRows(rows); err != nil {
 				return "", nil, err
 			}
 		} else {
 			_, err = tx.Exec(`INSERT INTO backup_jobs
 				(id, name, source, source_storage_version, source_storage_key, source_storage_json,
 				 source_binding_state, schedule, enabled, next_run, last_run, retention, retention_hourly, retention_daily,
-				 retention_weekly, retention_monthly, retention_yearly, excludes, tag,
+				 retention_weekly, retention_monthly, retention_yearly, excludes,
+				 skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 				 before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 				 engine_settings, portable_target_ids)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				job.ID, job.Name, job.Source, job.SourceStorageVersion, job.SourceStorageKey,
 				job.SourceStorageDescriptorJSON, normalizedJobSourceBindingState(job.SourceBindingState), job.Schedule,
 				job.Retention, job.RetentionHourly,
 				job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly, job.Excludes,
+				job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
 				job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
 				job.AfterScriptPath, job.AfterScriptMustSucceed, settings, string(portableJSON))
 			if err != nil {
@@ -875,8 +894,7 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 			return "", nil, fmt.Errorf("repository connection parent has no reviewed vault root state")
 		}
 		reviewedRoot, parseErr := vaultprofile.ParseRoot(reviewed.Root, repo.Connector)
-		if parseErr != nil || reviewedRoot.VaultUUID != repo.ID || reviewedRoot.Repository.Engine != repo.Engine ||
-			reviewedRoot.Repository.NativeRepositoryID != repo.NativeRepositoryID {
+		if parseErr != nil || !reviewedRoot.Identifies(repo) {
 			return "", nil, fmt.Errorf("repository connection parent has invalid reviewed vault root state")
 		}
 		if repo.ColdStorage && (reviewedRoot.Repository.S3Storage == nil || reviewedRoot.Repository.S3Storage.Mode != "cold" ||
@@ -956,7 +974,7 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 		// presentation in the same commit; aliases alone never rewrite Location.
 		result, err = tx.Exec(`UPDATE repositories SET name=?,description=?,passphrase=?,connector_options=?,
 			cold_storage=?,archive_write_class=?,location=?,canonical_identity=?,storage_identity_version=?,storage_identity_key=?,storage_identity_json=?,
-			resolved_repository_path='',resolved_repository_observed_at='',vault_size_dirty=1,
+			resolved_repository_path='',resolved_repository_observed_at='',vault_size_dirty=1,vault_size_dirty_count=vault_size_dirty_count+1,
 			profile_uuid=?,attachment_generation=?,check_schedule=?,next_check=?,maintenance_schedule=?,next_maintenance=?,concurrency_mode=?,auto_unlock=?
 			WHERE id=? AND native_repository_id=?`, strings.TrimSpace(repo.Name), repo.Description,
 			encodedPassphrase, optionsJSON, repo.ColdStorage, repo.ArchiveWriteClass,

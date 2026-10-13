@@ -218,6 +218,13 @@ func removeVaultInBackground(op *trackedOperation, repo models.Repository, disca
 	if err := finalizeRepositoryArtifacts(stage); err != nil {
 		cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault was deleted but quarantined local engine artifacts require manual cleanup: %v", err))
 	}
+	// The engine cache goes here, while the vault lock is still held, and not
+	// with the quarantined artifacts at startup: once the lock is released the
+	// same vault can be connected again under the same UUID, and its new cache
+	// would live at this same path.
+	if err := engines.RemoveRepositoryCaches(repo); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault was deleted but its local engine cache requires cleanup: %v", err))
+	}
 	if len(cleanupErrors) != 0 {
 		// Removed, with local cleanup left for the user: the removal happened,
 		// so this is not a failure, but it is not a clean success either.

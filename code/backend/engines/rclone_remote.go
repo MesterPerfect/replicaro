@@ -65,6 +65,7 @@ const (
 	RcloneRemoteEnvironmentUnreadableCode   = "rclone_remote_environment_unreadable"
 	RcloneRemoteEnvironmentNameRequiredCode = "rclone_remote_environment_name_required"
 	RcloneRemoteEnvironmentNameEqualsCode   = "rclone_remote_environment_name_equals"
+	RcloneRemoteEnvironmentNameSpacesCode   = "rclone_remote_environment_name_spaces"
 	RcloneRemoteEnvironmentNULCode          = "rclone_remote_environment_nul"
 	RcloneRemoteEnvironmentDuplicateCode    = "rclone_remote_environment_duplicate"
 	RcloneRemoteEnvironmentRefusedCode      = "rclone_remote_environment_refused"
@@ -91,7 +92,7 @@ var rcloneRemoteErrorCodes = []string{
 	RcloneRemoteNameDriveLetterCode, RcloneRemoteNameReservedCode,
 	RcloneRemotePathRequiredCode, RcloneRemotePathInvalidCode, RcloneRemotePathIncludesRemoteCode,
 	RcloneRemoteEnvironmentUnreadableCode, RcloneRemoteEnvironmentNameRequiredCode,
-	RcloneRemoteEnvironmentNameEqualsCode, RcloneRemoteEnvironmentNULCode,
+	RcloneRemoteEnvironmentNameEqualsCode, RcloneRemoteEnvironmentNameSpacesCode, RcloneRemoteEnvironmentNULCode,
 	RcloneRemoteEnvironmentDuplicateCode, RcloneRemoteEnvironmentRefusedCode,
 	RcloneRemoteConfigNotFoundCode, RcloneRemoteConfigAccessCode, RcloneRemoteConfigFolderCode,
 	RcloneRemoteConfigManagedFolderCode,
@@ -384,6 +385,31 @@ func ValidateRcloneRemoteEnvironment(variables []RcloneRemoteVariable) error {
 			Message: "Replicaro can't pass these environment variables to rclone: " + strings.Join(refused, ", ") +
 				". Replicaro sets them itself, or they change how rclone saves, reads, lists, or logs files, or make it start a server, write extra files, or run a program. Remove them and try again. Variables that set up your remote, such as AWS_ACCESS_KEY_ID or RCLONE_S3_ACCESS_KEY_ID, are fine.",
 			Names: refused,
+		}
+	}
+	return nil
+}
+
+// ValidateRcloneRemoteEnvironmentNamesForSave refuses variable names that
+// start or end with a space, and names every one of them. Names are passed
+// exactly as entered, so " AWS_REGION" would reach rclone as a different
+// variable that it never reads, and the setting would silently do nothing.
+//
+// This runs only when the vault's settings are saved, not before each run: a
+// vault saved earlier with such a name has been working without that
+// variable, and refusing it at run time would only stop its backups.
+func ValidateRcloneRemoteEnvironmentNamesForSave(variables []RcloneRemoteVariable) error {
+	var spaced []string
+	for _, variable := range variables {
+		if name := strings.TrimSpace(variable.Name); name != variable.Name {
+			spaced = append(spaced, name)
+		}
+	}
+	if len(spaced) > 0 {
+		return &RcloneRemoteError{
+			Code:    RcloneRemoteEnvironmentNameSpacesCode,
+			Message: "An environment variable name can't start or end with a space: " + strings.Join(spaced, ", ") + ". Remove the spaces and try again.",
+			Names:   spaced,
 		}
 	}
 	return nil

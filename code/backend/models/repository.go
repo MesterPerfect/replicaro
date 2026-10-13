@@ -332,3 +332,27 @@ type VaultSizeStatus struct {
 func ValidEngine(engine string) bool {
 	return engine == "restic" || engine == "kopia"
 }
+
+// SoleProfileConnector reports whether a vault on connector keeps exactly one
+// profile. These providers use an attachment-local, opaque rclone
+// authorization that Replicaro does not coordinate across computers. They are
+// also slower, eventually consistent backends, where several profiles writing
+// to one vault would not reliably see each other's changes. Each vault
+// therefore has one transferable profile: reconnect it for the same client,
+// take it over for a different client, and fail closed if any additional
+// profile exists. An Any Rclone Remote vault can be on any rclone backend,
+// which Replicaro can't tell apart, so it takes the same limits.
+//
+// WebDAV is deliberately not listed. Restic reaches it through rclone too, but
+// it is an ordinary server connector like SFTP, with no per-computer
+// authorization, so it keeps Join and multiple profiles. The Normal
+// concurrency cap in NormalizeConcurrencyModeForConnector covers the same
+// connectors; keep the two in step.
+func SoleProfileConnector(connector string) bool {
+	switch connector {
+	case "dropbox", "google_drive", "onedrive", "rclone_remote":
+		return true
+	default:
+		return false
+	}
+}

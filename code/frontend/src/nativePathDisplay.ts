@@ -1,3 +1,10 @@
+// A path as shown to the user: a Windows drive path (C:\ or C:/) is written
+// with backslashes, and every other path keeps its own spelling. Display only;
+// callers keep the original value for keys, selection and requests.
+export function displayPath(value: string): string {
+	return /^[A-Za-z]:[\\/]/.test(value) ? value.replace(/\//g, "\\") : value;
+}
+
 // Display only: callers keep the native path for keys, selection, and requests.
 // The native source header supplies the association; /C by itself is not proof
 // of a Windows drive, and the viewing computer supplies no path grammar.

@@ -120,21 +120,6 @@ func firstBindRestoredSource(ctx context.Context, job models.BackupJob) models.B
 	return bound
 }
 
-func requireRepositoryStorageAvailable(ctx context.Context, repo models.Repository) error {
-	observation := storageavailability.ObserveRepository(ctx, repo, time.Now().UTC())
-	if observation.State != database.StorageAvailable {
-		return fmt.Errorf("the saved filesystem storage is unavailable")
-	}
-	return nil
-}
-
-func requirePersistedRepositoryStorageAvailable(ctx context.Context, repo models.Repository) error {
-	if err := storageavailability.RequireRepositoryAvailable(ctx, repo); err != nil {
-		return fmt.Errorf("the saved filesystem storage is unavailable: %w", err)
-	}
-	return nil
-}
-
 func requireJobSourceStorageAvailable(ctx context.Context, job models.BackupJob) error {
 	observation := storageavailability.ObserveSource(ctx, job, time.Now().UTC())
 	if observation.State != database.StorageAvailable {

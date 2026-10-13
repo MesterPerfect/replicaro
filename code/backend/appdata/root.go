@@ -84,10 +84,11 @@ func rootDirectory() (string, error) {
 		return processRoot, nil
 	}
 	if runtime.GOOS == "windows" {
-		if value := os.Getenv("LOCALAPPDATA"); value != "" {
-			return absoluteRoot(filepath.Join(value, "Replicaro"))
+		localAppData, err := windowsLocalAppData()
+		if err != nil {
+			return "", err
 		}
-		return "", fmt.Errorf("LOCALAPPDATA is not set")
+		return absoluteRoot(filepath.Join(localAppData, "Replicaro"))
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -96,18 +97,49 @@ func rootDirectory() (string, error) {
 	if runtime.GOOS == "darwin" {
 		return absoluteRoot(filepath.Join(home, "Library", "Application Support", "Replicaro"))
 	}
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		if !filepath.IsAbs(value) {
-			return "", fmt.Errorf("XDG_STATE_HOME must be an absolute path (got %q)", value)
-		}
+	if value := xdgBaseDirectory("XDG_STATE_HOME"); value != "" {
 		return absoluteRoot(filepath.Join(value, "replicaro"))
 	}
 	return absoluteRoot(filepath.Join(home, ".local", "state", "replicaro"))
 }
 
+// windowsLocalAppData returns the per-user Local AppData folder that holds
+// Replicaro's data on Windows. LOCALAPPDATA normally names it and is used
+// when it holds an absolute path, so a redirected profile keeps working.
+// A launcher that builds a minimal environment can leave it out, though,
+// while the folder itself still exists. Asking Windows for the known folder
+// then finds the same place a normal launch uses, instead of refusing to
+// start or resolving a relative value against the working directory.
+func windowsLocalAppData() (string, error) {
+	if value := os.Getenv("LOCALAPPDATA"); filepath.IsAbs(value) {
+		return value, nil
+	}
+	value, err := localAppDataKnownFolder()
+	if err != nil {
+		return "", fmt.Errorf("LOCALAPPDATA is unset or relative, and the Local AppData known folder could not be found: %w", err)
+	}
+	if !filepath.IsAbs(value) {
+		return "", fmt.Errorf("LOCALAPPDATA is unset or relative, and the Local AppData known folder %q is not an absolute path", value)
+	}
+	return value, nil
+}
+
+// xdgBaseDirectory returns an XDG base-directory variable only when it holds
+// an absolute path. The XDG Base Directory spec says relative values are
+// invalid and should be ignored, so callers fall back to the default location
+// instead of refusing to start (or quietly resolving against whatever the
+// working directory happens to be).
+func xdgBaseDirectory(name string) string {
+	value := os.Getenv(name)
+	if !filepath.IsAbs(value) {
+		return ""
+	}
+	return value
+}
+
 // PasswordRotationRoot returns the one durable vault-password staging root
-// without creating or permission-changing any component. The rotation package
-// applies its stricter operation-specific no-link checks before mutation.
+// without creating or permission-changing any component. The password-change
+// code creates and cleans up its own stage under it.
 func PasswordRotationRoot() (string, error) {
 	root, err := rootDirectory()
 	if err != nil {
@@ -116,9 +148,9 @@ func PasswordRotationRoot() (string, error) {
 	return filepath.Join(root, "password-change"), nil
 }
 
-// OperationLogDirectoryPath returns the exact local diagnostic directory
-// without creating or permission-changing it. The operation-log package owns
-// its narrower no-link validation before any such mutation.
+// OperationLogDirectoryPath returns the local diagnostic directory without
+// creating or permission-changing it. The operation-log package creates it
+// when it first writes a log.
 func OperationLogDirectoryPath() (string, error) {
 	root, err := rootDirectory()
 	if err != nil {
@@ -127,10 +159,9 @@ func OperationLogDirectoryPath() (string, error) {
 	return filepath.Join(root, "logs"), nil
 }
 
-// RcloneSessionRoot returns the exact private authorization/operation-session location without
-// creating any path component. The rclone adapter validates and creates this
-// tree with its stricter no-alias/no-reparse rules before materializing
-// credentials.
+// RcloneSessionRoot returns the private authorization/operation-session
+// location without creating any path component. The rclone adapter creates
+// this tree itself before it writes any credentials there.
 func RcloneSessionRoot() (string, error) {
 	root, err := rootDirectory()
 	if err != nil {
@@ -159,11 +190,11 @@ func RcloneConfigSessionRoot() (string, error) {
 		return filepath.Join(processRoot, "rclone", "config-sessions"), nil
 	}
 	if runtime.GOOS == "windows" {
-		value := os.Getenv("LOCALAPPDATA")
-		if value == "" {
-			return "", fmt.Errorf("LOCALAPPDATA is not set")
+		localAppData, err := windowsLocalAppData()
+		if err != nil {
+			return "", err
 		}
-		root, err := absoluteRoot(filepath.Join(value, "Replicaro"))
+		root, err := absoluteRoot(filepath.Join(localAppData, "Replicaro"))
 		if err != nil {
 			return "", err
 		}
@@ -180,11 +211,9 @@ func RcloneConfigSessionRoot() (string, error) {
 		}
 		return filepath.Join(root, "rclone", "config-sessions"), nil
 	}
-	configHome := os.Getenv("XDG_CONFIG_HOME")
+	configHome := xdgBaseDirectory("XDG_CONFIG_HOME")
 	if configHome == "" {
 		configHome = filepath.Join(home, ".config")
-	} else if !filepath.IsAbs(configHome) {
-		return "", fmt.Errorf("XDG_CONFIG_HOME must be an absolute path (got %q)", configHome)
 	}
 	root, err := absoluteRoot(filepath.Join(configHome, "replicaro"))
 	if err != nil {
@@ -211,11 +240,11 @@ func RcloneVaultConfigRoot() (string, error) {
 		return filepath.Join(processRoot, "rclone", "vaults"), nil
 	}
 	if runtime.GOOS == "windows" {
-		value := os.Getenv("LOCALAPPDATA")
-		if value == "" {
-			return "", fmt.Errorf("LOCALAPPDATA is not set")
+		localAppData, err := windowsLocalAppData()
+		if err != nil {
+			return "", err
 		}
-		root, err := absoluteRoot(filepath.Join(value, "Replicaro"))
+		root, err := absoluteRoot(filepath.Join(localAppData, "Replicaro"))
 		if err != nil {
 			return "", err
 		}
@@ -232,27 +261,15 @@ func RcloneVaultConfigRoot() (string, error) {
 		}
 		return filepath.Join(root, "rclone", "vaults"), nil
 	}
-	configHome := os.Getenv("XDG_CONFIG_HOME")
+	configHome := xdgBaseDirectory("XDG_CONFIG_HOME")
 	if configHome == "" {
 		configHome = filepath.Join(home, ".config")
-	} else if !filepath.IsAbs(configHome) {
-		return "", fmt.Errorf("XDG_CONFIG_HOME must be an absolute path (got %q)", configHome)
 	}
 	root, err := absoluteRoot(filepath.Join(configHome, "replicaro"))
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(root, "rclone", "vaults"), nil
-}
-
-// RcloneProfileSessionRoot returns the exact private sidecar rclone-session
-// location without creating any path component.
-func RcloneProfileSessionRoot() (string, error) {
-	root, err := rootDirectory()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, "profile", "sessions"), nil
 }
 
 // CacheDirectory returns disposable per-user cache/log storage. macOS keeps

@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationlog"
@@ -102,7 +103,8 @@ func markSupportStorageObservation(w http.ResponseWriter, stage string, err erro
 	reason := storageavailability.ResolutionReason(err)
 	switch reason {
 	case database.AvailabilityReasonStorageMissing, database.AvailabilityReasonObservationFailed,
-		database.AvailabilityReasonObservationTimeout, database.AvailabilityReasonIdentityMismatch:
+		database.AvailabilityReasonObservationTimeout, database.AvailabilityReasonIdentityMismatch,
+		database.AvailabilityReasonObservationSlotsExhausted:
 	default:
 		return
 	}
@@ -329,7 +331,7 @@ func sanitizeSupportDetail(value string, privatePatterns []supportPrivatePattern
 	value = supportPOSIXPath.ReplaceAllString(value, "$1[REDACTED PATH]")
 	value = supportRelativePath.ReplaceAllString(value, "$1[REDACTED PATH]")
 	value = supportBareRelativePath.ReplaceAllString(value, "[REDACTED PATH]")
-	value = supportStructuredFilename.ReplaceAllString(value, "$1=[REDACTED FILENAME]")
+	value = redactStructuredFilenames(value)
 	value = supportQuotedFilename.ReplaceAllString(value, "[REDACTED FILENAME]")
 	value = supportFilename.ReplaceAllString(value, "[REDACTED FILENAME]")
 	value = strings.TrimSpace(value)
@@ -356,6 +358,50 @@ func sanitizeSupportDetail(value string, privatePatterns []supportPrivatePattern
 		return ""
 	}
 	return truncateSupportText(value, supportDetailByteLimit)
+}
+
+// supportPlaceholders are the markers the redaction passes write.
+var supportPlaceholders = []string{
+	"[REDACTED]", "[REDACTED CREDENTIAL]", "[REDACTED COMPUTER]", "[REDACTED URL]", "[REDACTED REMOTE]",
+	"[REDACTED PATH]", "[REDACTED FILENAME]", "[REDACTED PRESENTATION TAG]", "[REDACTED EMAIL]",
+}
+
+// redactStructuredFilenames is the second pass over file= and filename=
+// values. Most of them were already replaced by redactSupportSecrets, and the
+// pattern's unquoted value stops at the first space, so matching
+// "file=[REDACTED FILENAME]" again would replace only "[REDACTED" and leave
+// " FILENAME]" behind. A value that is exactly a placeholder therefore stays
+// as it is. Anything else, including a placeholder with more text attached,
+// is still replaced.
+func redactStructuredFilenames(value string) string {
+	matches := supportStructuredFilename.FindAllStringSubmatchIndex(value, -1)
+	if matches == nil {
+		return value
+	}
+	var result strings.Builder
+	last := 0
+	for _, match := range matches {
+		valueStart := match[3]
+		for valueStart < match[1] && strings.ContainsRune(" \t\r\n\f:=", rune(value[valueStart])) {
+			valueStart++
+		}
+		placeholder := false
+		for _, candidate := range supportPlaceholders {
+			if strings.HasPrefix(value[valueStart:], candidate) && valueStart+len(candidate) >= match[1] {
+				placeholder = true
+				break
+			}
+		}
+		if placeholder {
+			continue
+		}
+		result.WriteString(value[last:match[0]])
+		result.WriteString(value[match[2]:match[3]])
+		result.WriteString("=[REDACTED FILENAME]")
+		last = match[1]
+	}
+	result.WriteString(value[last:])
+	return result.String()
 }
 
 // Discover sensitive ranges before editing the detail. Their overlapping
@@ -653,6 +699,21 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 	}
 	if err := appendValue(hostname, "[REDACTED COMPUTER]", true, true, false); err != nil {
 		return nil, err
+	}
+	// Engines and rclone get Replicaro's proxy settings, so they're redacted in
+	// case a native tool echoes the setting. A proxy URL can hold a user name
+	// and password, often without an http:// prefix that the URL rule would
+	// catch. Very short values can't hold a login and would blank ordinary
+	// words.
+	for _, proxy := range command.ProxyEnvironmentValues() {
+		if utf8.RuneCountInString(strings.TrimSpace(proxy)) < database.SupportEnvironmentValueMinimumLength {
+			continue
+		}
+		for _, representation := range database.SupportSecretRepresentations(proxy) {
+			if err := appendValue(representation, "[REDACTED CREDENTIAL]", false, false, false); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for _, value := range configured.Paths {
 		if err := appendValue(value, "[REDACTED PATH]", runtime.GOOS == "windows", false, false); err != nil {
