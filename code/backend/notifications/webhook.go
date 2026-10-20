@@ -28,12 +28,14 @@ type Event struct {
 	TaskTarget string `json:"-"`
 	// MessageKey optionally replaces the generic status message with one
 	// specific catalog message (the 30-day unavailable-storage notices, the
-	// vault reconnect message, and the Kopia out-of-space notice).
-	// MessageValues fills its placeholders.
+	// vault reconnect message, the Kopia out-of-space notice, and the locked
+	// files message). MessageValues fills its placeholders; {taskName} is
+	// filled with the localized task name unless MessageValues sets it.
 	MessageKey            string            `json:"-"`
 	MessageValues         map[string]string `json:"-"`
 	Event                 string            `json:"event"`
 	Status                string            `json:"status,omitempty"`
+	IssueKind             string            `json:"issueKind,omitempty"` // only with status completed_with_issues; see models.OperationIssueLockedFiles
 	Success               bool              `json:"success"`
 	NativeBackupSucceeded bool              `json:"nativeBackupSucceeded,omitempty"`
 	Title                 string            `json:"title"`
@@ -186,6 +188,10 @@ func prepare(event *Event) {
 	}
 	if status == "completed_with_issues" {
 		event.Severity, event.Color, event.Icon = "warning", "#f2c063", "replicaro-warning"
+	} else {
+		// The qualifier only narrows completed_with_issues. Webhook consumers
+		// never see it next to any other status.
+		event.IssueKind = ""
 	}
 	if event.Timestamp == "" {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
@@ -203,7 +209,11 @@ func prepare(event *Event) {
 	}
 	event.Message = localizedNotificationMessage(taskName, *event)
 	if event.MessageKey != "" {
-		event.Message = locale.Text(event.Locale, event.MessageKey, event.MessageValues)
+		values := map[string]string{"taskName": taskName}
+		for name, value := range event.MessageValues {
+			values[name] = value
+		}
+		event.Message = locale.Text(event.Locale, event.MessageKey, values)
 	}
 	if len(event.Message) > maxWebhookMessageBytes {
 		// Cut at the start of a character so a multi-byte character is never
@@ -224,6 +234,9 @@ func localizedNotificationTitle(event Event) string {
 		key = "notifications.title.success"
 	case "completed_with_issues":
 		key = "notifications.title.completedWithIssues"
+		if event.IssueKind == models.OperationIssueLockedFiles {
+			key = "notifications.title.completedLockedFilesSkipped"
+		}
 	}
 	return locale.Text(event.Locale, key, nil)
 }

@@ -62,6 +62,7 @@ type BackupJobTarget struct {
 	Engine                   string `json:"engine"`
 	LastRun                  string `json:"lastRun"`
 	LastStatus               string `json:"lastStatus"`
+	LastIssueKind            string `json:"lastIssueKind,omitempty"` // IssueKind of the backup operation that set LastStatus, read from that operation
 	OperationID              string `json:"operationId,omitempty"`
 	PendingCatchUp           bool   `json:"pendingCatchUp"`
 	CoalescedMissedCount     int64  `json:"coalescedMissedCount"`

@@ -294,6 +294,17 @@ func ActivateBackupOperation(db *sql.DB, operationID, jobID, repositoryID string
 }
 
 func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status, output string, finishedAt time.Time) error {
+	return FinishBackupOperationWithIssueKind(db, operationID, jobID, repositoryID, status, "", output, finishedAt)
+}
+
+// FinishBackupOperationWithIssueKind is FinishBackupOperation with the
+// qualifier of a completed_with_issues result (models.OperationIssueLockedFiles
+// or ""). It is written in the same transaction as the status, so the two can
+// never disagree.
+func FinishBackupOperationWithIssueKind(db *sql.DB, operationID, jobID, repositoryID, status, issueKind, output string, finishedAt time.Time) error {
+	if issueKind != "" && (issueKind != models.OperationIssueLockedFiles || status != "completed_with_issues") {
+		return fmt.Errorf("backup issue kind %q does not apply to status %q", issueKind, status)
+	}
 	var engine string
 	_ = db.QueryRow(`SELECT engine FROM operations WHERE id=?`, operationID).Scan(&engine)
 	return operationlog.FinalizeOperation(operationID, engine, "backup", status, output, func() error {
@@ -302,7 +313,7 @@ func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status,
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		operationResult, err := tx.Exec(`UPDATE operations SET status = ?, finished_at = ?
+		operationResult, err := tx.Exec(`UPDATE operations SET status = ?, issue_kind = ?, finished_at = ?
 		WHERE id = ? AND (
 			status = 'running' OR (
 				status = 'queued' AND NOT EXISTS (
@@ -311,7 +322,7 @@ func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status,
 				)
 			)
 		)`,
-			status, formatSortableTimestamp(finishedAt), operationID)
+			status, issueKind, formatSortableTimestamp(finishedAt), operationID)
 		if err != nil {
 			return err
 		}
@@ -361,7 +372,7 @@ func FinishOperation(
 
 const operationColumns = `
 	id, kind, status, title, job_id, repository_id,
-	engine, started_at, finished_at`
+	engine, started_at, finished_at, issue_kind`
 
 func scanOperation(scan func(dest ...any) error) (models.Operation, error) {
 	var operation models.Operation
@@ -375,6 +386,7 @@ func scanOperation(scan func(dest ...any) error) (models.Operation, error) {
 		&operation.Engine,
 		&operation.StartedAt,
 		&operation.FinishedAt,
+		&operation.IssueKind,
 	)
 	return operation, err
 }
@@ -487,6 +499,7 @@ func GetOperation(db *sql.DB, id string) (models.Operation, error) {
 		&operation.Engine,
 		&operation.StartedAt,
 		&operation.FinishedAt,
+		&operation.IssueKind,
 	)
 	if err == nil {
 		operation.Steps, err = ListOperationSteps(db, operation.ID)

@@ -24,6 +24,7 @@ type DashboardIssue struct {
 	OperationID     string `json:"operationId,omitempty"`
 	Severity        string `json:"severity"`
 	Status          string `json:"status,omitempty"`
+	IssueKind       string `json:"issueKind,omitempty"`
 	Level           string `json:"level,omitempty"`
 	StartedAt       string `json:"startedAt,omitempty"`
 	FinishedAt      string `json:"finishedAt,omitempty"`

@@ -53,6 +53,9 @@ Terminal=false
 Categories=Utility;Archiving;
 Icon=replicaro
 DESKTOP
+# The unit is what Start at login runs, so it passes --no-startup-browser: a
+# login start shows only the tray icon instead of opening a browser window.
+# The tray icon and the app menu entry still open the web interface.
 cat > "$bundle/share/systemd/user/replicaro.service" <<SERVICE
 # Managed by Replicaro
 [Unit]
@@ -60,7 +63,7 @@ Description=Replicaro backup companion
 After=network-online.target
 [Service]
 Type=simple
-ExecStart="@REPLICARO_EXECUTABLE@"
+ExecStart="@REPLICARO_EXECUTABLE@" --no-startup-browser
 Restart=on-failure
 [Install]
 WantedBy=default.target

@@ -1483,6 +1483,29 @@ button.protection-ring { cursor: pointer; }
     max-height: 300px;
 }
 
+/* Native paths a locked-files backup skipped, in the operation details and
+   the timeline's log view. A long list scrolls instead of pushing the log
+   out of sight. */
+.skipped-locked-files ul {
+	max-height: 200px;
+	margin: 0;
+	padding: 0;
+	overflow: auto;
+	list-style: none;
+	color: var(--text-muted);
+	font-family: "JetBrains Mono", monospace;
+	font-size: 11.5px;
+	line-height: 1.7;
+}
+
+.skipped-locked-files li {
+	overflow-wrap: anywhere;
+}
+
+.timeline-event .skipped-locked-files {
+	margin: 12px 0 8px;
+}
+
 .log-page-controls {
 	display: flex;
 	align-items: center;
@@ -1759,15 +1782,16 @@ button.protection-ring { cursor: pointer; }
     visibility: visible;
 }
 
-/* Restore path tooltips escape the sticky panel's scroll container so the
-   complete rooted path remains readable at every panel boundary. */
-.find-full-path-tooltip {
+/* FloatingTooltip popups live in <body> with a fixed position, so a list or
+   panel that clips its content (the File History results list, browse tree
+   and restore-selection panel) can't cut them off. */
+.floating-tooltip {
     position: fixed;
     z-index: 60;
     overflow-wrap: anywhere;
 }
 
-.find-full-path-tooltip.open {
+.floating-tooltip.open {
     opacity: 1;
     transform: translateY(0);
 }
@@ -1816,6 +1840,14 @@ button.protection-ring { cursor: pointer; }
 
 .flow-glyph > .flow-status {
     text-align: center;
+}
+
+/* "Completed · locked files skipped" is too long for one line in most
+   languages, so it wraps instead of being cut with an ellipsis. Every other
+   status keeps the single line above. */
+.flow-glyph > .flow-status-wrap {
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .flow-glyph > .flow-status-action {
@@ -3168,10 +3200,8 @@ select option {
 }
 
 /* Job-name labels for managed snapshots. Job names have no length limit, so
-   the name is truncated with an ellipsis; the trigger itself stays unclipped
-   so the "Job source:" tooltip can render outside it. */
+   the name inside the label is truncated with an ellipsis. */
 .job-source-label.tooltip-trigger {
-    overflow: visible;
     min-width: 0;
     max-width: 100%;
 }
@@ -3183,8 +3213,9 @@ select option {
     white-space: nowrap;
 }
 
-/* The source line of a search result clips long paths; a job label truncates
-   itself instead so its tooltip is not clipped with it. */
+/* The source line of a search result clips long paths. A job label
+   truncates itself instead, so the line doesn't clip, which would cut off
+   the label's focus outline. */
 .find-result-main .mono.job-source-line {
     display: flex;
     gap: 0.5ch;
@@ -5399,10 +5430,33 @@ input, select, textarea { font-size: 14.5px; }
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	/* Lay out the label by its own text direction. A Latin label such as an S3
-	   endpoint in a right-to-left page would otherwise be cut at its start,
-	   showing only its end. */
+	/* Lay out the label by its own text direction. A Latin label such as an
+	   Any Rclone Remote address in a right-to-left page would otherwise be cut
+	   at its start, showing only its end. */
 	unicode-bidi: plaintext;
+}
+
+/* S3 and WebDAV labels ("s3: <endpoint>"): the prefix stays whole and only
+   the endpoint is cut, at its start. The box is fixed left-to-right, like
+   the label's own text, so the prefix stays on the left in a right-to-left
+   page too. The endpoint box is rtl only to put the ellipsis on its left;
+   its <bdi dir="ltr"> keeps the characters in order. */
+.protect-page .connector-label-text.connector-label-split {
+	display: flex;
+	direction: ltr;
+}
+
+.protect-page .connector-label-prefix {
+	flex: none;
+	/* Keep the space after the colon at the end of the flex item. */
+	white-space: pre;
+}
+
+.protect-page .connector-label-endpoint {
+	min-width: 0;
+	overflow: hidden;
+	direction: rtl;
+	text-overflow: ellipsis;
 }
 
 /* A pending creation card has no remote label chip, and its status chip can

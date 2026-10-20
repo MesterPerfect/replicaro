@@ -105,6 +105,10 @@ type startupOptions struct {
 	// repairInstallation is set by --repair-replicaro. It replaces a damaged
 	// installation ID without asking; an intact one is left alone.
 	repairInstallation bool
+	// noStartupBrowser is set by --no-startup-browser. It applies to this
+	// process only and is never saved, so a later start without it opens the
+	// web interface as usual.
+	noStartupBrowser bool
 	// help is set by --help or -h. When it is set, every other field is left
 	// empty and run() only prints startupUsage.
 	help bool
@@ -138,6 +142,10 @@ Options:
       If Replicaro reports that it has been damaged, repair it and start.
       You'll need to reconnect your vaults afterwards. Does nothing when
       Replicaro isn't damaged.
+  --no-startup-browser
+      Don't open Replicaro in your browser on start. If it's already
+      running, just exit. The tray or menu bar icon still opens it. Start
+      at login uses this.
   --help, -h
       Show this help and exit.
 `
@@ -236,6 +244,13 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 			options.repairInstallation = true
 		case strings.HasPrefix(argument, "--repair-replicaro="):
 			return startupOptions{}, fmt.Errorf("--repair-replicaro does not accept a value")
+		case argument == "--no-startup-browser":
+			if options.noStartupBrowser {
+				return startupOptions{}, fmt.Errorf("--no-startup-browser may be supplied only once")
+			}
+			options.noStartupBrowser = true
+		case strings.HasPrefix(argument, "--no-startup-browser="):
+			return startupOptions{}, fmt.Errorf("--no-startup-browser does not accept a value")
 		case strings.HasPrefix(argument, "--help="), strings.HasPrefix(argument, "-h="):
 			// Handled like the other options that take no value, which reject
 			// one (see --headless=), rather than showing help or ignoring it.
@@ -424,8 +439,9 @@ func isNoBufferSpaceError(err error) bool {
 
 // acquireRuntimeOwnership is the single production and process-test seam for
 // the instance guard, stale rendezvous cleanup, and loopback listener
-// selection. A losing instance opens the running owner's web interface and
-// never creates a listener; the returned bool reports that hand-off.
+// selection. A losing instance opens the running owner's web interface
+// (unless it was started with --no-startup-browser) and never creates a
+// listener; the returned bool reports that hand-off.
 func acquireRuntimeOwnership(root string, explicitPort ...int) (*runtimeOwnership, bool, error) {
 	return acquireRuntimeOwnershipWithListener(root, func() (net.Listener, runtimeendpoint.Endpoint, error) {
 		if len(explicitPort) > 1 {
@@ -505,10 +521,11 @@ func acquireRuntimeOwnershipWithListener(
 
 // openRunningInstance is the whole second-launch path: read the running
 // owner's URL from its rendezvous record, open it in the browser from this
-// process, and let the caller exit. There's deliberately no request to the
-// running instance. Only local programs can read the owner-only record, and
-// Replicaro doesn't defend against those; web pages can't read it, and the API
-// keeps them out with its Host, Origin, Fetch-Metadata, JSON and
+// process, and let the caller exit. With --no-startup-browser it reads and
+// opens nothing and the caller just exits. There's deliberately no request to
+// the running instance. Only local programs can read the owner-only record,
+// and Replicaro doesn't defend against those; web pages can't read it, and
+// the API keeps them out with its Host, Origin, Fetch-Metadata, JSON and
 // installation-UUID checks. Opening the URL from here also lets the browser
 // come forward with the focus the user just gave this launch.
 //
@@ -516,6 +533,16 @@ func acquireRuntimeOwnershipWithListener(
 // decision: it would only guard against local programs, and tools that read
 // the record still find the same fields.
 func openRunningInstance(root string) error {
+	// With --no-startup-browser this launch was asked not to open the web
+	// interface, and the running instance already serves, so there's nothing
+	// left to do. It exits at once instead of waiting up to
+	// secondLaunchPublicationWait for the record it wouldn't use. This keeps a
+	// scheduled task, login item or script that starts Replicaro again while
+	// it runs from opening a browser.
+	if desktop.NoStartupBrowser() {
+		log.Print("Replicaro is already running; not opening the web interface because of --no-startup-browser")
+		return nil
+	}
 	target, err := rendezvous.WaitForRunningURL(filepath.Join(root, rendezvous.FileName), secondLaunchPublicationWait)
 	if err != nil {
 		return err
@@ -1002,10 +1029,17 @@ func run() (result error) {
 		return err
 	}
 	headlessStart = headlessServiceMode(runtime.GOOS, options)
+	// Set before the instance guard: a second launch decides from it whether
+	// to open the running instance's web interface.
+	desktop.SetNoStartupBrowser(options.noStartupBrowser)
 	if options.containerPublishedPort != nil {
 		if err := requireContainerRuntime(); err != nil {
 			return err
 		}
+		// The image has zone files, so in Docker Restic, Kopia and rclone
+		// follow TZ like the rest of the container. Desktop builds never get
+		// here and keep their engines on the system's time zone.
+		command.InheritTimeZone()
 		if err := settleContainerUser(options.noRoot, options.noRootUser); err != nil {
 			return err
 		}

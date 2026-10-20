@@ -8,6 +8,7 @@ import {
 	getDashboardIssues,
 	getActiveOperations,
 	getOperationLive,
+	getOperationLockedFiles,
 	getOperationLog,
 	cancelOperation,
 	getDashboardTimeline,
@@ -32,7 +33,7 @@ import type {
 	OperationLiveResponse,
     Repository,
 } from "../types";
-import { dashboardIssueEvent, logTag, logTagLabel } from "./dashboardIssue";
+import { completedWithIssuesTag, dashboardIssueEvent, lockedFilesSkipped, logTag, logTagLabel } from "./dashboardIssue";
 import type { TimelineEvent } from "./dashboardIssue";
 import { formatReadableLog, noSummaryDiagnosticsLine } from "./nativeLogFormat";
 import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
@@ -99,7 +100,7 @@ function appendOlderTimelineBatch(feed: TimelineFeed, batch: DashboardTimeline):
 	};
 }
 
-const logPresentation = (kind?: string) => ({concise: true, operationKind: kind, maintenanceOnly: kind === "prune" || kind === "maintenance"});
+const logPresentation = (kind?: string, lockedFiles = false) => ({concise: true, operationKind: kind, maintenanceOnly: kind === "prune" || kind === "maintenance", lockedFilesSkipped: lockedFiles});
 
 // Backup, restore, integrity check, and maintenance results get one fixed line
 // of advice under the errors / warnings summary heading, but only when that
@@ -240,7 +241,7 @@ function operationTag(entry: OperationEntry) {
     if (entry.status === "interrupted") return t("ui.operation.stopped");
     if (entry.status === "failed") return t("ui.operation.failed");
 	if (entry.status === "reconnect_required") return t("ui.operation.reconnectRequired");
-    if (entry.status === "completed_with_issues") return t("ui.operation.completedWithIssues");
+    if (entry.status === "completed_with_issues") return completedWithIssuesTag(entry.issueKind);
     if (entry.status === "partial") return t("ui.operation.partial");
     if (entry.status === "success" && (entry.kind === "backup" || entry.kind === "restore")) return t("ui.operation.success");
     return operationKindLabel(entry.kind);
@@ -370,6 +371,40 @@ function activeOperationProgress(entry: OperationEntry) {
 function backupCompletedWithIssues(operation?: OperationEntry, event?: TimelineEvent) {
     return (operation?.kind ?? event?.operationKind) === "backup" &&
         (operation?.status ?? event?.operationStatus) === "completed_with_issues";
+}
+
+function backupLockedFilesSkipped(operation?: OperationEntry, event?: TimelineEvent) {
+    return backupCompletedWithIssues(operation, event) &&
+        lockedFilesSkipped("completed_with_issues", operation ? operation.issueKind : event?.operationIssueKind);
+}
+
+// The files a "locked files skipped" backup left out, listed in its details.
+// They are fetched each time the details are shown rather than kept with the
+// run, since the backend reads them from the saved log. The paths are the
+// engine's own and are shown as given. While loading, or when there are none,
+// nothing is shown; a failed read gets one quiet line.
+function SkippedLockedFiles({ operationID }: { operationID: string }) {
+    const [result, setResult] = useState<{ operationID: string; files?: string[]; failed?: boolean } | null>(null);
+    useEffect(() => {
+        const controller = new AbortController();
+        getOperationLockedFiles(operationID, controller.signal)
+            .then((response) => setResult({ operationID, files: Array.isArray(response?.files) ? response.files : [] }))
+            .catch((reason) => {
+                if (!(reason instanceof DOMException && reason.name === "AbortError")) setResult({ operationID, failed: true });
+            });
+        return () => controller.abort();
+    }, [operationID]);
+    if (result?.operationID !== operationID) return null;
+    if (result.failed) return <p className="muted">{t("ui.overview.skippedLockedFilesLoadFailed")}</p>;
+    if (!result.files?.length) return null;
+    return (
+        <div className="skipped-locked-files">
+            <div className="modal-section-label">{t("ui.overview.skippedLockedFiles")}</div>
+            <ul aria-label={t("ui.overview.skippedLockedFiles")}>
+                {result.files.map((file, index) => <li key={`${index}:${file}`}><bdi dir="ltr" translate="no">{file}</bdi></li>)}
+            </ul>
+        </div>
+    );
 }
 
 export default function Overview() {
@@ -781,7 +816,7 @@ export default function Overview() {
 					try {
 						const completed = await completedLogPager.current.read(
                             offset => getOperationLog(response.operation.id, controller!.signal, offset),
-                            () => active && generation === activeDetailGeneration.current, response.operation.engine, backupCompletedWithIssues(response.operation), logPresentation(response.operation.kind));
+                            () => active && generation === activeDetailGeneration.current, response.operation.engine, backupCompletedWithIssues(response.operation), logPresentation(response.operation.kind, backupLockedFilesSkipped(response.operation)));
 						if (active && generation === activeDetailGeneration.current) {
 							setCompletedOperationLog(completed.available ? completed.output : "");
 							setCompletedOperationLogPage(completed);
@@ -820,6 +855,7 @@ export default function Overview() {
         page?: OperationLogResponse | null, live = false) => {
         return formatReadableLog(text, {
             operationStatus: operation?.status ?? event?.operationStatus,
+            operationIssueKind: operation ? operation.issueKind : event?.operationIssueKind,
             operationKind: operation?.kind ?? event?.operationKind,
             engine: operation?.engine ?? event?.engine ?? openOutputEngine,
         }, live, page?.readableBody, page?.readableDiagnostics);
@@ -849,6 +885,7 @@ export default function Overview() {
                 operationKind: operation.kind,
                 operationID: operation.id,
                 operationStatus: operation.status,
+                operationIssueKind: operation.issueKind,
 				engine: operation.engine,
                 tone: operationOutcomeTone(operation.status),
                 tag: operationTag(operation),
@@ -1076,7 +1113,7 @@ export default function Overview() {
 					: getOperation(event.operationID).then((matches) => matches[0]?.engine).catch(() => undefined);
 				const [log, engine] = await Promise.all([timelineLogPager.current.read(
                     offset => offset === 0 ? getOperationLog(event.operationID!) : getOperationLog(event.operationID!, undefined, offset),
-                    () => requestSequence === timelineOutputRequestSequence.current, event.engine, backupCompletedWithIssues(operations.find(operation => operation.id === event.operationID), event), logPresentation(event.operationKind)), operationEngine]);
+                    () => requestSequence === timelineOutputRequestSequence.current, event.engine, backupCompletedWithIssues(operations.find(operation => operation.id === event.operationID), event), logPresentation(event.operationKind, backupLockedFilesSkipped(operations.find(operation => operation.id === event.operationID), event))), operationEngine]);
 				if (requestSequence !== timelineOutputRequestSequence.current) return;
 				setOpenOutputText(log.available ? log.output : "");
 				setOpenOutputPage(log);
@@ -1361,6 +1398,7 @@ export default function Overview() {
 								})}
 							</div>
 						)}
+						{backupLockedFilesSkipped(detailedOperation) && <SkippedLockedFiles operationID={detailedOperation.id} />}
 						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
                         {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>}
 						{detailedOperationActive ? !operationDetail ? (
@@ -1471,6 +1509,7 @@ export default function Overview() {
 								)}
 								{openOutput === event.id && (
 									<div>
+										{event.operationID && backupLockedFilesSkipped(operations.find(operation => operation.id === event.operationID), event) && <SkippedLockedFiles operationID={event.operationID} />}
 										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>
 										{/* Nothing inside the log output is translated, including these load states. */}
                                         <pre className="output timeline-output">{openOutputLoadFailed

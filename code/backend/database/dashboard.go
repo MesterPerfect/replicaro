@@ -164,6 +164,7 @@ func ListDashboardIssues(db *sql.DB, limit int, cursor string) (models.Dashboard
 				kind AS operation_kind,
 				id AS operation_id,
 				status,
+				issue_kind,
 				'' AS level,
 				started_at,
 				finished_at,
@@ -182,6 +183,7 @@ func ListDashboardIssues(db *sql.DB, limit int, cursor string) (models.Dashboard
 				'' AS operation_kind,
 				'' AS operation_id,
 				'' AS status,
+				'' AS issue_kind,
 				level,
 				'' AS started_at,
 				'' AS finished_at,
@@ -194,7 +196,7 @@ func ListDashboardIssues(db *sql.DB, limit int, cursor string) (models.Dashboard
 			SELECT issue_rows.*, `+dashboardSortKeyColumns+`
 			FROM issue_rows
 		)
-		SELECT id, timestamp, kind, is_new, operation_kind, operation_id, status, level,
+		SELECT id, timestamp, kind, is_new, operation_kind, operation_id, status, issue_kind, level,
 		       started_at, finished_at, title, output_available,
 		       sort_seconds, sort_nanos
 		FROM ordered_issues
@@ -239,6 +241,7 @@ func ListDashboardIssues(db *sql.DB, limit int, cursor string) (models.Dashboard
 			&issue.OperationKind,
 			&issue.OperationID,
 			&issue.Status,
+			&issue.IssueKind,
 			&issue.Level,
 			&issue.StartedAt,
 			&issue.FinishedAt,

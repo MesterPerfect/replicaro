@@ -8,6 +8,7 @@
 #import "native_darwin.h"
 
 extern void replicaroOpenRequested(void);
+extern void replicaroLaunchOpenRequested(void);
 extern void replicaroTerminateRequested(void);
 extern int replicaroConfirmQuit(void);
 extern char *replicaroTrayLabel(int quit);
@@ -96,13 +97,34 @@ static NSString *replicaroLabel(int quit) {
         [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
             atomic_store(&replicaroNotificationStatus, (int)settings.authorizationStatus);
         }];
-        replicaroOpenRequested();
+        // Not replicaroOpenRequested: this open is skipped with
+        // --no-startup-browser, and the menu item and reopen below are not.
+        replicaroLaunchOpenRequested();
     }
 }
 
 - (void)openReplicaro:(id)sender {
     (void)sender;
     replicaroOpenRequested();
+}
+
+// Opening Replicaro from Finder, Launchpad or Spotlight while it's running
+// doesn't start a second process: Launch Services sends the running app a
+// reopen event instead. Replicaro is an LSUIElement app with no windows for
+// AppKit to bring forward, so without this handler the reopen would do
+// nothing at all. Opening the app is the user asking for it, so it opens the
+// web interface the same way the menu-bar Open item does, also when the app
+// was started with --no-startup-browser (as Start at login does). Returning
+// NO tells AppKit it has nothing more to do.
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    (void)sender;
+    (void)flag;
+    // As at launch, a process that is shutting down doesn't open the web UI.
+    if (atomic_load(&replicaroTerminating)) {
+        return NO;
+    }
+    replicaroOpenRequested();
+    return NO;
 }
 
 - (void)quitReplicaro:(id)sender {

@@ -316,6 +316,9 @@ export interface BackupJobTarget {
     engine: "restic" | "kopia";
     lastRun: string;
     lastStatus: string;
+    // Set only while lastStatus is "completed_with_issues": the qualifier of
+    // the backup run that set it.
+    lastIssueKind?: OperationIssueKind;
     operationId?: string;
     pendingCatchUp: boolean;
     coalescedMissedCount: number;
@@ -361,10 +364,17 @@ export type StorageAvailabilityReason =
     | "observation_timeout"
     | "observation_slots_exhausted";
 
+// Narrows a "completed_with_issues" backup without being a status of its own:
+// "locked_files" means every problem was a source file another program had
+// locked. Everything that ranks, counts or groups results keeps matching the
+// status, so only the label changes. Older backends never send it.
+export type OperationIssueKind = "locked_files";
+
 export interface OperationEntry {
     id: string;
     kind: string;
     status: "queued" | "running" | "success" | "failed" | "partial" | "completed_with_issues" | "interrupted" | "reconnect_required";
+    issueKind?: OperationIssueKind;
     title: string;
     jobId: string;
     repositoryId: string;
@@ -424,6 +434,7 @@ export interface DashboardIssue {
 	operationId?: string;
     severity?: "warning" | "error";
     status?: "failed" | "interrupted" | "partial" | "completed_with_issues" | "reconnect_required";
+    issueKind?: OperationIssueKind;
     level?: "ERROR" | "WARN";
     startedAt?: string;
     finishedAt?: string;

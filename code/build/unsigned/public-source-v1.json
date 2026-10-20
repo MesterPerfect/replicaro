@@ -1685,6 +1685,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/src/components/FloatingTooltip.tsx",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/src/components/JobScriptFields.tsx",
       "mode": "100644"
     },

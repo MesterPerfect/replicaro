@@ -10,10 +10,12 @@ const placeholderNames = (text) => [...text.matchAll(/\{([a-zA-Z][a-zA-Z0-9]*)\}
 const notificationContract = {
   'notifications.title.success': '',
   'notifications.title.completedWithIssues': '',
+  'notifications.title.completedLockedFilesSkipped': '',
   'notifications.title.failed': '',
   'notifications.message.success': 'taskName',
   'notifications.message.completedWithIssues': 'taskName',
   'notifications.message.backupNativeSucceededWithIssues': 'taskName',
+  'notifications.message.backupLockedFilesSkipped': 'count,taskName',
   'notifications.message.failed': 'taskName',
   'notifications.message.sourceUnavailable30Days': 'jobName',
   'notifications.message.vaultUnavailable30Days': 'jobName,vaultName',

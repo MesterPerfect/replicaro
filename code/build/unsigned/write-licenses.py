@@ -103,11 +103,11 @@ COMMON = [
 LINUX = ["godbus/dbus", "AppImage type 2 runtime"]
 
 
-def assemble(platform, openssh=None, tini=None):
+def assemble(platform, openssh=None, tini=None, tzdata=None):
     if platform not in {"windows", "macos", "linux", "container"}:
         raise ValueError("unsupported notice platform")
-    if (platform == "container") != (openssh is not None) or (platform == "container") != (tini is not None):
-        raise ValueError("OpenSSH and tini notices are required only for the container")
+    if any((platform == "container") != (notice is not None) for notice in (openssh, tini, tzdata)):
+        raise ValueError("OpenSSH, tini and tzdata notices are required only for the container")
     names = list(COMMON)
     if platform in {"linux", "container"}:
         names += LINUX
@@ -130,6 +130,11 @@ def assemble(platform, openssh=None, tini=None):
         if not content or b"\x00" in content:
             raise ValueError("invalid tini notice source")
         sections.append(b"===== tini =====\n" + content.rstrip(b"\n") + b"\n")
+    if tzdata is not None:
+        content = pathlib.Path(tzdata).read_bytes()
+        if not content or b"\x00" in content:
+            raise ValueError("invalid tzdata notice source")
+        sections.append(b"===== tzdata =====\n" + content.rstrip(b"\n") + b"\n")
     return b"Replicaro licenses and third-party notices\n\n" + b"\n".join(sections)
 
 
@@ -138,12 +143,13 @@ def main():
     parser.add_argument("--platform", choices=("windows", "macos", "linux", "container"), required=True)
     parser.add_argument("--openssh-license", type=pathlib.Path)
     parser.add_argument("--tini-license", type=pathlib.Path)
+    parser.add_argument("--tzdata-license", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     output = args.output
     if output.exists() or output.is_symlink() or not output.parent.is_dir():
         parser.error("notice output must be a new file in an existing directory")
-    output.write_bytes(assemble(args.platform, args.openssh_license, args.tini_license))
+    output.write_bytes(assemble(args.platform, args.openssh_license, args.tini_license, args.tzdata_license))
 
 
 if __name__ == "__main__":

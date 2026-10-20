@@ -171,7 +171,8 @@ func (e *resticEngine) Backup(ctx context.Context, repo models.Repository, sourc
 	}
 	if runErr != nil {
 		if partial, confirmed := resticPartialSnapshot(capture, runErr); confirmed {
-			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr}
+			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr,
+				LockedFiles: resticLockedFiles(capture, source, lockedFilesOS)}
 		}
 		reportBackupStorageFull(ctx, repo, capture, source, options.LogicalSource)
 		return models.Snapshot{}, out, runErr

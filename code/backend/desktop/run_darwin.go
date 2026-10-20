@@ -100,9 +100,31 @@ func (desktop *darwinDesktop) requestQuit() {
 	desktop.quitOnce.Do(func() { close(desktop.quit) })
 }
 
+// openWebUI opens the web interface for the menu-bar Open item, a reopen of
+// the running app, and the launch. It's a variable so tests can check which
+// of them open it without a browser.
+var openWebUI = func() error { return openWebUIURL(currentWebUIURL()) }
+
+// replicaroOpenRequested is called on the main thread for the menu-bar Open
+// item and when the running app is opened again from Finder, Launchpad or
+// Spotlight. Both are the user asking for the web interface, so they open it
+// even with --no-startup-browser.
+//
 //export replicaroOpenRequested
 func replicaroOpenRequested() {
-	_ = openWebUIURL(currentWebUIURL())
+	_ = openWebUI()
+}
+
+// replicaroLaunchOpenRequested is called on the main thread once the app has
+// finished launching. --no-startup-browser skips only this open, which is why
+// it has its own entry point: gating replicaroOpenRequested instead would also
+// stop the menu-bar Open item and a reopen from working.
+//
+//export replicaroLaunchOpenRequested
+func replicaroLaunchOpenRequested() {
+	if !NoStartupBrowser() {
+		_ = openWebUI()
+	}
 }
 
 // replicaroTerminateRequested is called on the main thread when AppKit asks
@@ -185,8 +207,10 @@ const terminateReplyLimit = 15 * time.Second
 //
 // Double-clicking the .app while Replicaro runs doesn't get here: Launch
 // Services sends the running app a reopen event instead of starting a second
-// process. This path is for a second process started some other way, such as
-// from a terminal, a login item or open -n.
+// process, and the running app opens the web interface itself (see
+// applicationShouldHandleReopen: in native_darwin.m). This path is for a
+// second process started some other way, such as from a terminal, a login
+// item or open -n.
 //
 // open normally returns within a second. The timeout only keeps a wedged
 // Launch Services from leaving this process hanging around; the second launch

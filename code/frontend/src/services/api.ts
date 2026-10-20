@@ -319,6 +319,11 @@ export const getActiveOperations = () =>
 export const getOperationLive = (id: string, signal?: AbortSignal) =>
 	request<OperationLiveResponse>(`/api/operations/live?id=${encodeURIComponent(id)}`, { signal });
 
+// The files a "locked_files" backup skipped. The backend reads them from the
+// operation's saved log on each request, so nothing extra is stored per run.
+export const getOperationLockedFiles = (id: string, signal?: AbortSignal) =>
+	request<{ files: string[] }>(`/api/operations/locked-files?id=${encodeURIComponent(id)}`, { signal });
+
 type OperationLogWireResponse = Omit<OperationLogResponse, "output" | "rawBytes" | "readableBody" | "readableDiagnostics"> & {
 	outputBase64: string;
 	rawOutputBase64?: string;

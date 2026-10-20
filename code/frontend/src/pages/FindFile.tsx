@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
+import { FloatingTooltip } from "../components/FloatingTooltip";
 import { JobSourceLabel } from "../components/JobSourceLabel";
 import { fileHistorySourceJob, jobSourceTooltip, pathWithinJob } from "../jobSourceDisplay";
 import { displayPath } from "../nativePathDisplay";
@@ -194,72 +195,29 @@ function splitDisplayPath(value: string, windows = false) {
 // withinJob: the row belongs to a job-owned source, so its tooltip shows the
 // item's path within the job (for example 2024\IMG_001.jpg) instead of a full
 // native path. Unmanaged sources keep the native presentation.
-function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean }) {
+//
+// tooltipPath (the restore-selection panel) and floating (the search results
+// list) render the tooltip with FloatingTooltip, because both boxes clip a
+// popup rendered inside the label. The other callers are in a Modal and keep
+// the shared Tooltip, which opens above the dialog.
+function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false, floating = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean; floating?: boolean }) {
     const path = displayFilePath(value, source);
 	const tooltipPath = withinJob && nativeTooltipPath !== undefined ? pathWithinJob(value, source ?? "") : nativeTooltipPath;
     const parts = splitDisplayPath(path, path.startsWith("\\") && !value.includes("\\"));
-    const id = useId();
-    const triggerRef = useRef<HTMLSpanElement>(null);
-    const tooltipRef = useRef<HTMLSpanElement>(null);
-    const [tooltipOpen, setTooltipOpen] = useState(false);
-    const [tooltipPosition, setTooltipPosition] = useState<{ left: number; top: number }>();
-
-    useEffect(() => {
-        if (!tooltipPath || !tooltipOpen) return;
-        const positionTooltip = () => {
-            const trigger = triggerRef.current;
-            const tooltip = tooltipRef.current;
-            if (!trigger || !tooltip) return;
-            const triggerBox = trigger.getBoundingClientRect();
-            const tooltipBox = tooltip.getBoundingClientRect();
-            const left = Math.max(16, Math.min(triggerBox.left, window.innerWidth - tooltipBox.width - 16));
-            const below = triggerBox.bottom + 8;
-            const top = below + tooltipBox.height <= window.innerHeight - 16
-                ? below
-                : Math.max(16, triggerBox.top - tooltipBox.height - 8);
-            setTooltipPosition({ left, top });
-        };
-        positionTooltip();
-        window.addEventListener("resize", positionTooltip);
-        document.addEventListener("scroll", positionTooltip, true);
-        return () => {
-            window.removeEventListener("resize", positionTooltip);
-            document.removeEventListener("scroll", positionTooltip, true);
-        };
-    }, [tooltipOpen, tooltipPath]);
-
-    const label = <span className="file-path-label"><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></span>;
+    const text = <><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></>;
     if (tooltipPath) return (
-        <span
-            ref={triggerRef}
-            className="file-path-label tooltip-trigger"
-            tabIndex={0}
-            aria-label={tooltipPath}
+        <FloatingTooltip
+            className="file-path-label"
+            content={tooltipPath}
+            label={tooltipPath}
             title={withinJob ? undefined : `${t("ui.restore.backupSourceTooltip", { source: source ?? "" })}\n${t("ui.restore.snapshotPathTooltip", { path: value })}`}
-            aria-describedby={id}
-            onMouseEnter={() => { setTooltipPosition(undefined); setTooltipOpen(true); }}
-            onMouseLeave={() => setTooltipOpen(false)}
-            onFocus={() => { setTooltipPosition(undefined); setTooltipOpen(true); }}
-            onBlur={() => setTooltipOpen(false)}
-        >
-            <span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span>
-            {createPortal(
-                <span
-                    ref={tooltipRef}
-                    id={id}
-                    className={`tooltip-popup find-full-path-tooltip${tooltipOpen ? " open" : ""}`}
-                    role="tooltip"
-                    style={tooltipOpen && tooltipPosition
-                        ? { left: tooltipPosition.left, top: tooltipPosition.top, visibility: "visible" }
-                        : { visibility: "hidden" }}
-                >{tooltipPath}</span>,
-                document.body,
-            )}
-        </span>
+        >{text}</FloatingTooltip>
     );
+    const content = withinJob ? pathWithinJob(value, source ?? "") : path;
+    if (floating) return <FloatingTooltip className="file-path-label" content={content} label={content}>{text}</FloatingTooltip>;
     return (
-        <Tooltip content={withinJob ? pathWithinJob(value, source ?? "") : path}>
-            {label}
+        <Tooltip content={content}>
+            <span className="file-path-label">{text}</span>
         </Tooltip>
     );
 }
@@ -1120,9 +1078,10 @@ function VaultFileHistory({
             : t("ui.fileHistory.selectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source });
 		const disabledMessage = item.isSource ? "" : parentSelectionMessage(item);
 		// Source rows of a job show the job name with the "Job source:" tooltip;
-		// item rows under it show their path within the job.
+		// item rows under it show their path within the job. The browse tree
+		// clips its content like the results list, so the tooltip is floating.
 		const rowLabel = job
-			? <Tooltip content={item.isSource ? jobSourceTooltip(job) : pathWithinJob(item.path, item.source)}><span className="job-source-label" aria-label={label}><strong className="job-source-name">{label}</strong></span></Tooltip>
+			? <FloatingTooltip content={item.isSource ? jobSourceTooltip(job) : pathWithinJob(item.path, item.source)} label={label} className="job-source-label"><strong className="job-source-name">{label}</strong></FloatingTooltip>
 			: <strong>{label}</strong>;
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
@@ -1186,7 +1145,7 @@ function VaultFileHistory({
 								const checked = Boolean(selectedItems[key]);
 								const path = displayFilePath(result.path, result.source);
 								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
-								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} withinJob={Boolean(sourceJob(result.source))} /></strong>{(() => { const job = sourceJob(result.source); return job
+								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} withinJob={Boolean(sourceJob(result.source))} floating /></strong>{(() => { const job = sourceJob(result.source); return job
 									? <span className="mono job-source-line">{t("ui.fileHistory.sourceLabel")} <JobSourceLabel job={job} /></span>
 									: <span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span>; })()}</span></label>;
 							})}</div>

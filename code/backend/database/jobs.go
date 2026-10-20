@@ -366,6 +366,16 @@ func populateJobTargets(db *sql.DB, job *models.BackupJob) error {
 				WHERE o.job_id = t.job_id AND o.repository_id = t.repository_id
 				  AND o.status IN ('queued', 'running')
 				ORDER BY o.started_at DESC, o.id DESC LIMIT 1), ''),
+			-- last_status has no qualifier of its own. FinishBackupOperationWithIssueKind
+			-- sets it in the same transaction as the operation's status and issue_kind,
+			-- so the qualifier is read from the target's newest finished backup
+			-- operation by finished_at. If the clock moved backwards between two runs,
+			-- the previous run's qualifier can show until the next backup finishes.
+			-- An older build, or a pruned operation, leaves '' (plain result).
+			CASE WHEN t.last_status = 'completed_with_issues' THEN COALESCE((SELECT o.issue_kind FROM operations o
+				WHERE o.job_id = t.job_id AND o.repository_id = t.repository_id
+				  AND o.kind = 'backup' AND o.status NOT IN ('queued', 'running')
+				ORDER BY o.finished_at DESC, o.started_at DESC, o.id DESC LIMIT 1), '') ELSE '' END,
 			s.pending_catchup, s.coalesced_missed_count, s.first_deferred_due_at, s.last_due_at,
 			s.source_availability, s.source_reason_code, s.source_checked_at,
 			s.target_availability, s.target_reason_code, s.target_checked_at,
@@ -390,7 +400,7 @@ func populateJobTargets(db *sql.DB, job *models.BackupJob) error {
 		var target models.BackupJobTarget
 		if err := rows.Scan(&target.RepositoryID, &target.RepositoryName, &target.Engine,
 			&target.LastRun, &target.LastStatus, &target.LogicalSizeBytes, &target.LogicalSizeMeasuredAt, &target.OperationID,
-			&target.PendingCatchUp, &target.CoalescedMissedCount,
+			&target.LastIssueKind, &target.PendingCatchUp, &target.CoalescedMissedCount,
 			&target.FirstDeferredDueAt, &target.LastDueAt,
 			&target.SourceAvailability, &target.SourceAvailabilityReason,
 			&target.SourceAvailabilityCheck, &target.TargetAvailability,

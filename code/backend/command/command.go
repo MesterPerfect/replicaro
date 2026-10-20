@@ -1048,6 +1048,28 @@ var minimalEnvironmentNames = []string{"PATH", "HOME", "USERPROFILE", "HOMEDRIVE
 // would otherwise keep Replicaro's value whenever the cases differ.
 var networkEnvironmentNames = []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 
+// timeZoneEnvironmentNames are inherited only in the Docker package, after
+// InheritTimeZone. There TZ is how the user sets the container's time zone,
+// and Restic, Kopia and rclone should use the same zone as Replicaro's
+// schedules, its hooks and the image's own tools. Desktop builds never
+// inherit it: their engines follow the system's time zone, as before.
+//
+// TZ is kept out of minimalEnvironmentNames for the same reason as the
+// network names: an Any Rclone Remote vault refuses the minimal names, and it
+// checks that on every use, not only when saved, so a vault saved with its
+// own TZ would stop working. Here a vault's TZ replaces the inherited one.
+var timeZoneEnvironmentNames = []string{"TZ"}
+
+var inheritTimeZone atomic.Bool
+
+// InheritTimeZone makes every later engine and rclone child inherit TZ from
+// Replicaro's environment. main calls it once at startup, only after it has
+// confirmed that it is running in the Docker package. Don't call it for a
+// desktop build.
+func InheritTimeZone() {
+	inheritTimeZone.Store(true)
+}
+
 // MinimalEnvironmentNames returns the names a native child inherits from
 // Replicaro's environment. Callers that accept variables from the user refuse
 // these so the inherited values can't be replaced.
@@ -1074,16 +1096,22 @@ func ProxyEnvironmentValues() []string {
 }
 
 // nativeEnvironment is the complete environment of an engine or rclone child:
-// the minimal and network names from Replicaro's environment, then overrides,
-// which win.
+// the minimal and network names from Replicaro's environment (and TZ in the
+// Docker package), then overrides, which win.
 func nativeEnvironment(overrides []string) []string {
 	minimal := map[string]bool{}
 	for _, name := range minimalEnvironmentNames {
 		minimal[strings.ToUpper(name)] = true
 	}
-	network := map[string]bool{}
+	// The network names, and TZ when inherited, give way to an override.
+	overridable := map[string]bool{}
 	for _, name := range networkEnvironmentNames {
-		network[name] = true
+		overridable[name] = true
+	}
+	if inheritTimeZone.Load() {
+		for _, name := range timeZoneEnvironmentNames {
+			overridable[name] = true
+		}
 	}
 	overridden := map[string]bool{}
 	for _, item := range overrides {
@@ -1098,7 +1126,7 @@ func nativeEnvironment(overrides []string) []string {
 			continue
 		}
 		name := strings.ToUpper(key)
-		if minimal[name] || network[name] && !overridden[name] {
+		if minimal[name] || overridable[name] && !overridden[name] {
 			values[key] = value
 		}
 	}

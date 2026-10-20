@@ -250,7 +250,8 @@ func Migrate(db *sql.DB) error {
 		job_id TEXT NOT NULL DEFAULT '',
 		repository_id TEXT NOT NULL DEFAULT '',
 		started_at DATETIME NOT NULL,
-		finished_at DATETIME NOT NULL DEFAULT ''
+		finished_at DATETIME NOT NULL DEFAULT '',
+		issue_kind TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS operation_steps (
@@ -549,6 +550,14 @@ func Migrate(db *sql.DB) error {
 	// start at 0; the count only has to change, not mean anything absolute.
 	if err := addColumnIfMissing(tx, "repositories", "vault_size_dirty_count",
 		`INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0)`); err != nil {
+		return err
+	}
+	// A completed_with_issues backup can carry a qualifier such as
+	// "locked_files" (see models.OperationIssueLockedFiles). Existing rows get
+	// '' and keep showing plain completed with issues; they are not
+	// reclassified. The status values themselves are unchanged, so nothing
+	// that matches on them needs migrating.
+	if err := addColumnIfMissing(tx, "operations", "issue_kind", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)

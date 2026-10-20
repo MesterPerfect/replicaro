@@ -17,23 +17,23 @@
   },
   "runtime": {
     "releaseTag": "continuous",
-    "releaseId": 398504756,
-    "releaseCommit": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
-    "reviewedAt": "2026-09-30",
+    "releaseId": 417724209,
+    "releaseCommit": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+    "reviewedAt": "2026-10-20",
     "source": "https://github.com/AppImage/type2-runtime/releases/tag/continuous",
-    "license": "https://github.com/AppImage/type2-runtime/blob/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa/LICENSE",
+    "license": "https://github.com/AppImage/type2-runtime/blob/fedfad51acc2860b2916a1eef32ba4a500ff31ef/LICENSE",
     "artifacts": {
       "linux_amd64": {
         "filename": "runtime-x86_64",
-        "assetId": 596078161,
-        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/596078161",
-        "sha256": "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074"
+        "assetId": 657374641,
+        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
+        "sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46"
       },
       "linux_arm64": {
         "filename": "runtime-aarch64",
-        "assetId": 596077442,
-        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/596077442",
-        "sha256": "b4ff0030242d0c3bb12ce40541828303cf167493f4793456f0436edd6255c39d"
+        "assetId": 657373827,
+        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657373827",
+        "sha256": "9a72a744d221576c9347ec074243acc5c3c7568896b12714e0e82e9f0bf47900"
       }
     }
   }

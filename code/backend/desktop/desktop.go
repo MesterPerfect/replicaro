@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/local/replicaro/models"
@@ -103,6 +104,28 @@ func trayLabels() (open, quit string) {
 }
 
 var openDefaultBrowser = openWebUIURL
+
+// noStartupBrowserOption is the startup option that keeps Replicaro from
+// opening the web interface by itself when it starts. Start at login passes
+// it, so signing in shows only the tray or menu-bar icon, as with most tray
+// apps, instead of a browser window every time; the icon stays the way in.
+const noStartupBrowserOption = "--no-startup-browser"
+
+var noStartupBrowser atomic.Bool
+
+// SetNoStartupBrowser records whether this process was started with
+// --no-startup-browser. Call it before Run. It only skips the open Run does
+// by itself at startup: the tray icon, the tray and menu-bar Open item, and
+// on macOS reopening the running app still open the web interface.
+func SetNoStartupBrowser(skip bool) {
+	noStartupBrowser.Store(skip)
+}
+
+// NoStartupBrowser reports what SetNoStartupBrowser recorded. A second launch
+// reads it to decide whether to open the running instance's web interface.
+func NoStartupBrowser() bool {
+	return noStartupBrowser.Load()
+}
 
 func ConfigureEndpoint(endpoint runtimeendpoint.Endpoint) error {
 	if _, err := runtimeendpoint.ParseExact(endpoint.String()); err != nil {

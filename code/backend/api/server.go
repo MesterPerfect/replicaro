@@ -735,6 +735,40 @@ func handlerForExecutionInstanceWithReader(
 			"nextOffset": chunk.NextOffset, "size": chunk.Size, "eof": chunk.EOF})
 	})
 
+	// The files a "completed, locked files skipped" backup left out, read from
+	// its saved log when asked for. Any other operation has none.
+	handle(mux, "/api/operations/locked-files", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		operationID := r.URL.Query().Get("id")
+		parsed, parseErr := uuid.Parse(operationID)
+		if parseErr != nil || parsed == uuid.Nil || parsed.String() != operationID {
+			writeError(w, http.StatusBadRequest, errors.New("operation id is invalid"))
+			return
+		}
+		operation, err := database.GetOperation(readDB, operationID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, err)
+			} else {
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+		files := []string{}
+		if operation.Kind == "backup" && operation.Status == "completed_with_issues" && operation.IssueKind == models.OperationIssueLockedFiles {
+			err = operationlog.Scan(operationID, func(log io.Reader) error {
+				found, scanErr := engines.SkippedLockedFilesFromLog(log)
+				files = append(files, found...)
+				return scanErr
+			})
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		writeJSON(w, map[string]any{"files": files})
+	})
+
 	handle(mux, "/api/operations/cancel", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			OperationID string `json:"operationId"`

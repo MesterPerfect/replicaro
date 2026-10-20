@@ -106,7 +106,11 @@ desktop_target="$data_home/applications/replicaro.desktop"
 desktop_content=$(sed "s|@REPLICARO_EXECUTABLE@|$escaped_executable|g" "$bundle_dir/share/applications/replicaro.desktop")
 unit_target="$config_home/systemd/user/replicaro.service"
 unit_content=$(sed "s|@REPLICARO_EXECUTABLE@|$escaped_executable|g" "$bundle_dir/share/systemd/user/replicaro.service")
-legacy_unit_content=$(printf '%s\n' "$unit_content" | sed '1{/^# Managed by Replicaro$/d;}')
+unmarked_unit_content=$(printf '%s\n' "$unit_content" | sed '1{/^# Managed by Replicaro$/d;}')
+# An unmarked unit from an older install is still ours when it matches the
+# template without the marker line and without --no-startup-browser, which
+# older units didn't pass. Keep comparing against that older form.
+legacy_unit_content=$(printf '%s\n' "$unmarked_unit_content" | sed 's/^\(ExecStart=.*\) --no-startup-browser$/\1/')
 
 validate_startup_target() {
 	target=$1
@@ -152,7 +156,7 @@ else
 fi
 trap - EXIT HUP INT TERM
 { printf '%s\n' '# Managed by Replicaro'; printf '%s\n' "$desktop_content"; } > "$desktop_target"
-{ printf '%s\n' '# Managed by Replicaro'; printf '%s\n' "$legacy_unit_content"; } > "$unit_target"
+{ printf '%s\n' '# Managed by Replicaro'; printf '%s\n' "$unmarked_unit_content"; } > "$unit_target"
 
 if [ "${REPLICARO_SKIP_SYSTEMD:-0}" != 1 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload || true

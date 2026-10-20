@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,7 @@ type targetTask struct {
 	fullSourceRead      bool
 	sourceFailureReason string
 	targetFailureReason string
+	lockedFiles         []string // see lockedFilesSkipped; selects the issue kind and notification text
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	quarantined         bool
@@ -83,7 +85,7 @@ var (
 	executorMu              sync.RWMutex
 	executor                contextTargetExecutor = defaultExecutorContext
 	finisherMu              sync.RWMutex
-	finisher                OperationFinisher = database.FinishBackupOperation
+	finisher                OperationFinisher = database.FinishBackupOperationWithIssueKind
 	resolveBackupEngine                       = func(repo models.Repository) (engines.Engine, error) {
 		return engines.Resolve(repo)
 	}
@@ -167,6 +169,8 @@ func taskCanceledStage(taskErr, stageErr error) bool {
 //     completed_with_issues;
 //  4. otherwise success.
 //
+// lockedFilesSkipped then narrows step 3 without changing the status.
+//
 // The engine reports any context error as interrupted, internal time limits
 // included (for example a sidecar read in the final writer check). Such a
 // result is interrupted only when taskErr shows that this task's own context
@@ -182,6 +186,28 @@ func classifyBackupRunStatus(runErr, taskErr error) string {
 		return "completed_with_issues"
 	}
 	return status
+}
+
+// lockedFilesSkipped returns the skipped files when a completed_with_issues
+// backup has nothing but recognized lock errors behind it: the run error
+// consists only of saved-partial source-read failures and the engine reader
+// found every one of their errors to be a lock held by another program (see
+// engines.BackupLockedFiles). A failed optional script, a follow-up or
+// bookkeeping failure, or any other error keeps the plain result, and nothing
+// that isn't completed_with_issues is touched.
+//
+// This is a qualifier on completed_with_issues, not a status of its own: the
+// snapshot is just as incomplete, so retention, health and statistics, the
+// dashboard ordering and everything else that matches the status treat it
+// exactly the same.
+func lockedFilesSkipped(runErr error, status string) []string {
+	if status != "completed_with_issues" {
+		return nil
+	}
+	if _, optionalFailed := withoutOptionalScriptFailures(runErr); optionalFailed {
+		return nil
+	}
+	return engines.BackupLockedFiles(runErr)
 }
 
 // withoutOptionalScriptFailures removes optionalScriptFailure values from the
@@ -372,7 +398,9 @@ func combinedRunnerOutput(output string, err error) string {
 	return output + "\n" + err.Error()
 }
 
-type OperationFinisher func(*sql.DB, string, string, string, string, string, time.Time) error
+// OperationFinisher persists a backup's terminal state: db, operation ID, job
+// ID, repository ID, status, issue kind, output and finish time.
+type OperationFinisher func(*sql.DB, string, string, string, string, string, string, time.Time) error
 
 func NewCoordinator(db *sql.DB, limit int) *Coordinator {
 	return NewCoordinatorWithRuntime(db, limit, operationruntime.New())
@@ -1199,6 +1227,7 @@ func (c *Coordinator) run(task *targetTask) {
 			output = strings.TrimSpace(output + "\n" + note)
 		}
 	}
+	task.lockedFiles = lockedFilesSkipped(runErr, status)
 	finished := time.Now()
 	var dispatchNotification func()
 	if !pausedOccurrence {
@@ -1256,12 +1285,19 @@ func persistTerminalState(task *targetTask, status, output string, finished time
 		finisherMu.RLock()
 		currentFinisher := finisher
 		finisherMu.RUnlock()
-		err := currentFinisher(task.db, task.operationID, task.job.ID, task.target.RepositoryID, status, output, finished)
+		err := currentFinisher(task.db, task.operationID, task.job.ID, task.target.RepositoryID, status, backupIssueKind(task, status), output, finished)
 		if err != nil {
 			log.Printf("could not persist terminal backup state (attempt %d): %v", attempt, err)
 		}
 		return err
 	}, nil)
+}
+
+func backupIssueKind(task *targetTask, status string) string {
+	if status == "completed_with_issues" && len(task.lockedFiles) > 0 {
+		return models.OperationIssueLockedFiles
+	}
+	return ""
 }
 
 func (c *Coordinator) release(task *targetTask) {
@@ -1307,6 +1343,13 @@ func prepareBackupNotification(task *targetTask, status string) func() {
 			task.targetFailureReason == database.AvailabilityReasonUnavailableTooLong) {
 			event.MessageKey, event.MessageValues = unavailableTooLongText(
 				task.sourceFailureReason != "", task.job.Name, task.target.RepositoryName)
+		}
+		if issueKind := backupIssueKind(task, status); issueKind != "" {
+			// Same status, channels and switches as completed with issues, with
+			// its own title (chosen from IssueKind) and this message.
+			event.IssueKind = issueKind
+			event.MessageKey = "notifications.message.backupLockedFilesSkipped"
+			event.MessageValues = map[string]string{"count": strconv.Itoa(len(task.lockedFiles))}
 		}
 		if status == "reconnect_required" {
 			event.MessageKey = vaultreconnect.MessageKey
@@ -1398,7 +1441,7 @@ func SetOperationFinisherForTests(next OperationFinisher) func() {
 	finisherMu.Lock()
 	previous := finisher
 	if next == nil {
-		finisher = database.FinishBackupOperation
+		finisher = database.FinishBackupOperationWithIssueKind
 	} else {
 		finisher = next
 	}

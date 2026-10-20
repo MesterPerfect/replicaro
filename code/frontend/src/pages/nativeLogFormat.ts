@@ -543,7 +543,9 @@ function structuredDiagnostics(value: unknown, engine: string, diagnostics: stri
 
 export const retentionSummaryUnavailable = "Restic retention summary unavailable for this incomplete or unsupported record. See Raw in the completed log for details.";
 
-export interface LogPresentation { concise?: boolean; maintenanceOnly?: boolean; operationKind?: string }
+// lockedFilesSkipped narrows a completed-with-issues backup heading to the
+// locked-files result; it means nothing unless completedWithIssues is also set.
+export interface LogPresentation { concise?: boolean; maintenanceOnly?: boolean; operationKind?: string; lockedFilesSkipped?: boolean }
 
 function formatNativeLogLine(engine: NativeEngine | "replicaro", operationKind: string, line: string, diagnostics?: string[], concise = false, hiddenSection = false) {
     const unparsed = () => {
@@ -660,9 +662,13 @@ export function formatNativeLogText(engine: string, operationKind: string, text:
 
 const operationSection = /(^|(?:\r?\n){2})(\[(restic|kopia|replicaro) · ([^\]\r\n]+) · ([^\]\r\n]+)\])(\r?\n)([\s\S]*?)(?=(?:\r?\n){2}\[(?:restic|kopia|replicaro) · [^\]\r\n]+ · [^\]\r\n]+\]|$)/g;
 
-export function completedBackupHeading(header: string, completedWithIssues: boolean) {
+// The log stays in English, so the heading carries the English outcome. The
+// locked-files wording uses a comma rather than the UI label's "·", which
+// already separates the heading's fields.
+export function completedBackupHeading(header: string, completedWithIssues: boolean, lockedFilesSkipped = false) {
     return completedWithIssues
-        ? header.replace(/^(\[(?:restic|kopia|replicaro) · (?:backup|backup and retention) · )failed(\]\r?)$/, "$1completed with issues$2")
+        ? header.replace(/^(\[(?:restic|kopia|replicaro) · (?:backup|backup and retention) · )failed(\]\r?)$/,
+            `$1${lockedFilesSkipped ? "completed, locked files skipped" : "completed with issues"}$2`)
         : header;
 }
 
@@ -683,7 +689,7 @@ export function formatOperationLogText(text: string, pageEngine?: NativeEngine, 
 	const sectionText = text.slice(leadingBodyEnd);
 	const result = (presentation.maintenanceOnly ? "" : cleanBody(formattedLeadingBody)) + sectionText.replace(operationSection, (_section, prefix: string, header: string, component: string,
 		sectionKind: string, status: string, newline: string, body: string) => {
-        const displayHeader = completedBackupHeading(header, completedWithIssues);
+        const displayHeader = completedBackupHeading(header, completedWithIssues, presentation.lockedFilesSkipped);
         const failedSection = ["failed", "warning", "interrupted"].includes(status);
         const hiddenSection = presentation.concise && ["metadata_cache", "backup_admission"].includes(sectionKind);
         if (failedSection) {
@@ -728,6 +734,7 @@ export function formatOperationLogText(text: string, pageEngine?: NativeEngine, 
 
 export interface ReadableLogContext {
     operationStatus?: string;
+    operationIssueKind?: string;
     operationKind?: string;
     engine?: NativeEngine;
     partial?: boolean;
@@ -740,7 +747,8 @@ export const noSummaryDiagnosticsLine = "No errors or warnings identified in the
 export function formatReadableLog(text: string, context: ReadableLogContext, live = false, formattedBody?: string, pageDiagnostics?: readonly string[]) {
     const diagnostics: string[] = pageDiagnostics ? [...pageDiagnostics] : [];
     const completedWithIssues = context.operationKind === "backup" && context.operationStatus === "completed_with_issues";
-    const presentation = { concise: true, operationKind: context.operationKind, maintenanceOnly: context.operationKind === "prune" || context.operationKind === "maintenance" };
+    const presentation = { concise: true, operationKind: context.operationKind, maintenanceOnly: context.operationKind === "prune" || context.operationKind === "maintenance",
+        lockedFilesSkipped: completedWithIssues && context.operationIssueKind === "locked_files" };
     const formatted = pageDiagnostics && formattedBody !== undefined ? formattedBody : live && context.engine
         ? formatNativeLogText(context.engine, context.operationKind ?? "live", text, diagnostics, true)
         : formatOperationLogText(text, context.engine, diagnostics, completedWithIssues, presentation);

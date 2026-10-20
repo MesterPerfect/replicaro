@@ -23,10 +23,12 @@ var (
 	// already answers while Run is still setting the tray up, and the tray
 	// usually comes up, so Capabilities only reports it missing after this.
 	runningWithoutTray atomic.Bool
-	// startNativeTray and openWebUIOnStart are variables so tests can run
-	// Run without a real tray or browser.
-	startNativeTray  = newNativeTray
-	openWebUIOnStart = openWebUI
+	// startNativeTray and openWebUI are variables so tests can run Run and
+	// click the tray without a real tray or browser.
+	startNativeTray = newNativeTray
+	// openWebUI opens the web interface for the tray icon, its Open item, and
+	// Run at startup.
+	openWebUI = func() error { return openWebUIURL(currentWebUIURL()) }
 )
 
 // Run serves with the notification-area icon when Windows lets Replicaro set
@@ -77,7 +79,9 @@ func Run(service func() error, stop func() error) error {
 		serviceDone <- service()
 		tray.requestClose()
 	}()
-	_ = openWebUIOnStart()
+	if !NoStartupBrowser() {
+		_ = openWebUI()
+	}
 
 	loopErr := tray.runMessageLoop()
 
@@ -103,7 +107,9 @@ const replicaroShutdownLevel = 0x300
 func runWithoutTray(service func() error) error {
 	serviceDone := make(chan error, 1)
 	go func() { serviceDone <- service() }()
-	_ = openWebUIOnStart()
+	if !NoStartupBrowser() {
+		_ = openWebUI()
+	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -164,10 +170,6 @@ func ConfirmStartupRepair(question string) (answered, repair bool) {
 		return true, false
 	}
 	return false, false
-}
-
-func openWebUI() error {
-	return openWebUIURL(currentWebUIURL())
 }
 
 // OpenWebUI opens a running instance's web interface from a second launch.

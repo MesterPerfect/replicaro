@@ -102,6 +102,7 @@ import type {
 } from "../types";
 
 import { formatNativeLogText } from "./nativeLogFormat";
+import { completedWithIssuesTag, lockedFilesSkipped } from "./dashboardIssue";
 
 const vaultPasswordChangeNeedsRecovery = (result: VaultPasswordChangeResult) =>
 	["preparing", "native_started", "publishing", "cleanup_pending"].includes(result.phase);
@@ -1007,7 +1008,7 @@ function examplePlaceholder(value?: string) {
 // A destination's last run status in the job card tooltip. The words match the
 // Overview timeline, where an interrupted run is also shown as stopped. A
 // status this version doesn't know is shown as the backend sent it.
-function targetStatusLabel(status: string) {
+function targetStatusLabel(status: string, issueKind?: string) {
 	switch (status) {
 		case "": return t("ui.destinationStatus.notRun");
 		case "queued": return t("ui.operation.queued");
@@ -1016,7 +1017,7 @@ function targetStatusLabel(status: string) {
 		case "failed": return t("ui.operation.failed");
 		case "partial": return t("ui.operation.partial");
 		case "interrupted": return t("ui.operation.stopped");
-		case "completed_with_issues": return t("ui.operation.completedWithIssues");
+		case "completed_with_issues": return completedWithIssuesTag(issueKind);
 		case "reconnect_required": return t("ui.operation.reconnectRequired");
 		default: return status;
 	}
@@ -1601,6 +1602,34 @@ function repositoryConnectorLabelContent(repository: Pick<Repository, "connector
 	const address = savedRcloneRemoteVaultAddress(repository);
 	if (!address) return repositoryConnectorLabel(repository);
 	return <>{knownMessage(`ui.integration.${RCLONE_REMOTE_CONNECTOR}.label`, "Any Rclone Remote")}: <bdi dir="ltr" className="rclone-remote-address">{address}</bdi></>;
+}
+
+// The text inside the card's remote label chip. S3 and WebDAV labels arrive
+// from the backend as one string, "s3: <endpoint>" or "webdav: <host>[:port]",
+// so the endpoint is split off at the first ": " (the type prefix never
+// contains one). The connector check keeps the labels of other connectors
+// whole, and the cold storage check keeps the translated cold storage label
+// whole, even if a translation contains ": ".
+//
+// When the chip is too narrow, the prefix stays whole and the endpoint is cut
+// at its start, because the end of a host name is what tells endpoints apart
+// (see .connector-label-split in index.css for how). The prefix and endpoint
+// are separate flex items, so copying the chip's text puts a line break
+// between them.
+//
+// Any Rclone Remote labels are cut at their end: their address starts with
+// the remote's name, which is what identifies it. Cold storage, local and
+// network labels have no endpoint.
+function repositoryConnectorChipText(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage" | "rcloneRemote">) {
+	const label = repositoryConnectorLabel(repository);
+	const split = label.indexOf(": ");
+	if (repository.coldStorage || !["s3", "webdav"].includes(repository.connector) || split < 0) {
+		return <span className="connector-label-text">{repositoryConnectorLabelContent(repository)}</span>;
+	}
+	return <span className="connector-label-text connector-label-split">
+		<span className="connector-label-prefix">{label.slice(0, split + 2)}</span>
+		<span className="connector-label-endpoint"><bdi dir="ltr">{label.slice(split + 2)}</bdi></span>
+	</span>;
 }
 
 function repositoryConnectorLabel(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage" | "rcloneRemote">) {
@@ -5510,6 +5539,11 @@ export default function Protect() {
                         const activeTargets = job.targets.filter(backupTargetIsActive);
                         const failedTargets = job.targets.filter((target) => target.lastStatus === "failed" || target.lastStatus === "interrupted" || target.lastStatus === "reconnect_required");
                         const issueTargets = job.targets.filter((target) => target.lastStatus === "completed_with_issues");
+						// Locked files skipped is Completed with Issues with a narrower
+						// label, so it keeps that rank and tone. The job and its vaults
+						// get the narrower label only when it applies to every
+						// destination that completed with issues.
+						const lockedFilesOnly = issueTargets.length > 0 && issueTargets.every((target) => lockedFilesSkipped(target.lastStatus, target.lastIssueKind));
                         const isRunning = Boolean(running[job.id]) || activeTargets.length > 0;
                         const sourceUnavailable = job.targets.some((target) => target.sourceAvailability === "unavailable");
 						// Offered whenever the source cannot be used (paused or failing);
@@ -5524,20 +5558,20 @@ export default function Protect() {
                         const fullyProtected = job.targets.length > 0 && successfulTargets.length === job.targets.length;
                         const partiallyProtected = successfulTargets.length > 0 && !fullyProtected;
                         const tone = !job.enabled ? "idle" : isRunning ? "accent" : sourceUnavailable || vaultUnavailable || failedTargets.length > 0 ? "danger" : issueTargets.length > 0 ? "warn" : fullyProtected ? "ok" : "warn";
-                        const status = !job.enabled ? t("ui.jobStatus.paused") : isRunning ? t("ui.jobStatus.queuedRunning", { count: activeTargets.length }) : sourceUnavailable ? t("ui.jobStatus.sourceUnavailable") : vaultUnavailable ? t("ui.jobStatus.vaultUnavailable") : failedTargets.length > 0 ? t("ui.jobStatus.failedCount", { count: failedTargets.length }) : issueTargets.length > 0 ? t("ui.jobStatus.completedWithIssues") : fullyProtected ? t("ui.jobStatus.protected") : partiallyProtected ? t("ui.jobStatus.partiallyProtected") : t("ui.jobStatus.notRunYet");
+                        const status = !job.enabled ? t("ui.jobStatus.paused") : isRunning ? t("ui.jobStatus.queuedRunning", { count: activeTargets.length }) : sourceUnavailable ? t("ui.jobStatus.sourceUnavailable") : vaultUnavailable ? t("ui.jobStatus.vaultUnavailable") : failedTargets.length > 0 ? t("ui.jobStatus.failedCount", { count: failedTargets.length }) : issueTargets.length > 0 ? lockedFilesOnly ? t("ui.jobStatus.completedLockedFilesSkipped") : t("ui.jobStatus.completedWithIssues") : fullyProtected ? t("ui.jobStatus.protected") : partiallyProtected ? t("ui.jobStatus.partiallyProtected") : t("ui.jobStatus.notRunYet");
                         const destinationStatus = activeTargets.length > 0
                             ? t("ui.destinationStatus.running")
                             : failedTargets.length > 0
                                 ? t("ui.destinationStatus.failure")
                                 : issueTargets.length > 0
-                                    ? t("ui.destinationStatus.completedWithIssues")
+                                    ? lockedFilesOnly ? t("ui.destinationStatus.completedLockedFilesSkipped") : t("ui.destinationStatus.completedWithIssues")
                                     : fullyProtected
                                         ? t("ui.destinationStatus.successful")
                                         : partiallyProtected
                                             ? t("ui.destinationStatus.successfulCount", { successful: successfulTargets.length, total: job.targets.length })
                                             : t("ui.destinationStatus.notRun");
                         const targetDetails = job.targets.map((target) =>
-                            `${target.repositoryName}: ${targetStatusLabel(target.lastStatus)}`
+                            `${target.repositoryName}: ${targetStatusLabel(target.lastStatus, target.lastIssueKind)}`
                         ).join(" · ");
                         const pendingCatchUpTargets = job.targets.filter((target) => target.pendingCatchUp);
                         return (
@@ -5554,7 +5588,7 @@ export default function Protect() {
 									<span><b>{t("ui.pages.protect.size")}</b> {job.sizeBytes == null ? t("ui.pages.protect.not.measured.yet") : readableSize(job.sizeBytes)}</span>
                                 </div>
                                 <div className="flow-glyph">
-                                    <span className="flow-status">{status === t("ui.jobStatus.partiallyProtected") ? renderMessage("ui.jobStatus.partiallyProtectedBreak", { break: <br /> }) : status}</span>
+                                    <span className={status === t("ui.jobStatus.completedLockedFilesSkipped") ? "flow-status flow-status-wrap" : "flow-status"}>{status === t("ui.jobStatus.partiallyProtected") ? renderMessage("ui.jobStatus.partiallyProtectedBreak", { break: <br /> }) : status}</span>
 									{offerSourceUpdate && <button type="button" className="btn sm flow-status-action" onClick={() => setSourceUpdateJob(job)}>{t("ui.protect.updateJobSource")}</button>}
                                     <svg className="flow-arrow-horizontal" viewBox="0 0 120 10" aria-hidden="true">
                                         <line x1="0" y1="5" x2="112" y2="5" />
@@ -5675,7 +5709,7 @@ export default function Protect() {
 										    beside the engine chip; the tooltip always shows it in full,
 										    as the location line below does. */}
 										<Tooltip content={repositoryConnectorLabelContent(repo)}>
-											<span className="connector-chip connector-label-chip" aria-label={repositoryConnectorLabel(repo)}><span className="connector-label-text">{repositoryConnectorLabelContent(repo)}</span></span>
+											<span className="connector-chip connector-label-chip" aria-label={repositoryConnectorLabel(repo)}>{repositoryConnectorChipText(repo)}</span>
 										</Tooltip>
 									  </span>
 										</div>

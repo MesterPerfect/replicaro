@@ -104,6 +104,13 @@ type linuxDesktop struct {
 // that isn't answered in time counts as Cancel. Tests shorten it.
 var quitPromptLimit = 30 * time.Second
 
+// startLinuxDesktop and openWithoutDesktop are variables so tests can run Run
+// without a session bus or a browser.
+var (
+	startLinuxDesktop  = newLinuxDesktop
+	openWithoutDesktop = openURLFallback
+)
+
 // Run serves until the service stops, the tray's Quit is chosen, or the
 // process gets SIGINT or SIGTERM. A Linux session that ends either stops
 // Replicaro with SIGTERM, which reaches the same return as any other stop, or
@@ -111,7 +118,8 @@ var quitPromptLimit = 30 * time.Second
 // the caller runs the staged shutdown after Run returns, and Run never calls
 // stop itself.
 func Run(service func() error, _ func() error) error {
-	desktop, desktopErr := newLinuxDesktop()
+	desktop, desktopErr := startLinuxDesktop()
+	openOnStart := !NoStartupBrowser()
 	if desktopErr == nil {
 		activeLinuxMu.Lock()
 		activeLinux = desktop
@@ -124,9 +132,11 @@ func Run(service func() error, _ func() error) error {
 			activeLinuxMu.Unlock()
 			desktop.close()
 		}()
-		_ = desktop.open(currentWebUIURL())
-	} else if graphicalLinuxSession() {
-		_ = openURLFallback(currentWebUIURL())
+		if openOnStart {
+			_ = desktop.open(currentWebUIURL())
+		}
+	} else if openOnStart && graphicalLinuxSession() {
+		_ = openWithoutDesktop(currentWebUIURL())
 	}
 
 	serviceDone := make(chan error, 1)

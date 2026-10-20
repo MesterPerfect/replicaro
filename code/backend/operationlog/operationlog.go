@@ -668,6 +668,27 @@ func Read(operationID string) (string, error) {
 	return value, err
 }
 
+// Scan hands the operation's log to read as a stream, so a caller that only
+// looks for a few lines never loads a large log into memory. A missing log is
+// an empty stream.
+func Scan(operationID string, read func(io.Reader) error) error {
+	filename, err := path(operationID)
+	if err != nil {
+		return err
+	}
+	release := lockOperation(operationID)
+	defer release()
+	file, err := openRead(filename)
+	if errors.Is(err, os.ErrNotExist) {
+		return read(strings.NewReader(""))
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return read(file)
+}
+
 // Chunk is one bounded completed-log page. Offsets and sizes are file-byte
 // positions; no page read scales with the total operation-log size.
 type Chunk struct {
