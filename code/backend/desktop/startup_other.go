@@ -70,9 +70,31 @@ func RegisterStartup() error {
 	}
 desktopFallback:
 	desktopPath := filepath.Join(config, "autostart", "replicaro.desktop")
-	content := "# Managed by Replicaro\n[Desktop Entry]\nType=Application\nName=Replicaro\nExec=" + desktopEscape(executable) + "\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
-	legacy := "[Desktop Entry]\nType=Application\nName=Replicaro\nExec=" + desktopEscape(executable) + "\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+	content := autostartDesktopEntry(executable, true)
+	legacy := autostartDesktopEntry(executable, false)
 	return writeManagedStartupFile(desktopPath, []byte(content), 0o600, legacy)
+}
+
+// autostartDesktopEntry is the XDG autostart entry used where there's no
+// systemd user session.
+//
+// It, managedSystemdUnit and managedLaunchAgentContent come in two forms. The
+// marked form ("Managed by Replicaro") is what Replicaro writes. It starts
+// Replicaro with --no-startup-browser, so a login start shows only the tray
+// or menu-bar icon rather than opening a browser window; the icon still opens
+// the web interface. Replicaro rewrites its marked entry at every start,
+// which also adds the option to an entry an older version wrote.
+//
+// The unmarked form is the text very old versions wrote before they added
+// the marker. It's only compared against, to recognize such an entry as
+// Replicaro's own so it can be replaced or removed. Keep it exactly as it is,
+// without the option: changing it would make those entries look like the
+// user's own, which Replicaro never touches.
+func autostartDesktopEntry(executable string, marker bool) string {
+	if !marker {
+		return "[Desktop Entry]\nType=Application\nName=Replicaro\nExec=" + desktopEscape(executable) + "\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+	}
+	return "# Managed by Replicaro\n[Desktop Entry]\nType=Application\nName=Replicaro\nExec=" + desktopEscape(executable) + " " + noStartupBrowserOption + "\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
 }
 
 func isMacOSAppTranslocatedPath(path string) bool {
@@ -161,12 +183,15 @@ func hasVendorSystemdUnit() bool {
 	return false
 }
 
+// managedSystemdUnit is the systemd user unit for Start at login; see
+// autostartDesktopEntry for the marked and unmarked forms.
 func managedSystemdUnit(executable string, marker bool) string {
-	prefix := ""
+	prefix, arguments := "", ""
 	if marker {
 		prefix = "# Managed by Replicaro\n"
+		arguments = " " + noStartupBrowserOption
 	}
-	return prefix + "[Unit]\nDescription=Replicaro backup companion\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=" + systemdEscape(executable) + "\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
+	return prefix + "[Unit]\nDescription=Replicaro backup companion\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=" + systemdEscape(executable) + arguments + "\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
 }
 
 func removeManagedSystemdOverride(path, executable string) error {
@@ -231,16 +256,21 @@ const launchAgentManagedPrefix = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 ` + launchAgentManagedMarker + `<plist version="1.0"><dict>` + launchAgentManagedKey
 
+// managedLaunchAgentContent is the macOS LaunchAgent for Start at login; see
+// autostartDesktopEntry for the marked and unmarked forms. The marked form
+// passes --no-startup-browser as a second ProgramArguments string.
 func managedLaunchAgentContent(executable string, marker bool) string {
 	markerText := ""
 	markerField := ""
+	arguments := ""
 	if marker {
 		markerText = launchAgentManagedMarker
 		markerField = launchAgentManagedKey
+		arguments = `<string>` + xmlEscape(noStartupBrowserOption) + `</string>`
 	}
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-` + markerText + `<plist version="1.0"><dict>` + markerField + `<key>Label</key><string>io.replicaro.desktop</string><key>ProgramArguments</key><array><string>` + xmlEscape(executable) + `</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>
+` + markerText + `<plist version="1.0"><dict>` + markerField + `<key>Label</key><string>io.replicaro.desktop</string><key>ProgramArguments</key><array><string>` + xmlEscape(executable) + `</string>` + arguments + `</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>
 `
 }
 
@@ -297,9 +327,21 @@ func xmlEscape(value string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 	return replacer.Replace(value)
 }
+
+// systemdEscape quotes the executable for ExecStart. Inside the quotes systemd
+// reads C-style backslash escapes, expands % specifiers, and replaces $NAME
+// and ${NAME} with environment variables, so a literal $ is written $$.
 func systemdEscape(value string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`).Replace(value) + `"`
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`, `$`, `$$`).Replace(value) + `"`
 }
+
+// desktopEscape quotes the executable for the Exec key of a desktop entry.
+// The Desktop Entry spec reads that value twice: first as a string value,
+// where \\ stands for one backslash, and then as an Exec line, where a quoted
+// argument escapes ", `, $ and \ with a backslash. So the quoting escapes are
+// applied first and every backslash is then doubled once more, which writes a
+// literal backslash as four. A literal % is %%, the Exec line's own escape.
 func desktopEscape(value string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", `%`, `%%`).Replace(value) + `"`
+	quoted := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", `$`, `\$`).Replace(value) + `"`
+	return strings.NewReplacer(`\`, `\\`, `%`, `%%`).Replace(quoted)
 }

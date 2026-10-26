@@ -16,8 +16,12 @@ import (
 	"github.com/local/replicaro/vaultidentity"
 )
 
+// WebDAV is an ordinary connector for both engines, like SFTP: Kopia uses its
+// native WebDAV storage and Restic reaches the server through its native
+// rclone backend (see prepareResticStorage). It is not one of the OAuth
+// Restic-rclone providers, so IsResticRcloneConnector stays false for it.
 var supportedStorageConnectors = map[string]bool{
-	"fs": true, "sftp": true, "s3": true, "azblob": true, "gcs": true,
+	"fs": true, "sftp": true, "s3": true, "azblob": true, "gcs": true, "webdav": true,
 }
 
 // userSafeConnectorError carries only a fixed connector option name/value and
@@ -26,9 +30,13 @@ var supportedStorageConnectors = map[string]bool{
 // output-free public error.
 type userSafeConnectorError struct {
 	message string
+	// cause is kept only for errors.As on a typed error with the same
+	// user-safe message, such as *RcloneRemoteError.
+	cause error
 }
 
 func (err *userSafeConnectorError) Error() string { return err.message }
+func (err *userSafeConnectorError) Unwrap() error { return err.cause }
 
 func SupportsConnector(engine, connector string) bool {
 	if !models.ValidEngine(engine) {
@@ -36,8 +44,9 @@ func SupportsConnector(engine, connector string) bool {
 	}
 	connector = strings.ToLower(strings.TrimSpace(connector))
 	if IsResticRcloneConnector(connector) {
-		// Runner coverage is diagnostic evidence. It cannot downgrade an
-		// implemented integration; native engine capability checks still apply.
+		// Every Restic-rclone connector is available to Restic whether or not our
+		// test runners cover it; don't gate availability on runner coverage.
+		// Restic's own capability checks still apply.
 		return engine == ResticID
 	}
 	return supportedStorageConnectors[connector]
@@ -48,6 +57,21 @@ func SupportsConnector(engine, connector string) bool {
 // consume. This keeps the shared UI catalog from leaking another engine's
 // settings into native connector validation.
 func NormalizeConnectorOptions(engine string, integration integrations.Integration, provided map[string]string) (map[string]string, error) {
+	if engine == ResticID && integration.ID == RcloneRemoteConnector {
+		// Run the connector's coded checks before the catalog's generic
+		// "is required" and true/false checks, so a missing or malformed
+		// setting gets the error the UI can translate.
+		if _, err := normalizeRcloneRemoteOptions(provided, true); err != nil {
+			return nil, err
+		}
+		variables, err := ParseRcloneRemoteEnvironment(provided[RcloneRemoteEnvironmentOption])
+		if err != nil {
+			return nil, err
+		}
+		if err := ValidateRcloneRemoteEnvironmentNamesForSave(variables); err != nil {
+			return nil, err
+		}
+	}
 	normalized, err := NormalizeStorageOptions(integration, provided)
 	if err != nil {
 		return nil, err
@@ -130,6 +154,30 @@ func ValidateStorageOptions(connector string, options map[string]string) error {
 		}
 		if connection == "" && (account == "" || key == "") {
 			return fmt.Errorf("Azure requires a connection string or an account name and key")
+		}
+	case "webdav":
+		if err := validateStoragePort(options["port"]); err != nil {
+			return fmt.Errorf("WebDAV port: %w", err)
+		}
+		// Kopia asks for a missing WebDAV account password on standard input,
+		// which would hang a background command, and neither engine can sign in
+		// without both. The form requires them too, but the API must not rely
+		// on that.
+		if strings.TrimSpace(options["username"]) == "" {
+			return fmt.Errorf("WebDAV username is required")
+		}
+		if strings.TrimSpace(options["password"]) == "" {
+			return fmt.Errorf("WebDAV account password is required")
+		}
+		// Kopia takes the whole value from its environment, but rclone reads the
+		// WebDAV account password through "rclone obscure -", which stops at the
+		// first line break, so the two engines would sign in with different
+		// values. The username is held to the same rule. Never echo either value.
+		if strings.ContainsAny(options["username"], "\r\n\x00") {
+			return fmt.Errorf("WebDAV username cannot contain line breaks or NUL characters")
+		}
+		if strings.ContainsAny(options["password"], "\r\n\x00") {
+			return fmt.Errorf("WebDAV account password cannot contain line breaks or NUL characters")
 		}
 	case "gcs":
 		file := strings.TrimSpace(options["credentials_file"])
@@ -318,7 +366,6 @@ func validateStoragePort(value string) error {
 }
 
 func normalizedStorageRepository(repo models.Repository, engine string) models.Repository {
-	repo = repo.RuntimeView()
 	if strings.TrimSpace(repo.Engine) == "" {
 		repo.Engine = engine
 	}
@@ -407,7 +454,33 @@ func validatedConnectorAddress(engine, connector, location string, options map[s
 	if engine == KopiaID && connector == "sftp" && strings.TrimSpace(address.Username) == "" {
 		return vaultidentity.EffectiveAddress{}, fmt.Errorf("SFTP username is required for Kopia")
 	}
+	// Restic starts ssh with the host as its first argument, so a host that
+	// begins with "-" would be read by ssh as an option. No real host name
+	// starts with "-". The user name is passed after -l and is safe, and Kopia
+	// already rejects such a host in its own argument parser.
+	if engine == ResticID && connector == "sftp" && strings.HasPrefix(address.Host, "-") {
+		return vaultidentity.EffectiveAddress{}, errSFTPDashHost
+	}
 	return address, nil
+}
+
+var errSFTPDashHost = errors.New(`SFTP host cannot start with "-"`)
+
+// ValidateSFTPHost refuses an SFTP host that starts with "-", whatever the
+// engine. Connecting an existing vault reads its recovery metadata before the
+// engine is known, and creating a Kopia vault doesn't get the Restic check in
+// the address validation; without this check such a host would only show up
+// as a generic failed command. Other address problems are left to the usual
+// validation.
+func ValidateSFTPHost(connector, location string, options map[string]string) error {
+	if connector != "sftp" {
+		return nil
+	}
+	address, err := vaultidentity.ResolveEffectiveAddress(connector, location, options)
+	if err == nil && strings.HasPrefix(address.Host, "-") {
+		return errSFTPDashHost
+	}
+	return nil
 }
 
 func splitConnectionString(value string) map[string]string {

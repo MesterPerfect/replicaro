@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/local/replicaro/appdata"
@@ -39,41 +38,6 @@ type repositoryPasswordProber interface {
 	probeRepositoryPassword(context.Context, models.Repository) (string, error)
 }
 
-func validateNativePasswordInputPath(path string) error {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	volume := filepath.VolumeName(absolute)
-	current := string(filepath.Separator)
-	if volume != "" {
-		current = volume + string(filepath.Separator)
-	}
-	relative := strings.TrimPrefix(absolute[len(volume):], string(filepath.Separator))
-	components := strings.Split(relative, string(filepath.Separator))
-	for index, component := range components {
-		if component == "" {
-			continue
-		}
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 || isReparsePoint(info) {
-			return fmt.Errorf("native password input path is linked or reparse")
-		}
-		if index == len(components)-1 {
-			if !info.Mode().IsRegular() {
-				return fmt.Errorf("native password input has the wrong type")
-			}
-		} else if !info.IsDir() {
-			return fmt.Errorf("native password input ancestor has the wrong type")
-		}
-	}
-	return nil
-}
-
 // ChangeRepositoryPassword invokes only the selected engine's pinned native
 // repository password command. The native result remains separate from
 // protected-sidecar publication and local cleanup.
@@ -92,16 +56,26 @@ func ChangeRepositoryPassword(ctx context.Context, engine Engine, repo models.Re
 		if rootErr == nil {
 			expected = filepath.Join(root, repo.ID, operationUUID, "restic-new-password.txt")
 		}
+		// The input must be the file derived from this repository and
+		// operation, and must hold the candidate written for this change. That
+		// catches a stale or mistaken path and a half-written file before
+		// Restic sees it.
+		//
+		// The path is not checked for symlinks or junctions in its folders or at
+		// the file itself. The app-data root can sit under linked folders: a
+		// symlinked home or ~/.local, folders placed by a dotfile manager, or
+		// /home -> /var/home on ostree systems. Planting a link inside our own
+		// owner-only folders takes someone or something already on the
+		// computer, and that is outside what Replicaro defends against. Don't
+		// add link, owner or EvalSymlinks checks here without a product
+		// decision: they make password changes fail for those users and catch
+		// nothing an accident can cause.
 		cleanInput := filepath.Clean(nativeInputPath)
-		pathErr := validateNativePasswordInputPath(expected)
-		resolvedInput, resolveErr := filepath.EvalSymlinks(cleanInput)
-		resolvedExpected, resolveExpectedErr := filepath.EvalSymlinks(expected)
-		if parseErr != nil || parsedRepository.String() != repo.ID || rootErr != nil || cleanInput != expected ||
-			pathErr != nil || resolveErr != nil || resolveExpectedErr != nil || resolvedInput != resolvedExpected {
+		if parseErr != nil || parsedRepository.String() != repo.ID || rootErr != nil || cleanInput != expected {
 			return PasswordChangeResult{}, fmt.Errorf("native password input does not match the exact password-change operation")
 		}
-		info, inspectErr := os.Lstat(expected)
-		if inspectErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() != int64(len(newPassword)+1) {
+		info, inspectErr := os.Stat(expected)
+		if inspectErr != nil || !info.Mode().IsRegular() || info.Size() != int64(len(newPassword)+1) {
 			return PasswordChangeResult{}, fmt.Errorf("native password input is unavailable or unsafe")
 		}
 		file, openErr := os.Open(expected)
@@ -119,7 +93,6 @@ func ChangeRepositoryPassword(ctx context.Context, engine Engine, repo models.Re
 	target := engine
 	if public, ok := engine.(*publicEngine); ok {
 		target = public.Engine
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 	}
 	changer, ok := target.(repositoryPasswordChanger)
 	if !ok {
@@ -140,7 +113,7 @@ func ChangeRepositoryPassword(ctx context.Context, engine Engine, repo models.Re
 		if errors.As(nativeErr, &exit) && exit.ExitCode() == 11 {
 			// Pinned Restic 0.19.1 defines exit 11 for key passwd as a lock
 			// rejection before its key mutation. Keep the native failure intact;
-			// this structured exit status only narrows recovery cleanup authority.
+			// the disposition below only tells recovery cleanup the key never changed.
 			disposition = PasswordMutationRejectedBeforeMutation
 		}
 	}
@@ -178,7 +151,6 @@ func ProbeRepositoryPassword(ctx context.Context, repo models.Repository, passwo
 	target := engine
 	if public, ok := engine.(*publicEngine); ok {
 		target = public.Engine
-		ctx = repositoryProcessContext(ctx, candidate, public.availabilityCheck)
 	}
 	if prober, ok := target.(repositoryPasswordProber); ok && repo.Engine == KopiaID {
 		fingerprint, err := prober.probeRepositoryPassword(ctx, candidate)
@@ -194,7 +166,13 @@ func ProbeRepositoryPassword(ctx context.Context, repo models.Repository, passwo
 	if err != nil {
 		return err
 	}
-	fingerprint, err := RepositoryFingerprint(candidate, output)
+	// Callers hold the vault lock, so the filesystem marker read is bounded by
+	// ctx. A read abandoned at the deadline or on cancellation reports ctx's
+	// error rather than a mismatch it never observed.
+	fingerprint, err := RepositoryFingerprintContext(ctx, candidate, output)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return err
+	}
 	if err != nil || fingerprint != repo.NativeRepositoryID {
 		return fmt.Errorf("credential probe reached a different native repository")
 	}
@@ -218,7 +196,6 @@ func ResticRcloneRepositoryFingerprint(ctx context.Context, repo models.Reposito
 	target := engine
 	if public, ok := engine.(*publicEngine); ok {
 		target = public.Engine
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 	}
 	prober, ok := target.(repositoryPasswordProber)
 	if !ok {
@@ -253,13 +230,14 @@ func EmbeddedBinarySHA256(id, target string) (string, error) {
 	return expectedEmbeddedHash(id, target)
 }
 
-// publicEngine binds repository availability checks and requested-operation
-// classification around a concrete adapter. Ordinary output remains the
-// selected engine's native content through this application boundary.
+// publicEngine wraps a concrete adapter with requested-operation
+// classification. It passes the selected engine's native output through
+// unchanged. It runs no storage probe before each native command: the vault's
+// storage and identity are checked once, under the vault lock, when the
+// operation is admitted, and probing again here would turn every native
+// command into another availability gate.
 type publicEngine struct {
 	Engine
-	repo              models.Repository
-	availabilityCheck RepositoryAvailabilityCheck
 }
 
 type resticMaintenancePruneAdmissionKey struct{}
@@ -311,11 +289,10 @@ func admitNativeDeletion(ctx context.Context) error {
 	return &command.PreProcessAdmissionError{Err: err}
 }
 
-// ContextWithResticMaintenancePruneAdmission installs the one narrow
-// application authorization check that must run after a successful optional
-// plain Restic unlock and immediately before the requested prune command.
-// It is intentionally specific to owner-authorized maintenance and is not a
-// generalized process coordinator.
+// ContextWithResticMaintenancePruneAdmission installs an authorization check
+// that must run after the optional plain Restic unlock succeeds and immediately
+// before the requested prune command. It exists only for maintenance run by the
+// vault owner; do not grow it into a general process coordinator.
 func ContextWithResticMaintenancePruneAdmission(
 	ctx context.Context,
 	admit func(context.Context) error,
@@ -394,12 +371,79 @@ func unlockResticRepository(ctx context.Context, engine Engine, repo models.Repo
 // Restic owns stale-lock classification and any resulting repository mutation.
 func UnlockResticRepository(ctx context.Context, engine Engine, repo models.Repository) (string, error) {
 	if public, ok := engine.(*publicEngine); ok {
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 		output, err := unlockResticRepository(ctx, public.Engine, repo)
 		return output, err
 	}
 	output, err := unlockResticRepository(ctx, engine, repo)
 	return output, err
+}
+
+// ListResticKeys runs Restic's native `key list` with repo.Passphrase and
+// returns every key's full ID and the ID of the key that password opened.
+func ListResticKeys(ctx context.Context, engine Engine, repo models.Repository) (current string, ids []string, err error) {
+	if public, ok := engine.(*publicEngine); ok {
+		engine = public.Engine
+	}
+	restic, ok := engine.(*resticEngine)
+	if !ok || repo.Engine != ResticID {
+		return "", nil, fmt.Errorf("%w: native Restic key list requires a Restic repository", ErrUnsupported)
+	}
+	return restic.listKeys(ctx, repo)
+}
+
+// RemoveResticKey runs Restic's native `key remove` for one full key ID with
+// repo.Passphrase.
+func RemoveResticKey(ctx context.Context, engine Engine, repo models.Repository, keyID string) (string, error) {
+	if public, ok := engine.(*publicEngine); ok {
+		engine = public.Engine
+	}
+	restic, ok := engine.(*resticEngine)
+	if !ok || repo.Engine != ResticID {
+		return "", fmt.Errorf("%w: native Restic key removal requires a Restic repository", ErrUnsupported)
+	}
+	return restic.removeKey(ctx, repo, keyID)
+}
+
+// ShowKopiaFormatBlob returns one Kopia format blob (KopiaRepositoryBlob or
+// KopiaBlobcfgBlob) as native `kopia blob show` prints it, with
+// repo.Passphrase.
+func ShowKopiaFormatBlob(ctx context.Context, engine Engine, repo models.Repository, blobID string) ([]byte, error) {
+	if public, ok := engine.(*publicEngine); ok {
+		engine = public.Engine
+	}
+	kopia, ok := engine.(*kopiaEngine)
+	if !ok || repo.Engine != KopiaID {
+		return nil, fmt.Errorf("%w: native Kopia blob show requires a Kopia repository", ErrUnsupported)
+	}
+	return kopia.showFormatBlob(ctx, repo, blobID)
+}
+
+// ForgetKopiaCachedFormat removes Kopia's cached copies of the format blobs
+// from the vault's own cache folder, so the next Kopia command reads the
+// format from storage.
+func ForgetKopiaCachedFormat(repo models.Repository) error {
+	if repo.Engine != KopiaID {
+		return fmt.Errorf("%w: the Kopia format cache belongs to a Kopia repository", ErrUnsupported)
+	}
+	return forgetKopiaCachedFormat(repo)
+}
+
+// Exit codes pinned Restic 0.19.1 documents for every repository command:
+// 11 when it could not lock the repository, 12 when the password opens no
+// key.
+const (
+	ResticExitLocked        = 11
+	ResticExitWrongPassword = 12
+)
+
+// ResticExitCode returns the exit code of the Restic process behind err, when
+// err comes from a Restic process that ran and exited on its own.
+func ResticExitCode(err error) (int, bool) {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || !exit.Exited() {
+		return 0, false
+	}
+	return exit.ExitCode(), true
 }
 
 func (e *publicEngine) autoUnlockRestic(ctx context.Context, repo models.Repository) error {
@@ -413,35 +457,11 @@ func (e *publicEngine) autoUnlockRestic(ctx context.Context, repo models.Reposit
 	return nil
 }
 
-// ContextWithRepositoryAvailabilityCheck binds an explicit persisted-storage
-// check to every native process launched with the returned context.
-func ContextWithRepositoryAvailabilityCheck(
-	ctx context.Context,
-	repo models.Repository,
-	check RepositoryAvailabilityCheck,
-) context.Context {
-	if check == nil {
-		return ctx
-	}
-	return command.ContextWithBeforeProcess(ctx, func(checkContext context.Context) error {
-		return check(checkContext, repo)
-	})
-}
-
-func repositoryProcessContext(
-	ctx context.Context,
-	repo models.Repository,
-	check RepositoryAvailabilityCheck,
-) context.Context {
-	return ContextWithRepositoryAvailabilityCheck(ctx, repo, check)
-}
-
 // ValidateRepository checks an existing repository without changing its
 // repository-level settings. Engines without a specialized validation path
 // already have a non-mutating Info implementation.
 func ValidateRepository(ctx context.Context, engine Engine, repo models.Repository) (string, error) {
 	if public, ok := engine.(*publicEngine); ok {
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 		if validator, ok := public.Engine.(readOnlyRepositoryValidator); ok {
 			output, err := validator.validateRepository(ctx, repo)
 			return output, err
@@ -451,19 +471,16 @@ func ValidateRepository(ctx context.Context, engine Engine, repo models.Reposito
 }
 
 func (e *publicEngine) Info(ctx context.Context, repo models.Repository) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	output, err := e.Engine.Info(ctx, repo)
 	return output, err
 }
 
 func (e *publicEngine) Create(ctx context.Context, repo models.Repository) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	output, err := e.Engine.Create(ctx, repo)
 	return output, err
 }
 
 func (e *publicEngine) Backup(ctx context.Context, repo models.Repository, source string, options BackupOptions) (models.Snapshot, string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return models.Snapshot{}, "", resticPreparationFailure(err)
 	}
@@ -475,57 +492,33 @@ func (e *publicEngine) Backup(ctx context.Context, repo models.Repository, sourc
 }
 
 func (e *publicEngine) ListSnapshots(ctx context.Context, repo models.Repository) ([]models.Snapshot, string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	snapshots, output, err := e.Engine.ListSnapshots(ctx, repo)
 	return snapshots, output, err
 }
 
 // ListSnapshotsFresh preserves the optional cache-bypassing listing contract
-// through the public repository-checking boundary.
+// through the public wrapper.
 func (e *publicEngine) ListSnapshotsFresh(ctx context.Context, repo models.Repository) ([]models.Snapshot, string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	snapshots, output, err := ListSnapshotsFresh(ctx, e.Engine, repo)
 	return snapshots, output, err
 }
 
 func (e *publicEngine) ListPath(ctx context.Context, repo models.Repository, snapshotID, path string) ([]models.SnapshotEntry, string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	entries, output, err := e.Engine.ListPath(ctx, repo, snapshotID, path)
 	return entries, output, err
 }
 
 func (e *publicEngine) ListPathRecursive(ctx context.Context, repo models.Repository, snapshotID, path string) ([]models.SnapshotEntry, string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	entries, output, err := e.Engine.ListPathRecursive(ctx, repo, snapshotID, path)
 	return entries, output, err
 }
 
-type publicSnapshotIndexSession struct {
-	SnapshotIndexSession
-	repo              models.Repository
-	availabilityCheck RepositoryAvailabilityCheck
-}
-
-func (s *publicSnapshotIndexSession) ListPathRecursive(ctx context.Context, snapshot SnapshotIndexItem, path string) ([]models.SnapshotEntry, string, error) {
-	ctx = repositoryProcessContext(ctx, s.repo, s.availabilityCheck)
-	entries, output, err := s.SnapshotIndexSession.ListPathRecursive(ctx, snapshot, path)
-	return entries, output, err
-}
-
-func (s *publicSnapshotIndexSession) Close() error {
-	return s.SnapshotIndexSession.Close()
-}
-
 // BeginSnapshotIndex preserves the optional indexing contract across the
-// public repository-checking wrapper without making unsupported engines
-// advertise it.
+// public wrapper without making unsupported engines advertise it.
 func BeginSnapshotIndex(ctx context.Context, engine Engine, repo models.Repository) (SnapshotIndexSession, string, bool, error) {
 	target := engine
-	var availabilityCheck RepositoryAvailabilityCheck
 	if public, ok := engine.(*publicEngine); ok {
 		target = public.Engine
-		availabilityCheck = public.availabilityCheck
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 	}
 	indexer, ok := target.(SnapshotIndexEngine)
 	if !ok {
@@ -535,30 +528,24 @@ func BeginSnapshotIndex(ctx context.Context, engine Engine, repo models.Reposito
 	if err != nil {
 		return nil, output, true, err
 	}
-	if _, checked := engine.(*publicEngine); checked {
-		session = &publicSnapshotIndexSession{
-			SnapshotIndexSession: session,
-			repo:                 repo,
-			availabilityCheck:    availabilityCheck,
-		}
-	}
 	return session, output, true, nil
 }
 
 func (e *publicEngine) Restore(ctx context.Context, repo models.Repository, snapshotID string, options RestoreOptions) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}
 	output, err := e.Engine.Restore(ctx, repo, snapshotID, options)
-	if repo.Engine == ResticID {
+	// resticRequestedOperationError would unwrap the engine's "completed with
+	// errors" report down to the bare exit-1 failure, the same way it would
+	// lose a backup source-read qualification.
+	if repo.Engine == ResticID && !RestoreReportedErrors(err) {
 		err = resticRequestedOperationError(err)
 	}
 	return output, err
 }
 
 func (e *publicEngine) DeleteSnapshot(ctx context.Context, repo models.Repository, snapshotID string) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}
@@ -570,7 +557,6 @@ func (e *publicEngine) DeleteSnapshot(ctx context.Context, repo models.Repositor
 }
 
 func (e *publicEngine) DeleteSnapshots(ctx context.Context, repo models.Repository, snapshotIDs []string) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}
@@ -587,12 +573,11 @@ func (e *publicEngine) DeleteSnapshots(ctx context.Context, repo models.Reposito
 	return e.DeleteSnapshot(ctx, repo, snapshotIDs[0])
 }
 
-func (e *publicEngine) Check(ctx context.Context, repo models.Repository, snapshotID string) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
+func (e *publicEngine) Check(ctx context.Context, repo models.Repository) (string, error) {
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}
-	output, err := e.Engine.Check(ctx, repo, snapshotID)
+	output, err := e.Engine.Check(ctx, repo)
 	if repo.Engine == ResticID {
 		err = resticRequestedOperationError(err)
 	}
@@ -600,7 +585,6 @@ func (e *publicEngine) Check(ctx context.Context, repo models.Repository, snapsh
 }
 
 func (e *publicEngine) Maintenance(ctx context.Context, repo models.Repository) (string, error) {
-	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}

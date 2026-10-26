@@ -7,7 +7,6 @@ import "os/exec"
 import (
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"sync/atomic"
 	"syscall"
@@ -52,7 +51,7 @@ func (tree *processTree) active(process *exec.Cmd) bool {
 }
 
 func configureWindowsCommand(process *exec.Cmd) {
-	if runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Getpid() == 1) {
+	if runtime.GOOS == "darwin" {
 		// A process group is not a complete child-process boundary:
 		// pinned engines may create additional process groups for helpers. Give
 		// each top-level native command its own session so those groups remain
@@ -91,7 +90,7 @@ func (tree *processTree) attach(process *exec.Cmd) error {
 		return fmt.Errorf("engine process did not create an isolated process group")
 	}
 	tree.pgid = pgid
-	if runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Getpid() == 1) {
+	if runtime.GOOS == "darwin" {
 		sid, err := tree.sessionID(process.Process.Pid)
 		if errors.Is(err, unix.ESRCH) {
 			// The session was successfully created before exec and Getpgid just

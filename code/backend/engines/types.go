@@ -149,7 +149,7 @@ func capabilitiesFor(id string) Capabilities {
 			{ID: "always", Label: "Always overwrite", Description: "Restic passes its native --overwrite always mode.", Default: true},
 			{ID: "never", Label: "Never overwrite", Description: "Restic passes its native --overwrite never mode.", Default: false},
 		}, DestinationScope: "Restic writes directly below the selected native target. Replicaro exposes Restic's native always and never overwrite modes."}
-		base.Verification = NativeOperationCapability{Supported: true, Label: "Restic repository verification", Scope: "Native check --read-data content verification, optionally filtered to one snapshot."}
+		base.Verification = NativeOperationCapability{Supported: true, Label: "Restic repository verification", Scope: "Native check --read-data content verification of the whole repository."}
 	case KopiaID:
 		base.Restore = RestoreCapability{FullSnapshot: true, SinglePath: true, ConflictModes: []RestoreConflictMode{
 			{ID: "overwrite", Label: "Overwrite", Description: "Kopia applies its native overwrite behavior.", Default: true},
@@ -159,8 +159,6 @@ func capabilitiesFor(id string) Capabilities {
 	}
 	return base
 }
-
-type RepositoryAvailabilityCheck func(context.Context, models.Repository) error
 
 func ValidateRestoreCapability(descriptor Descriptor, options RestoreOptions) error {
 	capability := descriptor.Capabilities.Restore
@@ -196,8 +194,25 @@ type BackupOptions struct {
 	// actual filesystem input is a freshly verified local alias.
 	LogicalSource string
 	Excludes      []string
-	Verify        bool
-	Settings      models.EngineJobSettings
+	// Marker files whose folders' contents Restic skips (see
+	// models.BackupJob). SkipCacheDirFolders is the effective value, already
+	// forced on for a job with a Kopia vault. Kopia takes the same choices
+	// from its managed job policy instead.
+	SkipNoBackupFolders bool
+	SkipCacheDirFolders bool
+	SkipMarkerFileName  string
+	Verify              bool
+	Settings            models.EngineJobSettings
+	// FullSourceRead asks the engine to read every source file instead of
+	// trusting metadata matches against earlier snapshots. The runner sets it
+	// after the job's source alias changed, and for a new (job, vault) pair
+	// whose vault may already hold the job's snapshots from another folder,
+	// on every attempt until the pair commits a snapshot. Kopia maps it to
+	// --force-hash=100 because --override-source can leave another folder's
+	// snapshots as the comparison base. Restic ignores it: it records the
+	// folder actually read, so a different folder already has no matching
+	// parent snapshot.
+	FullSourceRead bool
 }
 
 // RetentionPolicy is the compact job intent translated by each engine. A zero
@@ -224,7 +239,6 @@ func ApplyNativeRetention(ctx context.Context, engine Engine, repo models.Reposi
 		if repo.Engine != ResticID {
 			return "", fmt.Errorf("%w: separate native retention is unavailable for %s", ErrUnsupported, repo.Engine)
 		}
-		ctx = repositoryProcessContext(ctx, repo, public.availabilityCheck)
 		if err := public.autoUnlockRestic(ctx, repo); err != nil {
 			return "", resticPreparationFailure(err)
 		}
@@ -248,10 +262,10 @@ type RestoreOptions struct {
 	Destination       string
 	Selection         string
 	NativeRoot        models.SnapshotSourceRoot
-	// ExactSourceRoot is set only after the restore coordinator has established
-	// that a whole restore is the one authoritative source of a managed
-	// snapshot. NativeRoot alone is rebuildable addressing identity and must
-	// never be allowed to narrow whole-snapshot scope.
+	// ExactSourceRoot is set only after the restore coordinator has confirmed
+	// that NativeRoot is the sole source root of a managed snapshot, so a whole
+	// restore may target it. NativeRoot by itself is rebuildable cache addressing
+	// and must never be used to narrow a whole-snapshot restore.
 	ExactSourceRoot  bool
 	OriginalLocation bool
 	ConflictMode     string
@@ -268,7 +282,10 @@ type Engine interface {
 	ListPathRecursive(context.Context, models.Repository, string, string) ([]models.SnapshotEntry, string, error)
 	Restore(context.Context, models.Repository, string, RestoreOptions) (string, error)
 	DeleteSnapshot(context.Context, models.Repository, string) (string, error)
-	Check(context.Context, models.Repository, string) (string, error)
+	// Check runs the engine's whole-repository integrity check. It takes no
+	// snapshot on purpose: the snapshot-scoped check had no caller and was
+	// removed, and cold storage vaults refuse the whole-repository check.
+	Check(context.Context, models.Repository) (string, error)
 	Maintenance(context.Context, models.Repository) (string, error)
 }
 
@@ -449,8 +466,8 @@ func validateNativeDeletionIDResults(requested []string, results []NativeDeletio
 }
 
 // ValidateSnapshotIDArgument rejects values that a native CLI could interpret
-// as options or multiple arguments. Exact canonical membership is separately
-// established from a native listing by the locked orchestration layer.
+// as options or multiple arguments. Whether the ID actually exists is checked
+// separately against a native listing by the orchestration layer, under lock.
 func ValidateSnapshotIDArgument(id string) error {
 	if id == "" || strings.TrimSpace(id) != id || strings.HasPrefix(id, "-") ||
 		strings.ContainsAny(id, "\x00\r\n\t ") {

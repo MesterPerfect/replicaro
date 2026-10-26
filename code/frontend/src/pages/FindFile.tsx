@@ -5,27 +5,28 @@ import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
+import { FloatingTooltip } from "../components/FloatingTooltip";
+import { JobSourceLabel } from "../components/JobSourceLabel";
+import { fileHistorySourceJob, jobSourceTooltip, pathWithinJob } from "../jobSourceDisplay";
+import { displayPath } from "../nativePathDisplay";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
 	APIError,
 	browseFiles,
 	getFileHistory,
+	getJobs,
 	getMetadataStatus,
-	getOperation,
     getEngines,
     getRepositories,
     listSnapshots,
 	prepareMetadata,
-	observeSubmittedRestoreOperation,
-	isOperationNotFound,
-	requireExactOperation,
 	restoreSelection,
     searchFiles,
 } from "../services/api";
 import type { MetadataPreparationStatus } from "../services/api";
-import { defaultConflictMode, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
-import type { EngineDescriptor, FileBrowseEntry, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
+import { defaultConflictMode, restorableContainingFolder, RESTORE_SELECTION_NAME_INVALID, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
+import type { BackupJob, EngineDescriptor, FileBrowseEntry, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
 
 type RestoreMode = "single" | "individual";
 type HistoryMap = Record<string, FileVersion[]>;
@@ -52,6 +53,37 @@ const emptyPageState = (): PageState => ({ hasMore: false, nextOffset: 0, loadin
 const browseRootKey = "\u0000browse-root";
 const allVaultsValue = "__all_vaults__";
 const SNAPSHOT_HISTORY_TOOLTIP = () => t("ui.snapshotHistory.refreshHelp");
+
+// containingFolderRestoreItems replaces each item whose name the backend
+// refused with its nearest clean folder from the same snapshot, and drops
+// items that folder now contains. folders lists the replacement folders so the
+// review can show what the action restores. It returns null when an item has
+// no such folder, or when nothing would change. It also returns null when the
+// folder would contain an item chosen from another snapshot: dropping that
+// item would restore the folder's snapshot in place of the version the user
+// chose for it, so no action is offered.
+//
+// Names with U+FFFD are refused on every backend. When the refused request has
+// none, the refusal came from a Windows backend and a backslash, so those items
+// are replaced instead, as the Restore page does for its single item.
+function containingFolderRestoreItems(items: ReviewedRestoreItem[]): { items: ReviewedRestoreItem[]; folders: string[] } | null {
+	const refusedChar = items.some((item) => item.path.includes("\uFFFD")) ? "\uFFFD" : "\\";
+	const replaced = items.map((item) => item.path.includes(refusedChar) ? { ...item, path: restorableContainingFolder(item.path) } : item);
+	if (replaced.some((item) => item.path === "") || replaced.every((item, index) => item === items[index])) return null;
+	const kept: ReviewedRestoreItem[] = [];
+	const folders: string[] = [];
+	for (const [index, item] of replaced.entries()) {
+		const covering = replaced.find((other, otherIndex) => otherIndex !== index &&
+			(other.path === item.path ? otherIndex < index : item.path.startsWith(`${other.path}/`)));
+		if (!covering) {
+			kept.push(item);
+			if (item !== items[index]) folders.push(item.path);
+			continue;
+		}
+		if (covering.snapshotId !== item.snapshotId || covering.nativeRootId !== item.nativeRootId) return null;
+	}
+	return { items: kept, folders };
+}
 
 function resultKey(result: FileSearchResult) {
 	return JSON.stringify([result.source, result.path]);
@@ -136,10 +168,7 @@ function exactSnapshotVersion(history: FileVersion[] | undefined, snapshotId: st
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
-// Filesystem destinations and native source headers retain their spelling.
 // Relative archive names are slash-delimited regardless of the viewing OS.
-function displayPath(value: string) { return value; }
-function nativeRootLabel(path: string) { return /^[A-Za-z]:[\\/]/.test(path) ? path.replace(/\//g, "\\") : path; }
 function displayFilePath(value: string, source = "") {
 	const windowsSource = /^[A-Za-z]:[\\/]/.test(source) || source.startsWith("\\\\");
 	return windowsSource && !value.includes("\\") ? `\\${value.replace(/\//g, "\\")}` : value ? `/${value}` : "/";
@@ -163,71 +192,32 @@ function splitDisplayPath(value: string, windows = false) {
 		: { parent: value.slice(0, separator + 1), name: value.slice(separator + 1) };
 }
 
-function FilePathLabel({ value, source, tooltipPath }: { value: string; source?: string; tooltipPath?: string }) {
+// withinJob: the row belongs to a job-owned source, so its tooltip shows the
+// item's path within the job (for example 2024\IMG_001.jpg) instead of a full
+// native path. Unmanaged sources keep the native presentation.
+//
+// tooltipPath (the restore-selection panel) and floating (the search results
+// list) render the tooltip with FloatingTooltip, because both boxes clip a
+// popup rendered inside the label. The other callers are in a Modal and keep
+// the shared Tooltip, which opens above the dialog.
+function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false, floating = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean; floating?: boolean }) {
     const path = displayFilePath(value, source);
+	const tooltipPath = withinJob && nativeTooltipPath !== undefined ? pathWithinJob(value, source ?? "") : nativeTooltipPath;
     const parts = splitDisplayPath(path, path.startsWith("\\") && !value.includes("\\"));
-    const id = useId();
-    const triggerRef = useRef<HTMLSpanElement>(null);
-    const tooltipRef = useRef<HTMLSpanElement>(null);
-    const [tooltipOpen, setTooltipOpen] = useState(false);
-    const [tooltipPosition, setTooltipPosition] = useState<{ left: number; top: number }>();
-
-    useEffect(() => {
-        if (!tooltipPath || !tooltipOpen) return;
-        const positionTooltip = () => {
-            const trigger = triggerRef.current;
-            const tooltip = tooltipRef.current;
-            if (!trigger || !tooltip) return;
-            const triggerBox = trigger.getBoundingClientRect();
-            const tooltipBox = tooltip.getBoundingClientRect();
-            const left = Math.max(16, Math.min(triggerBox.left, window.innerWidth - tooltipBox.width - 16));
-            const below = triggerBox.bottom + 8;
-            const top = below + tooltipBox.height <= window.innerHeight - 16
-                ? below
-                : Math.max(16, triggerBox.top - tooltipBox.height - 8);
-            setTooltipPosition({ left, top });
-        };
-        positionTooltip();
-        window.addEventListener("resize", positionTooltip);
-        document.addEventListener("scroll", positionTooltip, true);
-        return () => {
-            window.removeEventListener("resize", positionTooltip);
-            document.removeEventListener("scroll", positionTooltip, true);
-        };
-    }, [tooltipOpen, tooltipPath]);
-
-    const label = <span className="file-path-label"><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></span>;
+    const text = <><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></>;
     if (tooltipPath) return (
-        <span
-            ref={triggerRef}
-            className="file-path-label tooltip-trigger"
-            tabIndex={0}
-            aria-label={tooltipPath}
-            title={`Native source: ${source ?? ""}\nNative path: ${value}`}
-            aria-describedby={id}
-            onMouseEnter={() => { setTooltipPosition(undefined); setTooltipOpen(true); }}
-            onMouseLeave={() => setTooltipOpen(false)}
-            onFocus={() => { setTooltipPosition(undefined); setTooltipOpen(true); }}
-            onBlur={() => setTooltipOpen(false)}
-        >
-            <span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span>
-            {createPortal(
-                <span
-                    ref={tooltipRef}
-                    id={id}
-                    className={`tooltip-popup find-full-path-tooltip${tooltipOpen ? " open" : ""}`}
-                    role="tooltip"
-                    style={tooltipOpen && tooltipPosition
-                        ? { left: tooltipPosition.left, top: tooltipPosition.top, visibility: "visible" }
-                        : { visibility: "hidden" }}
-                >{tooltipPath}</span>,
-                document.body,
-            )}
-        </span>
+        <FloatingTooltip
+            className="file-path-label"
+            content={tooltipPath}
+            label={tooltipPath}
+            title={withinJob ? undefined : `${t("ui.restore.backupSourceTooltip", { source: source ?? "" })}\n${t("ui.restore.snapshotPathTooltip", { path: value })}`}
+        >{text}</FloatingTooltip>
     );
+    const content = withinJob ? pathWithinJob(value, source ?? "") : path;
+    if (floating) return <FloatingTooltip className="file-path-label" content={content} label={content}>{text}</FloatingTooltip>;
     return (
-        <Tooltip content={path}>
-            {label}
+        <Tooltip content={content}>
+            <span className="file-path-label">{text}</span>
         </Tooltip>
     );
 }
@@ -267,7 +257,7 @@ function formatDate(value: string) {
 }
 
 function sourceLabel(result: FileSearchResult) {
-	return nativeRootLabel(result.source || t("ui.findFile.unknownSource"));
+	return displayPath(result.source || t("ui.findFile.unknownSource"));
 }
 
 function presentVersions(history: FileVersion[] | undefined) {
@@ -329,6 +319,9 @@ function FindFilePage({ repoId }: { repoId: string }) {
 	const toast = useToast();
 	const [repos, setRepos] = useState<Repository[] | null>(null);
 	const [engines, setEngines] = useState<EngineDescriptor[]>([]);
+	// Job names and current sources label job-owned File History sources. A
+	// failed load leaves every source shown by its recorded path.
+	const [jobs, setJobs] = useState<BackupJob[] | null>(null);
 	const [selected, setSelected] = useState("");
 	const [query, setQuery] = useState("");
 	const [searchCommand, setSearchCommand] = useState<SearchCommand | null>(null);
@@ -342,6 +335,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 
 	useEffect(() => {
 		let active = true;
+		getJobs().then((nextJobs) => { if (active) setJobs(nextJobs); }).catch(() => undefined);
 		Promise.all([getRepositories(), getEngines()])
 			.then(([nextRepos, engineResponse]) => {
 				if (!active) return;
@@ -421,6 +415,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 						key={repository.id}
 						repository={repository}
 						engines={engines}
+						jobs={jobs}
 						query={query}
 						searchCommand={searchCommand}
 						allVaults
@@ -432,6 +427,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 						key={selected}
 						repository={repos.find((repository) => repository.id === selected)!}
 						engines={engines}
+						jobs={jobs}
 						query={query}
 						searchCommand={searchCommand}
 						forceRefreshSequence={forceRefreshSequence}
@@ -455,6 +451,7 @@ function PortalSurface({ target, children }: { target?: Element; children: React
 function VaultFileHistory({
 	repository,
 	engines,
+	jobs,
 	query,
 	searchCommand,
 	forceRefreshSequence = 0,
@@ -466,6 +463,7 @@ function VaultFileHistory({
 }: {
 	repository: Repository;
 	engines: EngineDescriptor[];
+	jobs: BackupJob[] | null;
 	query: string;
 	searchCommand?: SearchCommand | null;
 	forceRefreshSequence?: number;
@@ -491,6 +489,9 @@ function VaultFileHistory({
     const [searching, setSearching] = useState(false);
 	const [restoring, setRestoring] = useState(false);
     const [reviewedRestore, setReviewedRestore] = useState<ReviewedRestore | null>(null);
+	// Set when the backend refused a selected item's name. offer is the
+	// request to send instead, or null when no containing folder can be offered.
+	const [nameRefusal, setNameRefusal] = useState<{ offer: ReturnType<typeof containingFolderRestoreItems> } | null>(null);
     const [error, setError] = useState("");
     const [indexing, setIndexing] = useState(false);
 	const [indexState, setIndexState] = useState<MetadataIndexState | null>(null);
@@ -516,7 +517,7 @@ function VaultFileHistory({
 	const handledForceRefreshSequence = useRef(0);
 	const restoreReviewSession = useRef(0);
 	const restoreSubmissionGeneration = useRef(0);
-	const restoreSubmissionOwner = useRef<{ session: number; generation: number; requestPending: boolean; handedOff: boolean; observationController: AbortController; controller?: AbortController } | null>(null);
+	const restoreSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
 	const preparationAction = useRef<"access" | "retry" | "force">("access");
 	const preparationRun = useRef(0);
 	const preparationScheduledOrActive = useRef(false);
@@ -591,9 +592,9 @@ function VaultFileHistory({
 						typeof status.index.appliedGeneration === "number" &&
 						status.index.requiredGeneration !== status.index.appliedGeneration;
 					if (!controller.signal.aborted && generation.current === vaultGeneration && retryLeftDirtyGeneration) {
-						// Retry repairs failed entries; one ordinary access preparation then
-						// gives the authoritative header path a chance to certify the still-
-						// dirty generation. Access retains its normal persisted cooldown.
+						// Retry repairs failed entries; one normal access preparation then lets
+						// the header-based path confirm the still-dirty generation. Access keeps
+						// its normal persisted cooldown.
 						retryAccessPrepared = true;
 						status = await prepareMetadata(selected, "access");
 						continue;
@@ -655,7 +656,7 @@ function VaultFileHistory({
 				}
 				if (action === "force") {
 					const succeeded = !status.index.repositoryFailed && status.index.complete && catalogAccepted;
-					toast(succeeded ? "ok" : "error", succeeded ? "Snapshot history refreshed." : "Backup data refresh failed.");
+					toast(succeeded ? "ok" : "error", succeeded ? t("ui.restore.snapshotHistoryRefreshed") : t("ui.restore.backupDataRefreshFailed"));
 				}
 			} catch (reason) {
 				if (!controller.signal.aborted && generation.current === vaultGeneration) setError((reason as Error).message);
@@ -676,7 +677,6 @@ function VaultFileHistory({
 		generation.current++;
 		restoreReviewSession.current++;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
         snapshotRequest.current?.abort();
 		searchRequest.current?.abort();
@@ -689,6 +689,10 @@ function VaultFileHistory({
 		[selectedItems]
 	);
 	const selectedRepository = repository;
+	// A job-owned File History source is labelled by its job (see
+	// jobSourceDisplay.ts). Paths, selections, and restore requests still use
+	// the source and native roots returned by the backend.
+	const sourceJob = (source: string) => fileHistorySourceJob(source, repository.id, jobs);
 	const indexBlocked = Boolean(selected) && (indexing || indexState === null || !indexState.complete);
 	useEffect(() => {
 		onStatusChange(repository.id, { indexBlocked, searching, forcingMetadata });
@@ -723,15 +727,28 @@ function VaultFileHistory({
 			const version = fileVersionForKey(histories[resultKey(result)], chosenVersions[resultKey(result)]);
 			return { snapshotId: version?.snapshotId ?? "", path: result.path, nativeRootId: version?.nativeRootId ?? "" };
 		});
-	const canRestore = selectedResults.length > 0 && !restoreSelectionConflict && Boolean(effectiveTargetPath) && allHistoriesLoaded &&
-		restoreItems.every((item) => Boolean(item.nativeRootId)) &&
-		(mode === "single" ? Boolean(effectiveSingleSnapshot) : allIndividualVersionsChosen);
 	const selectedVersion = (result: FileSearchResult) => {
 		const key = resultKey(result);
 		return mode === "single"
 			? exactSnapshotVersion(histories[key], effectiveSingleSnapshot)
 			: fileVersionForKey(histories[key], chosenVersions[key]);
 	};
+	// Kopia restores a selected folder's contents straight into the
+	// destination, so several items that include a folder would merge there.
+	// The backend refuses such a request; this shows the same text before
+	// review. The chosen version decides whether an item is a folder.
+	const kopiaFolderSelectionConflict = selectedRepository.engine === "kopia" && selectedResults.length > 1 &&
+		selectedResults.some((result) => selectedVersion(result)?.isDir ?? result.isDir)
+		? t("ui.restore.kopiaFolderSelection")
+		: "";
+	// Kopia can restore selected files only into a folder that already exists
+	// (the backend refuses a missing one), so the destination hint says so
+	// whenever the selection includes a file.
+	const kopiaSelectionIncludesFile = selectedRepository.engine === "kopia" &&
+		selectedResults.some((result) => !(selectedVersion(result)?.isDir ?? result.isDir));
+	const canRestore = selectedResults.length > 0 && !restoreSelectionConflict && !kopiaFolderSelectionConflict && Boolean(effectiveTargetPath) && allHistoriesLoaded &&
+		restoreItems.every((item) => Boolean(item.nativeRootId)) &&
+		(mode === "single" ? Boolean(effectiveSingleSnapshot) : allIndividualVersionsChosen);
 	const selectedFolderAncestor = (result: FileSearchResult) => selectedResults
 		.filter((candidate) => (selectedVersion(candidate)?.isDir ?? candidate.isDir) && isSelectionDescendant(result, candidate))
 		.sort((left, right) => canonicalSelectionPath(right).length - canonicalSelectionPath(left).length)[0];
@@ -975,6 +992,7 @@ function VaultFileHistory({
 		restoreReviewSession.current++;
 		restoreSubmissionOwner.current = null;
 		setRestoring(false);
+		setNameRefusal(null);
 		setReviewedRestore({
 			repositoryId: selected,
 			targetPath: effectiveTargetPath,
@@ -999,130 +1017,44 @@ function VaultFileHistory({
 	const dismissReviewedRestore = () => {
 		if (restoreSubmissionOwner.current?.session === restoreReviewSession.current) return false;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoring(false);
+		setNameRefusal(null);
 		setReviewedRestore(null);
 		return true;
 	};
 
-	const cancelColdRestore = () => {
-		restoreSubmissionOwner.current?.controller?.abort();
-	};
-
-    const doRestore = async () => {
-		if (!reviewedRestore) return;
+	// The restore of the selected items runs in the background once the backend
+	// has queued it. The review closes and the dashboard opens the live log for
+	// the returned operation, where the per-item results appear when it ends
+	// and where it can be cancelled (cold storage included).
+    const doRestore = async (items = reviewedRestore?.items) => {
+		if (!reviewedRestore || !items) return;
 		if (restoreSubmissionOwner.current) return;
 		const reviewed = reviewedRestore;
-		const payload = {
-			operationId: window.crypto.randomUUID(),
-			repositoryId: reviewed.repositoryId,
-			targetPath: reviewed.targetPath,
-			items: reviewed.items.map((item) => ({ ...item })),
-			conflictMode: reviewed.conflictMode,
-		};
-		const coldStorage = Boolean(selectedRepository?.coldStorage);
-		const owner = {
-			session: restoreReviewSession.current,
-			generation: ++restoreSubmissionGeneration.current,
-			requestPending: false,
-			handedOff: false,
-			observationController: new AbortController(),
-			controller: coldStorage ? new AbortController() : undefined,
-		};
+		const owner = { session: restoreReviewSession.current, generation: ++restoreSubmissionGeneration.current };
 		restoreSubmissionOwner.current = owner;
 		const ownsSubmission = () => restoreReviewSession.current === owner.session &&
 			restoreSubmissionGeneration.current === owner.generation && restoreSubmissionOwner.current === owner;
         setRestoring(true);
+		setNameRefusal(null);
         try {
-			const preflightTimeout = window.setTimeout(() => owner.observationController.abort(), 5000);
-			let operationAbsent = false;
-			const existing = await getOperation(payload.operationId, owner.observationController.signal)
-				.catch((reason) => {
-					// Exact lookup reports ordinary absence as HTTP 404. Only that
-					// response proves this freshly generated identity is available.
-					if (isOperationNotFound(reason)) {
-						operationAbsent = true;
-						return [];
-					}
-					throw reason;
-				})
-				.finally(() => window.clearTimeout(preflightTimeout));
-			if (!ownsSubmission()) return;
-			if (!operationAbsent) {
-				requireExactOperation(payload.operationId, existing);
-				throw new Error("operation id already exists");
-			}
-			owner.requestPending = true;
-			const request = owner.controller
-				? restoreSelection(payload, owner.controller.signal)
-				: restoreSelection(payload);
-			const handoff = observeSubmittedRestoreOperation(payload.operationId, () =>
-				ownsSubmission() && owner.requestPending && !owner.handedOff,
-				owner.observationController.signal,
-			).then((operation) => {
-				if (!operation || !ownsSubmission() || owner.handedOff) return false;
-				owner.handedOff = true;
-				owner.requestPending = false;
-				owner.observationController.abort();
-				setReviewedRestore(null);
-				navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-				return true;
+			const { operationId } = await restoreSelection({
+				repositoryId: reviewed.repositoryId,
+				targetPath: reviewed.targetPath,
+				items: items.map((item) => ({ ...item })),
+				conflictMode: reviewed.conflictMode,
 			});
-			let outcome: Awaited<ReturnType<typeof restoreSelection>> | undefined;
-			let requestError: unknown;
-			try {
-				outcome = await request;
-			} catch (reason) {
-				requestError = reason;
-			}
-			// Native execution can finish and make the durable row terminal before
-			// the POST reports its HTTP error. Keep exact handoff ownership until the
-			// separately bounded observer settles so that result truth is not lost.
-			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or this was a pre-row rejection. AbortError and
-			// transport failures are different because server work may still continue.
-			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
-			const handedOff = await handoff;
-			owner.observationController.abort();
-			if (!handedOff && ownsSubmission()) {
-				const finalController = new AbortController();
-				owner.observationController = finalController;
-				const finalTimeout = window.setTimeout(() => finalController.abort(), 5000);
-				let finalAbsent = false;
-				const finalMatches = await getOperation(payload.operationId, finalController.signal)
-					.catch((reason) => {
-						if (isOperationNotFound(reason)) {
-							finalAbsent = true;
-							return [];
-						}
-						throw reason;
-					})
-					.finally(() => window.clearTimeout(finalTimeout));
-				if (!ownsSubmission()) return;
-				if (!finalAbsent) {
-					requireExactOperation(payload.operationId, finalMatches);
-					owner.handedOff = true;
-					finalController.abort();
-					setReviewedRestore(null);
-					navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-					return;
-				}
-				if (requestError) throw requestError;
-				if (!outcome) return;
-				owner.requestPending = false;
-				if (outcome.status === "success") toast("ok", `Restored ${outcome.restored} selected item${outcome.restored === 1 ? "" : "s"}.`);
-				else toast("error", `Restore was ${outcome.status}: ${outcome.restored} restored, ${outcome.failed} failed, ${outcome.notAttempted} not attempted.`);
-				setReviewedRestore(null);
-			}
+			if (!ownsSubmission()) return;
+			setReviewedRestore(null);
+			navigate(`/?operation=${encodeURIComponent(operationId)}`);
         } catch (reason) {
-			const requestWasPending = owner.requestPending;
-			owner.requestPending = false;
-			owner.observationController.abort();
-			if (ownsSubmission() && !owner.handedOff) {
-				if (requestWasPending && coldStorage && (reason as Error).name === "AbortError") toast("info", "Cold storage restore was interrupted locally. Provider restore requests may continue.");
-				else toast("error", (reason as Error).message);
+			if (!ownsSubmission()) return;
+			if (reason instanceof APIError && reason.code === RESTORE_SELECTION_NAME_INVALID) {
+				setNameRefusal({ offer: containingFolderRestoreItems(items) });
+				return;
 			}
+			toast("error", (reason as Error).message);
         } finally {
 			if (ownsSubmission()) {
 				restoreSubmissionOwner.current = null;
@@ -1138,13 +1070,19 @@ function VaultFileHistory({
 		const checked = !item.isSource && Boolean(selectedItems[resultKey(item)]);
 		const childPage = browsePages[key];
 		const childError = browseErrors[key];
-		const source = nativeRootLabel(item.source);
+		const job = sourceJob(item.source);
+		const source = job ? job.name : displayPath(item.source);
 		const label = item.isSource ? source : item.name;
 		const selectionLabel = checked
             ? t("ui.fileHistory.deselectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source })
             : t("ui.fileHistory.selectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source });
 		const disabledMessage = item.isSource ? "" : parentSelectionMessage(item);
-		const rowLabel = <strong>{label}</strong>;
+		// Source rows of a job show the job name with the "Job source:" tooltip;
+		// item rows under it show their path within the job. The browse tree
+		// clips its content like the results list, so the tooltip is floating.
+		const rowLabel = job
+			? <FloatingTooltip content={item.isSource ? jobSourceTooltip(job) : pathWithinJob(item.path, item.source)} label={label} className="job-source-label"><strong className="job-source-name">{label}</strong></FloatingTooltip>
+			: <strong>{label}</strong>;
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
 				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={expanded ? t("ui.fileHistory.collapseNamed", { name: label }) : t("ui.fileHistory.expandNamed", { name: label })} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
@@ -1173,12 +1111,13 @@ function VaultFileHistory({
 			{selectedResults.map((result) => {
 				const key = resultKey(result);
 				const versions = presentVersions(histories[key]).sort(newestVersionFirst);
-					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
+					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
 			})}
 		</div>}
-		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
+		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
 		{restoreSelectionConflict && <div className="inline-error" role="alert">{restoreSelectionConflict}</div>}
-		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
+		{kopiaFolderSelectionConflict && <div className="inline-error" role="alert">{kopiaFolderSelectionConflict}</div>}
+		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={kopiaSelectionIncludesFile ? t("ui.restore.chooseExistingFolder") : t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
 			<button className="btn primary find-restore-button" disabled={!canRestore} onClick={reviewRestore}><Icon name="restore" size={14} />{t("ui.pages.findfile.review.restore")}</button>
 		</aside>;
 		const showSearchSurface = allVaults || Boolean(error || indexing || searching || matchesVisible || indexState?.repositoryFailed || (indexState?.failedSnapshots ?? 0) > 0);
@@ -1206,7 +1145,9 @@ function VaultFileHistory({
 								const checked = Boolean(selectedItems[key]);
 								const path = displayFilePath(result.path, result.source);
 								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
-								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} /></strong><span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span></span></label>;
+								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} withinJob={Boolean(sourceJob(result.source))} floating /></strong>{(() => { const job = sourceJob(result.source); return job
+									? <span className="mono job-source-line">{t("ui.fileHistory.sourceLabel")} <JobSourceLabel job={job} /></span>
+									: <span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span>; })()}</span></label>;
 							})}</div>
 							{searchPage.hasMore && <button className="btn find-presentation-load-more" onClick={() => void loadMoreResults()} disabled={searchPage.loading}>{searchPage.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.matches")}</button>}
 						</section>
@@ -1241,9 +1182,9 @@ function VaultFileHistory({
 				{(restoreCapability(selectedRepository, engines)?.conflictModes.length ?? 0) <= 1
 					? <p className="muted">{restoreCapability(selectedRepository, engines)?.conflictModes[0]?.description}</p>
 					: <label className="field"><span>{t("ui.pages.findfile.should.existing.files.be.overwritten")}</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-				{restoring && selectedRepository?.coldStorage && <p className="recovery-warning">{t("ui.pages.findfile.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 				</fieldset>
-				<div className="modal-footer"><button className="btn" disabled={restoring && !selectedRepository?.coldStorage} onClick={restoring && selectedRepository?.coldStorage ? cancelColdRestore : dismissReviewedRestore}>{restoring && selectedRepository?.coldStorage ? t("ui.pages.findfile.cancel.restore") : t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
+				{nameRefusal && <div className="inline-error" role="alert">{t("ui.restore.selectionNameInvalid")}{nameRefusal.offer && <> <button type="button" className="btn" disabled={restoring} onClick={() => void doRestore(nameRefusal.offer?.items)}>{t("ui.restore.restoreContainingFolder")}</button>{nameRefusal.offer.folders.map((folder) => <span key={folder}> <strong><FilePathLabel value={folder} /></strong></span>)}</>}</div>}
+				<div className="modal-footer"><button className="btn" disabled={restoring} onClick={dismissReviewedRestore}>{t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
 			</Modal>}
 
 		</>

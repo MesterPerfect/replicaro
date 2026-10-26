@@ -56,7 +56,7 @@ Creating backups should be easy. Replicaro makes it easy. Get started in five mi
 
 ## Restoring Made Easier
 
-Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders, with each having its own history. The choice is yours.
+Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders (Kopia vaults: one folder at a time, or several files together), with each having its own history. The choice is yours.
 
 Whole snapshot restore is supported too, of course.
 
@@ -72,7 +72,7 @@ View the history of your backed up files & folders, so you can restore specific 
 
 #### Search Across File History
 
-Search by name or path, compare available versions, select multiple files or folders, and restore.
+Search by name or path, compare available versions, select multiple files or folders (Kopia vaults: one folder at a time, or several files together), and restore.
 
 ![Searching for files in Replicaro File History](./readme-assets/file-history-dark.png)
 
@@ -100,7 +100,9 @@ Don't want to search? No problem. You can also explore a vault just like a folde
     <tr><td width="760">Azure Blob Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Google Cloud Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">SFTP/SSH</td><td align="center" width="240">✓</td></tr>
+    <tr><td width="760">WebDAV (e.g., Nextcloud, ownCloud, Apache, nginx, and more)</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Local, external, and mounted storage</td><td align="center" width="240">✓</td></tr>
+    <tr><td width="760">Any remote supported by Rclone</td><td align="center" width="240">✓</td></tr>
   </tbody>
 </table>
 
@@ -150,7 +152,7 @@ Build backup jobs around your data. No need to understand command-line.
   
 - **Removable and network storage detection.**
 
-  - If your source data or destination vault is removable/external/flash storage or a network location, Replicaro automatically pauses backup jobs when that removable or network storage is unavailable and automatically resumes jobs when it becomes available. Yes, Replicaro works even when the namespace (e.g., drive letter) of your removable/external/flash storage changes. It is like magic.
+  - If your source data or destination vault is removable/external/flash storage or a network location, Replicaro automatically pauses backup jobs when that removable or network storage is unavailable and automatically resumes jobs when it becomes available. It is like magic.
 
 - **Object lock & immutability.**
 
@@ -166,7 +168,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Backup multiple computers to the same vault.**
 
-  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, and OneDrive vaults. You can use one Dropbox, Google Drive, or OneDrive account to hold multiple vaults, but each vault can only be used by one computer.)
+  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, OneDrive, and Any Rclone Remote vaults. You can use one Dropbox, Google Drive, or OneDrive account, or one rclone remote, to hold multiple vaults, but each vault can only be used by one computer.)
 
 - **Bring an existing vault.**
 
@@ -198,7 +200,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Multi-language and internationalization support.**
 
-  - English not your prefered language? No problem. Replicaro also supports Arabic (Modern Standard), Bengali, Brazilian Portuguese, Cantonese (Traditional Chinese), Dutch, European Portuguese, French, German, Greek, Hebrew, Hindi, Indonesian, Irish, Italian, Japanese, Korean, Malaysian Malay, Mandarin (Simplified Chinese), Nigerian Pidgin, Persian (Farsi), Polish, Russian, Spanish, Turkish, Urdu, and Vietnamese.
+  - English not your prefered language? No problem. Replicaro also supports Arabic (Modern Standard), Bengali, Brazilian Portuguese, Cantonese (Simplified Chinese), Cantonese (Traditional Chinese), Dutch, European Portuguese, French, German, Greek, Hebrew, Hindi, Indonesian, Irish, Italian, Japanese, Korean, Malaysian Malay, Mandarin (Simplified Chinese), Mandarin (Traditional Chinese), Nigerian Pidgin, Persian (Farsi), Polish, Russian, Spanish, Turkish, Urdu, and Vietnamese.
 
 - **Make the interface yours.**
 
@@ -215,100 +217,6 @@ Build backup jobs around your data. No need to understand command-line.
 <div align="center">
   <strong>Your data. Your storage. Your protection.</strong>
 </div>
-
-## Translate Replicaro
-
-The canonical English interface catalog is at
-[`code/frontend/public/locales/en.json`](code/frontend/public/locales/en.json).
-Translations are contributed through pull requests and require review before
-they are included in the app. A new catalog is a candidate until a maintainer
-explicitly registers its locale in the frontend catalog registry, backend
-catalog loader, and supported language setting. The v1.0.2 source includes
-English, German, French, Arabic, Urdu, Hindi, Spanish, Italian, Simplified
-Chinese (Mandarin), Traditional Chinese (Cantonese), Japanese, Irish, Korean,
-Malay, Indonesian, Turkish, Hebrew, European Portuguese, Brazilian Portuguese,
-Russian, Polish, Dutch, Bengali, Greek, Persian (Farsi), Vietnamese, and Nigerian
-Pidgin. The new translations require fluent-speaker and maintainer approval
-before release. Updates to an already registered
-translation can remain catalog-only.
-New catalogs must also be included in the
-[`public-source manifest`](code/build/unsigned/public-source-v1.json) so public
-builds receive the same translations as internal builds.
-
-English is the source of truth for every translation. Preserve its meaning,
-including the strength of claims, warnings, qualifications, and uncertainty.
-If an English statement seems incorrect or overstated, raise that as a separate
-source-text issue; do not silently correct, weaken, or strengthen it in another
-language. Natural phrasing and the target language's grammar should convey the
-same message.
-
-The shared English catalog serves both British and American English. Regional
-Spanish, French, and other OS language variants use their shared language
-catalog when no exact regional catalog is registered. European Portuguese
-(`pt-PT`) and Brazilian Portuguese (`pt-BR`) have separate catalogs. Matching
-tries an exact locale, then progressively less specific tags, then a registered
-variant of the same language before moving to the next OS preference; English
-is the final fallback. Same-language variant fallback uses sorted catalog order,
-so `pt` and `pt-AO` currently select `pt-BR`. Users can choose a specific catalog
-in Appearance. Text and formatting both use the selected catalog's locale;
-there is no separate regional-format setting.
-
-The language area always includes **Reset to English**, with that exact English
-label excluded from translation. It saves the English preference immediately;
-other unsaved settings stay in the form until the user saves them separately.
-
-Arabic (`ar`) uses Modern Standard Arabic, Persian (`fa`) uses standard Iranian
-Persian, Malay (`ms`) uses Malaysian Malay, and Pidgin (`pcm`) uses Nigerian
-Pidgin. Mandarin (`zh-Hans`) uses Simplified Chinese; Cantonese (`yue-Hant`)
-uses Traditional Chinese. OS tags beginning with `zh` select Mandarin, including
-Traditional Chinese OS settings; Cantonese requires a `yue` tag or an explicit
-selection. These catalogs are not automatic script or dialect conversions.
-
-All Replicaro-formatted dates use the **Gregorian calendar** in every language,
-including Arabic and Persian. Month names, digits, field order, and time
-formatting use the selected locale through the browser's `Intl` data. A browser
-that lacks formatting data for a locale may use its default locale for dates
-and numbers; the calendar stays Gregorian. Use `formatDisplayDate` or
-`formatDisplayDateTime` from `code/frontend/src/i18n.ts` for UI dates so locale
-defaults cannot switch the calendar. This applies to snapshot dates, activity and profile timestamps,
-and date-picker labels. It does not rewrite stored timestamps, time zones, raw
-engine output, or native retention calendar semantics. Support-report payloads
-remain English, including when their surrounding UI is translated.
-
-1. Fork the [public Replicaro repository](https://github.com/replicaro/replicaro)
-   and create a branch in your fork.
-2. Copy `code/frontend/public/locales/en.json` in the same directory. Name the
-   copy for the correct BCP 47 locale identifier, such as `fr-FR.json`. Use a
-   hyphen between language and region subtags, rather than an underscore.
-   Set the top-level `locale` to that identifier and `direction` for the language.
-   The bundled Arabic, Urdu, Hebrew, and Persian catalogs use `rtl`; the other
-   bundled catalogs use `ltr`.
-3. Translate the values. Keep every message key and placeholder exactly as in
-   `en.json`; do not add or remove message keys. Preserve interpolation syntax.
-   For plural messages, use the categories required by the target locale, which
-   can differ from English (`one` and `other`); the locale validator checks them.
-4. Keep **Replicaro**, **Restic**, **Kopia**, and **rclone** unchanged. Preserve
-   user-provided names, paths, commands, configuration values, and log samples.
-   These are data, not prose to translate.
-5. Write complete, natural sentences in the target language. Check labels and
-   messages in context, especially at narrow window widths. Do not put raw
-   HTML, scripts, or external links in catalog values.
-
-The public translation PR check runs these commands. Run them locally from
-`code/frontend` before opening a pull request:
-
-```sh
-npm ci
-npm run validate:locales
-npm run build
-```
-
-Open a pull request against the public repository. State the language and
-exact locale identifier, how a fluent speaker reviewed the wording, and include
-screenshots of representative screens at desktop and narrow widths. A fluent
-speaker and a maintainer must review the translation before it ships. Updates
-to an existing translation normally change only that locale's catalog and any
-bounded metadata needed for it; explain any broader change in the pull request.
 
 ## License
 

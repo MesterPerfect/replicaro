@@ -1,11 +1,14 @@
 package database
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -19,11 +22,18 @@ import (
 var (
 	ErrJobRunActive          = errors.New("backup job has queued or running target runs")
 	ErrJobConnectionReserved = errors.New("backup job is reserved by a pending repository connection")
-	ErrJobDefinitionBusy     = errors.New("backup job definition is being deleted")
-	ErrInvalidTargets        = errors.New("at least one unique existing repository target is required")
-	ErrJobSourceImmutable    = errors.New("backup job source cannot be changed after creation")
-	ErrJobSourceChanged      = errors.New("backup job source changed during binding; retry the operation")
-	ErrJobSourceUnbound      = errors.New("imported backup job source is not bound to this computer")
+	// ErrJobDefinitionBusy is what every job admission and edit gets while a
+	// deletion of the job holds its definition gate. The API shows this text to
+	// the user (with the job_being_deleted code the UI translates).
+	ErrJobDefinitionBusy  = errors.New("This job is being deleted.")
+	ErrInvalidTargets     = errors.New("at least one unique existing repository target is required")
+	ErrJobSourceImmutable = errors.New("backup job source cannot be changed after creation")
+	ErrJobSourceChanged   = errors.New("backup job source changed during binding; retry the operation")
+	ErrJobSourceUnbound   = errors.New("imported backup job source is not bound to this computer")
+	// ErrJobDefinitionChanged refuses an edit whose revision no longer matches
+	// the stored definition. The API sends this text with the
+	// job_definition_changed code, which the UI translates.
+	ErrJobDefinitionChanged = errors.New("Job settings have changed since you opened the job. Your current changes were not saved. Please try again.")
 )
 
 type jobDefinitionGateKey struct {
@@ -47,15 +57,37 @@ func acquireJobDefinitionUse(db *sql.DB, jobID string) (func(), error) {
 	return gate.RUnlock, nil
 }
 
-// AcquireJobDefinitionDeletion holds the one local per-job definition gate
-// across deletion admission, exact native cleanup, ownership removal, and the
-// final definition delete. It is intentionally process-local and run-scoped.
-func AcquireJobDefinitionDeletion(db *sql.DB, jobID string) (func(), error) {
+// JobDeletionKind is the operation kind of a job deletion. Its record carries
+// the job ID, so the "anything else queued or running for this job" checks
+// below leave it out; otherwise a deletion would wait for itself.
+const JobDeletionKind = "delete_job"
+
+// HoldJobDefinitionForDeletion takes the one local per-job definition gate for
+// a job deletion and keeps it across waiting for the job's other work, exact
+// native cleanup, ownership removal, and the final definition delete. It
+// blocks until in-flight admissions (short read holds) finish. Once it is
+// waiting or held, every new admission and edit of the job fails with
+// ErrJobDefinitionBusy, which is how a pending deletion holds back new work:
+// scheduled runs are skipped without an issue, user requests are refused. It
+// is process-local; after a restart the interrupted deletion releases nothing
+// because nothing is held.
+func HoldJobDefinitionForDeletion(db *sql.DB, jobID string) func() {
 	gate := jobDefinitionGate(db, jobID)
-	if !gate.TryLock() {
-		return nil, ErrJobDefinitionBusy
+	gate.Lock()
+	var once sync.Once
+	return func() { once.Do(gate.Unlock) }
+}
+
+// JobHasOtherActiveWork reports whether anything other than a deletion of the
+// job is queued or running for it. A job deletion polls this before taking any
+// vault lock (see HoldJobDefinitionForDeletion).
+func JobHasOtherActiveWork(db *sql.DB, jobID string) (bool, error) {
+	var active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`,
+		jobID, JobDeletionKind).Scan(&active); err != nil {
+		return false, err
 	}
-	return gate.Unlock, nil
+	return active > 0, nil
 }
 
 func requireJobConnectionUnreserved(tx *sql.Tx, jobID string) error {
@@ -118,6 +150,98 @@ func NextRunFrom(schedule string, from time.Time) string {
 	return ""
 }
 
+// nextJobRunFrom is NextRunFrom for backup job schedules. A job's daily,
+// weekly, monthly and every-N-months schedules step on the local calendar, so
+// they keep their local time of day (and a month step its day of the month)
+// across daylight-saving changes. Hourly and custom-minute intervals stay
+// fixed durations. Vault care keeps NextRunFrom's fixed intervals: Kopia
+// Object Lock maintenance stores the interval as its native full interval,
+// and its lock-extension margin assumes runs are never further apart than
+// that.
+func nextJobRunFrom(schedule string, from time.Time) string {
+	days := func(count int) func(time.Time) time.Time {
+		return func(reading time.Time) time.Time { return reading.AddDate(0, 0, count) }
+	}
+	months := func(count int) func(time.Time) time.Time {
+		return func(reading time.Time) time.Time { return nextCalendarMonths(reading, count) }
+	}
+	switch schedule {
+	case "daily":
+		return schedulevalue.NextLocal(from, time.Local, days(1)).Format(time.RFC3339)
+	case "weekly":
+		return schedulevalue.NextLocal(from, time.Local, days(7)).Format(time.RFC3339)
+	case "monthly":
+		return schedulevalue.NextLocal(from, time.Local, months(1)).Format(time.RFC3339Nano)
+	}
+	if count, valid := schedulevalue.CustomMonths(schedule); valid {
+		return schedulevalue.NextLocal(from, time.Local, months(count)).Format(time.RFC3339Nano)
+	}
+	return NextRunFrom(schedule, from)
+}
+
+// nextRunBeyondSchedule reports a saved next run that lies further ahead
+// than one whole schedule period. Normal scheduling never produces one; it
+// comes from a clock that jumped forward and back (or a time zone change), and
+// left alone it would hold the job or vault task back until that date.
+//
+// Cron has no fixed period, so the saved run is flagged only when it lies
+// after the second occurrence from now. Comparing with the first occurrence
+// would treat a small backward clock step just after a run as a jump: the
+// saved next run is then one occurrence ahead, and resetting it would bring
+// back the slot that just ran and run it twice.
+//
+// Apart from cron, the saved run is measured against a whole period rather
+// than against the next occurrence computed from now, because a run computed
+// earlier can legitimately lie after that occurrence. A calendar job run
+// computed in the first pass through a repeated autumn hour falls after one
+// computed in the second pass, and month steps from the 30th and from the
+// 31st both land on the last day of a 30-day month, so a step taken now can
+// land almost a day earlier than one taken the day before.
+func nextRunBeyondSchedule(schedule string, next, now time.Time) bool {
+	if !next.After(now) {
+		return false
+	}
+	if _, cronSchedule := schedulevalue.CronExpression(schedule); cronSchedule {
+		first, valid := schedulevalue.NextCron(schedule, now)
+		if !valid {
+			return false
+		}
+		second, valid := schedulevalue.NextCron(schedule, first)
+		return valid && next.After(second)
+	}
+	// Calendar schedules can run up to a daylight-saving shift longer than
+	// their nominal period; the margin covers any shift in use. Fixed
+	// intervals allow for small clock corrections and for the storage
+	// recheck delay: a scheduled vault check or maintenance that finds its
+	// storage unavailable is moved that far ahead, more than one period
+	// for intervals under five minutes, and a smaller margin would pull it
+	// straight back.
+	const calendarMargin = 3 * time.Hour
+	const fixedMargin = UnavailableStorageRecheckInterval
+	var period, margin time.Duration
+	switch schedule {
+	case "hourly":
+		period, margin = time.Hour, fixedMargin
+	case "daily":
+		period, margin = 24*time.Hour, calendarMargin
+	case "weekly":
+		period, margin = 7*24*time.Hour, calendarMargin
+	case "monthly":
+		period, margin = 31*24*time.Hour, calendarMargin
+	default:
+		if minutes, valid := schedulevalue.CustomMinutes(schedule); valid {
+			period, margin = time.Duration(minutes)*time.Minute, fixedMargin
+		} else if months, valid := schedulevalue.CustomMonths(schedule); valid {
+			period, margin = time.Duration(months)*31*24*time.Hour, calendarMargin
+		} else {
+			return false
+		}
+	}
+	// Compared this way so the longest custom intervals cannot overflow.
+	ahead := next.Sub(now)
+	return ahead > period && ahead-period > margin
+}
+
 func nextCalendarMonths(from time.Time, months int) time.Time {
 	year, month, day := from.Date()
 	nextMonthStart := time.Date(year, month+time.Month(months), 1, from.Hour(), from.Minute(), from.Second(), from.Nanosecond(), from.Location())
@@ -140,7 +264,7 @@ const jobColumns = `id, name, source, source_storage_version, source_storage_key
 		source_storage_json, source_binding_state, resolved_source_path, resolved_source_observed_at, schedule, enabled,
 	COALESCE(next_run, ''), COALESCE(last_run, ''), retention,
 	retention_hourly, retention_daily, retention_weekly, retention_monthly, retention_yearly,
-	excludes, tag,
+	excludes, skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 	before_script_path, before_script_must_succeed, after_script_path, after_script_must_succeed,
 	engine_settings, portable_target_ids`
 
@@ -202,7 +326,8 @@ func scanJob(scan func(dest ...any) error) (models.BackupJob, error) {
 		&j.SourceStorageDescriptorJSON, &j.SourceBindingState, &j.ResolvedSourcePath,
 		&j.ResolvedSourceObservedAt, &j.Schedule, &j.Enabled, &j.NextRun, &j.LastRun,
 		&j.Retention, &hourly, &daily, &weekly, &monthly, &yearly,
-		&j.Excludes, &j.Tag, &j.BeforeScriptPath, &j.BeforeScriptMustSucceed,
+		&j.Excludes, &j.SkipNoBackupFolders, &j.SkipCacheDirFolders, &j.SkipMarkerFileName,
+		&j.Tag, &j.BeforeScriptPath, &j.BeforeScriptMustSucceed,
 		&j.AfterScriptPath, &j.AfterScriptMustSucceed, &settingsJSON, &targetIDsJSON)
 	if err == nil {
 		j.RetentionHourly = nullableRetentionValue(hourly)
@@ -225,30 +350,6 @@ func scanJob(scan func(dest ...any) error) (models.BackupJob, error) {
 	return j, err
 }
 
-func setResolvedSourcePathTx(tx *sql.Tx, jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	return setResolvedSourcePath(tx.Exec, jobID, configuredPath, resolvedPath, observedAt)
-}
-
-func SetResolvedSourcePath(db *sql.DB, jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	return setResolvedSourcePath(db.Exec, jobID, configuredPath, resolvedPath, observedAt)
-}
-
-func setResolvedSourcePath(exec func(string, ...any) (sql.Result, error), jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	stored := resolvedPath
-	if stored == configuredPath {
-		stored = ""
-	}
-	result, err := exec(`UPDATE backup_jobs SET resolved_source_path=?, resolved_source_observed_at=? WHERE id=?`,
-		stored, observedAt.UTC().Format(time.RFC3339Nano), jobID)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func nullableRetentionValue(value sql.NullInt64) *int {
 	if !value.Valid {
 		return nil
@@ -265,6 +366,16 @@ func populateJobTargets(db *sql.DB, job *models.BackupJob) error {
 				WHERE o.job_id = t.job_id AND o.repository_id = t.repository_id
 				  AND o.status IN ('queued', 'running')
 				ORDER BY o.started_at DESC, o.id DESC LIMIT 1), ''),
+			-- last_status has no qualifier of its own. FinishBackupOperationWithIssueKind
+			-- sets it in the same transaction as the operation's status and issue_kind,
+			-- so the qualifier is read from the target's newest finished backup
+			-- operation by finished_at. If the clock moved backwards between two runs,
+			-- the previous run's qualifier can show until the next backup finishes.
+			-- An older build, or a pruned operation, leaves '' (plain result).
+			CASE WHEN t.last_status = 'completed_with_issues' THEN COALESCE((SELECT o.issue_kind FROM operations o
+				WHERE o.job_id = t.job_id AND o.repository_id = t.repository_id
+				  AND o.kind = 'backup' AND o.status NOT IN ('queued', 'running')
+				ORDER BY o.finished_at DESC, o.started_at DESC, o.id DESC LIMIT 1), '') ELSE '' END,
 			s.pending_catchup, s.coalesced_missed_count, s.first_deferred_due_at, s.last_due_at,
 			s.source_availability, s.source_reason_code, s.source_checked_at,
 			s.target_availability, s.target_reason_code, s.target_checked_at,
@@ -289,7 +400,7 @@ func populateJobTargets(db *sql.DB, job *models.BackupJob) error {
 		var target models.BackupJobTarget
 		if err := rows.Scan(&target.RepositoryID, &target.RepositoryName, &target.Engine,
 			&target.LastRun, &target.LastStatus, &target.LogicalSizeBytes, &target.LogicalSizeMeasuredAt, &target.OperationID,
-			&target.PendingCatchUp, &target.CoalescedMissedCount,
+			&target.LastIssueKind, &target.PendingCatchUp, &target.CoalescedMissedCount,
 			&target.FirstDeferredDueAt, &target.LastDueAt,
 			&target.SourceAvailability, &target.SourceAvailabilityReason,
 			&target.SourceAvailabilityCheck, &target.TargetAvailability,
@@ -305,6 +416,7 @@ func populateJobTargets(db *sql.DB, job *models.BackupJob) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	job.UnattachedTargets = job.HasUnattachedTargets()
 	selectPresentedJobSize(job)
 	return nil
 }
@@ -395,6 +507,7 @@ func ListJobs(db *sql.DB) ([]models.BackupJob, error) {
 		if err := populateJobTargets(db, &jobs[index]); err != nil {
 			return nil, err
 		}
+		jobs[index].Revision = jobDefinitionRevision(jobs[index])
 	}
 	return jobs, nil
 }
@@ -421,7 +534,90 @@ func GetJob(db *sql.DB, id string) (models.BackupJob, error) {
 	if err != nil {
 		return job, err
 	}
-	return job, populateJobTargets(db, &job)
+	if err := populateJobTargets(db, &job); err != nil {
+		return job, err
+	}
+	job.Revision = jobDefinitionRevision(job)
+	return job, nil
+}
+
+// jobDefinitionRevision digests the parts of a stored job that a job edit
+// rewrites, so an edit can show it started from the definition that is
+// stored now. A job edit sends back every field, so an edit made from an
+// outdated copy (a tab left open, or a copy read before profile sync applied
+// another computer's change) would put back old values. A lower retention
+// from such a copy makes the next native forget delete snapshots, and an old
+// target list silently drops a vault. Comparing this digest refuses that edit
+// instead.
+//
+// Included: name, source, schedule, the six retention values, excludes, the
+// three marker-file choices, tag,
+// both script paths and must-succeed flags, engine settings, the target vault
+// IDs, and the portable target IDs (profile sync merges other computers'
+// vaults into these, and connecting a vault adds a target and replaces engine
+// settings).
+//
+// Left out on purpose, because they change without anyone editing the job and
+// would refuse edits for no reason: enabled (it has its own endpoint, and an
+// edit always keeps the stored value), next and last run, the local source
+// binding facts and binding state (probes record and convert them, and an
+// edit always keeps the stored binding), the source alias and its
+// observation time, and everything per target other than its vault ID (run
+// status, schedule state, availability, policy status, sizes, vault name and
+// engine).
+//
+// The digest is computed when a job is loaded and is never stored, so it
+// needs no schema change. Don't add a field here without checking that only
+// an edit or profile sync changes it.
+func jobDefinitionRevision(job models.BackupJob) string {
+	targets := make([]string, 0, len(job.Targets))
+	for _, target := range job.Targets {
+		targets = append(targets, target.RepositoryID)
+	}
+	slices.Sort(targets)
+	portable := append([]string(nil), job.PortableTargetIDs...)
+	slices.Sort(portable)
+	engineSettings := job.EngineSettings
+	if engineSettings == nil {
+		engineSettings = models.EngineSettings{}
+	}
+	// A struct keeps the field order fixed, and encoding/json writes map keys
+	// in sorted order, so the same definition always encodes the same way.
+	encoded, err := json.Marshal(struct {
+		Name                    string                `json:"name"`
+		Source                  string                `json:"source"`
+		Schedule                string                `json:"schedule"`
+		Retention               int                   `json:"retention"`
+		RetentionHourly         *int                  `json:"retentionHourly"`
+		RetentionDaily          *int                  `json:"retentionDaily"`
+		RetentionWeekly         *int                  `json:"retentionWeekly"`
+		RetentionMonthly        *int                  `json:"retentionMonthly"`
+		RetentionYearly         *int                  `json:"retentionYearly"`
+		Excludes                string                `json:"excludes"`
+		SkipNoBackupFolders     bool                  `json:"skipNoBackupFolders"`
+		SkipCacheDirFolders     bool                  `json:"skipCacheDirFolders"`
+		SkipMarkerFileName      string                `json:"skipMarkerFileName"`
+		Tag                     string                `json:"tag"`
+		BeforeScriptPath        string                `json:"beforeScriptPath"`
+		BeforeScriptMustSucceed bool                  `json:"beforeScriptMustSucceed"`
+		AfterScriptPath         string                `json:"afterScriptPath"`
+		AfterScriptMustSucceed  bool                  `json:"afterScriptMustSucceed"`
+		EngineSettings          models.EngineSettings `json:"engineSettings"`
+		Targets                 []string              `json:"targets"`
+		PortableTargets         []string              `json:"portableTargets"`
+	}{
+		job.Name, job.Source, job.Schedule, job.Retention,
+		job.RetentionHourly, job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly,
+		job.Excludes, job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
+		job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
+		job.AfterScriptPath, job.AfterScriptMustSucceed, engineSettings, targets, portable,
+	})
+	if err != nil {
+		// Every field above always encodes; an empty revision never matches.
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func validateTargets(tx *sql.Tx, targets []models.BackupJobTarget) error {
@@ -455,6 +651,9 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 	if err := models.ValidateRetentionPolicy(job); err != nil {
 		return "", err
 	}
+	if err := models.ValidateSkipMarkerFileName(job.SkipMarkerFileName); err != nil {
+		return "", err
+	}
 	if err := validateJobSourceBinding(job); err != nil {
 		return "", err
 	}
@@ -467,6 +666,10 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 		return "", err
 	}
 	id := job.ID
+	// A job restored with its original UUID (a dormant recovery definition)
+	// is already carried by snapshots in its vaults; a server-assigned UUID
+	// cannot be, so only the former changes any File History grouping.
+	restoredID := id != ""
 	if id == "" {
 		id = uuid.New().String()
 	}
@@ -496,9 +699,10 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 			(id, name, source, source_storage_version, source_storage_key, source_storage_json,
 			source_binding_state, schedule, enabled, next_run, last_run, retention,
 		retention_hourly, retention_daily, retention_weekly, retention_monthly, retention_yearly,
-		excludes, tag, before_script_path, before_script_must_succeed,
+		excludes, skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name,
+		tag, before_script_path, before_script_must_succeed,
 		after_script_path, after_script_must_succeed, engine_settings, portable_target_ids)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, job.Name, job.Source, job.SourceStorageVersion, job.SourceStorageKey,
 		job.SourceStorageDescriptorJSON, func() string {
 			if job.SourceBindingState == "" {
@@ -506,9 +710,10 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 			}
 			return job.SourceBindingState
 		}(), job.Schedule, job.Enabled,
-		NextRunFrom(job.Schedule, time.Now()), job.Retention,
+		nextJobRunFrom(job.Schedule, time.Now()), job.Retention,
 		job.RetentionHourly, job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly,
-		job.Excludes, job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
+		job.Excludes, job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
+		job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
 		job.AfterScriptPath, job.AfterScriptMustSucceed, string(settingsJSON), string(portableJSON))
 	if err != nil {
 		return "", err
@@ -516,6 +721,13 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 	for _, target := range job.Targets {
 		if _, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)`, id, target.RepositoryID); err != nil {
 			return "", err
+		}
+		// Only a restored or supplied ID can already have snapshots in this
+		// vault; a freshly generated one keeps Kopia's normal first backup.
+		if restoredID {
+			if err := markJobTargetFullSourceRead(tx, id, target.RepositoryID); err != nil {
+				return "", err
+			}
 		}
 	}
 	targetIDs := make([]string, 0, len(job.Targets))
@@ -534,10 +746,29 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	if restoredID {
+		RefreshStaleMetadataGrouping(db, targetIDs)
+	}
 	return id, nil
 }
 
+// UpdateJob saves a job definition as given, including its enabled state,
+// without checking which revision the caller started from. Job edits from
+// the API use UpdateJobAtRevision.
 func UpdateJob(db *sql.DB, job models.BackupJob) error {
+	return updateJob(db, job, false, "")
+}
+
+// UpdateJobAtRevision saves a job edit only when the stored definition still
+// has the revision the caller read; otherwise it changes nothing and returns
+// ErrJobDefinitionChanged. An empty revision skips that check (see the job
+// edit handler). The edit always keeps the stored enabled state, which only
+// the enabled-state endpoint changes.
+func UpdateJobAtRevision(db *sql.DB, job models.BackupJob, revision string) error {
+	return updateJob(db, job, true, revision)
+}
+
+func updateJob(db *sql.DB, job models.BackupJob, definitionEdit bool, expectedRevision string) error {
 	releaseDefinition, err := acquireJobDefinitionUse(db, job.ID)
 	if err != nil {
 		return err
@@ -550,6 +781,9 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 		return fmt.Errorf("invalid backup schedule")
 	}
 	if err := models.ValidateRetentionPolicy(job); err != nil {
+		return err
+	}
+	if err := models.ValidateSkipMarkerFileName(job.SkipMarkerFileName); err != nil {
 		return err
 	}
 	tx, err := db.Begin()
@@ -574,19 +808,6 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 	if err != nil {
 		return err
 	}
-	if err := validateJobSourceTransition(existingJob, job, false); err != nil {
-		return err
-	}
-	if err := validateJobSourceBinding(job); err != nil {
-		return err
-	}
-	var existingPortableJSON, existingSchedule, existingNextRun string
-	var existingEnabled bool
-	if err := tx.QueryRow(`SELECT portable_target_ids,schedule,enabled,COALESCE(next_run,'')
-		FROM backup_jobs WHERE id = ?`, job.ID).Scan(
-		&existingPortableJSON, &existingSchedule, &existingEnabled, &existingNextRun); err != nil {
-		return err
-	}
 	oldRows, err := tx.Query(`SELECT repository_id FROM backup_job_targets WHERE job_id = ?`, job.ID)
 	if err != nil {
 		return err
@@ -603,7 +824,44 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 		oldActiveTargets[repositoryID] = true
 		existingJob.Targets = append(existingJob.Targets, models.BackupJobTarget{RepositoryID: repositoryID})
 	}
-	if err := oldRows.Close(); err != nil {
+	if err := closeRows(oldRows); err != nil {
+		return err
+	}
+	// The revision is compared here, inside the write transaction, rather
+	// than only in the handler: the database has one writer connection, so
+	// no other job edit, enable change or profile sync apply can land between
+	// this read and the commit below. It comes before the target and
+	// definition checks below so an outdated copy gets the reload message
+	// rather than an error about a field that only differs because the copy
+	// is old. The handler already compared the revision before the name and
+	// running-operation checks above.
+	if expectedRevision != "" && expectedRevision != jobDefinitionRevision(existingJob) {
+		return ErrJobDefinitionChanged
+	}
+	if definitionEdit {
+		// The caller's copy of enabled can be older than this transaction:
+		// the enabled-state endpoint may have committed since it was read.
+		job.Enabled = existingJob.Enabled
+	}
+	if err := validateJobSourceTransition(existingJob, job, false); err != nil {
+		return err
+	}
+	if normalizedJobSourceBindingState(existingJob.SourceBindingState) == "bound" {
+		// A definition update never changes the local binding. Writing the
+		// stored value (rather than the caller's copy) keeps a binding that
+		// was converted after the caller read the job.
+		job.SourceStorageVersion = existingJob.SourceStorageVersion
+		job.SourceStorageKey = existingJob.SourceStorageKey
+		job.SourceStorageDescriptorJSON = existingJob.SourceStorageDescriptorJSON
+	}
+	if err := validateJobSourceBinding(job); err != nil {
+		return err
+	}
+	var existingPortableJSON, existingSchedule, existingNextRun string
+	var existingEnabled bool
+	if err := tx.QueryRow(`SELECT portable_target_ids,schedule,enabled,COALESCE(next_run,'')
+		FROM backup_jobs WHERE id = ?`, job.ID).Scan(
+		&existingPortableJSON, &existingSchedule, &existingEnabled, &existingNextRun); err != nil {
 		return err
 	}
 	if err := validateTargets(tx, job.Targets); err != nil {
@@ -635,7 +893,9 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 			source_storage_version = ?, source_storage_key = ?, source_storage_json = ?,
 			source_binding_state = ?, schedule = ?,
 		retention = ?, retention_hourly = ?, retention_daily = ?, retention_weekly = ?,
-		retention_monthly = ?, retention_yearly = ?, excludes = ?, tag = ?, enabled = ?, next_run = ?,
+		retention_monthly = ?, retention_yearly = ?, excludes = ?,
+		skip_nobackup_folders = ?, skip_cachedir_folders = ?, skip_marker_file_name = ?,
+		tag = ?, enabled = ?, next_run = ?,
 		before_script_path = ?, before_script_must_succeed = ?,
 		after_script_path = ?, after_script_must_succeed = ?,
 			engine_settings = ?, portable_target_ids = ? WHERE id = ?`,
@@ -647,8 +907,8 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 			return job.SourceBindingState
 		}(), job.Schedule, job.Retention,
 		job.RetentionHourly, job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly,
-		job.Excludes, job.Tag,
-		job.Enabled, nextRun, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
+		job.Excludes, job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
+		job.Tag, job.Enabled, nextRun, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
 		job.AfterScriptPath, job.AfterScriptMustSucceed,
 		string(settingsJSON), string(portableJSON),
 		job.ID)
@@ -689,14 +949,50 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 	if _, err := tx.Exec(query, args...); err != nil {
 		return err
 	}
+	// Removed targets take their scheduled restorations with them (ON DELETE
+	// CASCADE); drop any never-started admission group that leaves empty, as
+	// vault removal does.
+	if _, err := tx.Exec(deleteEmptyUnstartedAdmissionGroups+` AND job_id=?`, job.ID); err != nil {
+		return err
+	}
 	for _, target := range job.Targets {
-		if _, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)
-			ON CONFLICT(job_id, repository_id) DO NOTHING`, job.ID, target.RepositoryID); err != nil {
+		inserted, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)
+			ON CONFLICT(job_id, repository_id) DO NOTHING`, job.ID, target.RepositoryID)
+		if err != nil {
 			return err
+		}
+		// A vault newly added to this job may be one it used before, still
+		// holding its snapshots from another folder. Targets the job already
+		// had hit the conflict, insert nothing, and keep their flag.
+		count, err := inserted.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 1 {
+			if err := markJobTargetFullSourceRead(tx, job.ID, target.RepositoryID); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err := RefreshKopiaPolicyStatesTx(tx, affected); err != nil {
 		return err
+	}
+	// File History groups a vault's Restic snapshots of a job under the job's
+	// source only while the job targets that vault, so a vault joining or
+	// leaving the job, or an unbound imported job's source changing, can move
+	// snapshots between grouping roots in exactly those vaults.
+	groupingChanged := []string{}
+	newActiveTargets := make(map[string]bool, len(job.Targets))
+	for _, target := range job.Targets {
+		newActiveTargets[target.RepositoryID] = true
+		if existingJob.Source != job.Source || !oldActiveTargets[target.RepositoryID] {
+			groupingChanged = append(groupingChanged, target.RepositoryID)
+		}
+	}
+	for repositoryID := range oldActiveTargets {
+		if !newActiveTargets[repositoryID] {
+			groupingChanged = append(groupingChanged, repositoryID)
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO activity_log (timestamp, level, message) VALUES (datetime('now'), 'INFO', ?)`, "Backup job updated: "+job.Name); err != nil {
 		return err
@@ -704,6 +1000,7 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	RefreshStaleMetadataGrouping(db, groupingChanged)
 	return nil
 }
 
@@ -725,10 +1022,17 @@ func validateJobSourceTransition(existing, next models.BackupJob, allowFirstBind
 	if existing.Source != next.Source {
 		return ErrJobSourceImmutable
 	}
-	if existingState != nextState ||
-		existing.SourceStorageVersion != next.SourceStorageVersion ||
-		existing.SourceStorageKey != next.SourceStorageKey ||
-		existing.SourceStorageDescriptorJSON != next.SourceStorageDescriptorJSON {
+	// The binding is immutable after first binding with two exceptions, and
+	// neither goes through this function: the one-time conversion of a legacy
+	// binding by a successful probe (convertLegacySourceBindingTx) and a user's
+	// "Update job source" (UpdateJobSourceAlias), which records the alias's
+	// facts. A caller that read the row before a legacy conversion still
+	// passes, and UpdateJob keeps the stored value. Do not widen this check to
+	// accept other binding changes: definition edits must never move the
+	// location a job reads from.
+	if existingState != nextState || !equivalentSourceBinding(
+		existing.SourceStorageVersion, existing.SourceStorageKey, existing.SourceStorageDescriptorJSON,
+		next.SourceStorageVersion, next.SourceStorageKey, next.SourceStorageDescriptorJSON) {
 		return ErrJobSourceImmutable
 	}
 	return nil
@@ -751,6 +1055,8 @@ func sameSavedJobDefinition(left, right models.BackupJob) bool {
 		left.SourceStorageDescriptorJSON == right.SourceStorageDescriptorJSON &&
 		(left.SourceBindingState == right.SourceBindingState || left.SourceBindingState == "" && right.SourceBindingState == "bound" || left.SourceBindingState == "bound" && right.SourceBindingState == "") && left.Schedule == right.Schedule &&
 		left.Enabled == right.Enabled && models.RetentionPolicyEqual(left, right) && left.Excludes == right.Excludes &&
+		left.SkipNoBackupFolders == right.SkipNoBackupFolders && left.SkipCacheDirFolders == right.SkipCacheDirFolders &&
+		left.SkipMarkerFileName == right.SkipMarkerFileName &&
 		left.Tag == right.Tag && left.BeforeScriptPath == right.BeforeScriptPath &&
 		left.BeforeScriptMustSucceed == right.BeforeScriptMustSucceed && left.AfterScriptPath == right.AfterScriptPath &&
 		left.AfterScriptMustSucceed == right.AfterScriptMustSucceed && semanticEngineSettingsEqual(left.EngineSettings, right.EngineSettings) &&
@@ -842,7 +1148,7 @@ func RetainedPortableTargetEngines(db *sql.DB, jobID string, newTargets []models
 		}
 		oldActive[id] = true
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, false, err
 	}
 	known = map[string]bool{}
@@ -871,7 +1177,8 @@ func DeleteJob(db *sql.DB, id string) error {
 		return err
 	}
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	// The deletion's own operation record carries this job ID; see JobDeletionKind.
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`, id, JobDeletionKind).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {
@@ -890,7 +1197,7 @@ func DeleteJob(db *sql.DB, id string) error {
 		}
 		affected = append(affected, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	result, err := tx.Exec(`DELETE FROM backup_jobs WHERE id = ?`, id)
@@ -900,6 +1207,9 @@ func DeleteJob(db *sql.DB, id string) error {
 	if count, _ := result.RowsAffected(); count == 0 {
 		return sql.ErrNoRows
 	}
+	// The job's Restic snapshots stay in its vaults as unmanaged snapshots and
+	// return to their native grouping root once the grouping is refreshed.
+	targetRepositoryIDs := append([]string(nil), affected...)
 	dormantAffected, err := deleteDormantRecoveryJobEverywhere(tx, id)
 	if err != nil {
 		return err
@@ -911,13 +1221,17 @@ func DeleteJob(db *sql.DB, id string) error {
 	if err := markVaultProfilesDirty(tx, mergePortableTargetIDs(affected)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	RefreshStaleMetadataGrouping(db, targetRepositoryIDs)
+	return nil
 }
 
-// ValidateJobDeletionAdmission proves that deleting a job is currently
-// admissible without changing its authoritative definition. Callers that must
-// perform exact native cleanup first use this gate before crossing that native
-// boundary; DeleteJob repeats the same checks transactionally afterward.
+// ValidateJobDeletionAdmission checks that the job can be deleted right now,
+// without changing its stored definition. Callers that must run native cleanup
+// first call this before starting it; DeleteJob repeats the same checks in its
+// transaction afterward.
 func ValidateJobDeletionAdmission(db *sql.DB, id string) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -928,13 +1242,33 @@ func ValidateJobDeletionAdmission(db *sql.DB, id string) error {
 		return err
 	}
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`, id, JobDeletionKind).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {
 		return ErrJobRunActive
 	}
 	return nil
+}
+
+// ValidateJobDeletionRequest is the part of deletion admission a request can
+// check without waiting: the job exists and no pending repository connection
+// has reserved it. Queued or running work for the job is not a refusal any
+// more; the deletion waits for it.
+func ValidateJobDeletionRequest(db *sql.DB, id string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM backup_jobs WHERE id = ?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists != 1 {
+		return sql.ErrNoRows
+	}
+	return requireJobConnectionUnreserved(tx, id)
 }
 
 func SetJobEnabledCommitted(db *sql.DB, id string, enabled bool) (bool, error) {
@@ -1051,9 +1385,10 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 		}
 		affected = append(affected, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return false, err
 	}
+	targetRepositoryIDs := append([]string(nil), affected...)
 	job, err := scanJob(tx.QueryRow(`SELECT `+jobColumns+` FROM backup_jobs WHERE id = ?`, id).Scan)
 	if err != nil {
 		return false, err
@@ -1073,6 +1408,11 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
+	}
+	if bindSource {
+		// First binding sets the source File History groups this job's Restic
+		// snapshots under.
+		RefreshStaleMetadataGrouping(db, targetRepositoryIDs)
 	}
 	return true, nil
 }
@@ -1144,7 +1484,7 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 			}
 			affected = append(affected, repositoryID)
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return err
 		}
 		if err := markVaultProfilesDirty(tx, affected); err != nil {
@@ -1157,7 +1497,13 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// First binding sets the source File History groups this job's Restic
+	// snapshots under.
+	RefreshStaleMetadataGrouping(db, jobTargetRepositoryIDs(db, bound.ID))
+	return nil
 }
 
 func SetJobEnabled(db *sql.DB, id string, enabled bool) error {
@@ -1177,14 +1523,21 @@ func schedulerTransition(
 		return ""
 	}
 	if existingSchedule != newSchedule {
-		return NextRunFrom(newSchedule, now)
+		return nextJobRunFrom(newSchedule, now)
 	}
-	if !existingEnabled && newEnabled && existingNextRun == "" {
-		return NextRunFrom(newSchedule, now)
+	if !existingEnabled && newEnabled {
+		saved, err := time.Parse(time.RFC3339, existingNextRun)
+		if existingNextRun == "" || err == nil && nextRunBeyondSchedule(newSchedule, saved, now) {
+			return nextJobRunFrom(newSchedule, now)
+		}
 	}
 	return existingNextRun
 }
 
+// DueJobs lists the enabled jobs whose next run has come. It also moves a
+// next run that lies more than one schedule period ahead back to the next
+// occurrence from now (see nextRunBeyondSchedule), so a clock that jumped
+// forward and back does not stall the job.
 func DueJobs(db *sql.DB) ([]models.BackupJob, error) {
 	jobs, err := ListJobs(db)
 	if err != nil {
@@ -1197,9 +1550,40 @@ func DueJobs(db *sql.DB) ([]models.BackupJob, error) {
 			continue
 		}
 		when, err := time.Parse(time.RFC3339, job.NextRun)
-		if err == nil && !when.After(now) {
+		if err != nil {
+			continue
+		}
+		if !when.After(now) {
 			due = append(due, job)
+			continue
+		}
+		if nextRunBeyondSchedule(job.Schedule, when, now) {
+			rescheduleNextRun(db, job, now)
 		}
 	}
 	return due, nil
+}
+
+func rescheduleNextRun(db *sql.DB, job models.BackupJob, now time.Time) {
+	next := nextJobRunFrom(job.Schedule, now)
+	if next == "" {
+		return
+	}
+	// Only the value read above is replaced: an edit or a scheduled run that
+	// changed the job meanwhile wins. A job reserved by a vault connection in
+	// progress is left alone, as every other job write does.
+	result, err := db.Exec(`UPDATE backup_jobs SET next_run=?
+		WHERE id=? AND enabled=1 AND schedule=? AND next_run=?
+			AND NOT EXISTS (SELECT 1 FROM repository_connection_job_name_reservations r
+				JOIN repository_connection_intents c ON c.id=r.connection_id
+				WHERE r.job_id=backup_jobs.id)`,
+		next, job.ID, job.Schedule, job.NextRun)
+	if err != nil {
+		log.Printf("reschedule job %s after a clock change: %v", job.ID, err)
+		return
+	}
+	if count, _ := result.RowsAffected(); count == 1 {
+		log.Printf("job %s: next run %s was more than one schedule period ahead; rescheduled to %s",
+			job.ID, job.NextRun, next)
+	}
 }

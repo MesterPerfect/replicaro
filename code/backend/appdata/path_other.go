@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// Only Windows has known folders; windowsLocalAppData never runs elsewhere.
+var localAppDataKnownFolder = func() (string, error) {
+	return "", fmt.Errorf("the Local AppData known folder exists only on Windows")
+}
+
 func File(name string) (string, error) {
 	root, err := rootDirectory()
 	if err != nil {

@@ -10,7 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +30,13 @@ const (
 	PrivateFailureMissingObject
 	PrivateFailureObjectIsDirectory
 	PrivateFailureDecryptAuthentication
+	PrivateFailureSSHHostKeyUnknown
+	PrivateFailureSSHHostKeyChanged
+	// PrivateFailureStorageFull is the vault reporting that it ran out of
+	// space, by the markers the caller passed with
+	// ContextWithStorageFullMarkers. It is only used to explain a failure;
+	// it never changes how the failure is retried.
+	PrivateFailureStorageFull
 )
 
 type PrivateOutputError struct {
@@ -40,9 +47,9 @@ type PrivateOutputError struct {
 func (e *PrivateOutputError) Error() string { return "private native command failed" }
 func (e *PrivateOutputError) Unwrap() error { return e.Cause }
 
-// PrivateOutputFailureKind returns only the narrow output-free classification
-// needed by private rclone workflows. Native text is inspected at the process
-// boundary and is not retained in the returned error graph.
+// PrivateOutputFailureKind returns only the failure category that private
+// rclone workflows need, with no output text. Native text is inspected inside
+// this package and is never kept in the returned error chain.
 func PrivateOutputFailureKind(err error) PrivateFailureKind {
 	if _, followup := FailureCauses(err); followup != nil {
 		return PrivateFailureUnknown
@@ -131,6 +138,29 @@ type processStartTrackerKey struct{}
 type liveOutputKey struct{}
 type liveOutputEnabledKey struct{}
 type successfulStderrKey struct{}
+type outlivesReplicaroKey struct{}
+type privateFailureRedactionsKey struct{}
+type storageFullMarkersKey struct{}
+
+// ContextWithPrivateFailureRedactions names text that private-output commands
+// started with the returned context remove from their stderr before it is
+// classified (see classifyPrivateFailure). Callers pass the vault's own path:
+// rclone quotes it in its errors, and a folder called "Permission denied" or
+// "not found" would otherwise decide the category.
+// The values are matched case-insensitively and never leave this package.
+func ContextWithPrivateFailureRedactions(ctx context.Context, values []string) context.Context {
+	return context.WithValue(ctx, privateFailureRedactionsKey{}, append([]string(nil), values...))
+}
+
+// ContextWithStorageFullMarkers names the out-of-space wording that the
+// private-output commands started with the returned context look for, after
+// the redactions above are taken out. The caller passes the markers for the
+// vault's connector from the one shared list (engines.StorageFullMarkers), so
+// this package never needs to know which connector says what. Without
+// markers the storage-full category is never returned.
+func ContextWithStorageFullMarkers(ctx context.Context, markers []string) context.Context {
+	return context.WithValue(ctx, storageFullMarkersKey{}, append([]string(nil), markers...))
+}
 
 type LiveOutputObserver func(stream, text string)
 
@@ -152,6 +182,22 @@ func ContextWithLiveOutputEnabled(ctx context.Context) context.Context {
 // private or otherwise ineligible native command boundary.
 func ContextWithoutLiveOutput(ctx context.Context) context.Context {
 	return context.WithValue(ctx, liveOutputEnabledKey{}, false)
+}
+
+// ContextOutlivingReplicaro lets the native children started with the
+// returned context keep running when Replicaro ends without stopping them (a
+// crash or a SIGKILL), instead of getting the Linux parent-death signal.
+// Cancellation and process-tree cleanup still apply while Replicaro runs. Use
+// it only for a command that makes several writes the repository can't open
+// between, where finishing on its own is safer than being cut off midway.
+func ContextOutlivingReplicaro(ctx context.Context) context.Context {
+	return context.WithValue(ctx, outlivesReplicaroKey{}, true)
+}
+
+// OutlivesReplicaro reports whether ctx came from ContextOutlivingReplicaro.
+func OutlivesReplicaro(ctx context.Context) bool {
+	outlives, _ := ctx.Value(outlivesReplicaroKey{}).(bool)
+	return outlives
 }
 
 type successfulStderrCapture struct {
@@ -274,19 +320,19 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 func Run(ctx context.Context, path string, args, env []string, timeout time.Duration, engine string) (string, error) {
-	return runWithInput(ctx, path, args, env, "", timeout, engine, false, false, nil, nil)
+	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, "", timeout, engine, false, false, nil, nil)
 }
 
-// RunCaptured drains exact ordinary stdout and stderr into owner-local files.
-// Only a bounded diagnostic excerpt remains in memory; total output size does
-// not alter the native process result. The caller must Close the returned
+// RunCaptured drains the complete stdout and stderr into owner-local files.
+// Only a bounded diagnostic excerpt stays in memory, and total output size
+// never changes the native process result. The caller must Close the returned
 // capture after parsing it.
 func RunCaptured(ctx context.Context, path string, args, env []string, timeout time.Duration, engine string) (*CapturedOutput, string, error) {
 	capture, err := newCapturedOutput()
 	if err != nil {
 		return nil, "", &Error{Engine: engine, Err: err}
 	}
-	diagnostic, runErr := runWithInput(ctx, path, args, env, "", timeout, engine, false, false, nil, capture)
+	diagnostic, runErr := runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, "", timeout, engine, false, false, nil, capture)
 	status := "succeeded"
 	if runErr != nil {
 		status = "failed"
@@ -301,14 +347,14 @@ func RunCaptured(ctx context.Context, path string, args, env []string, timeout t
 // RunWithInputSecrets is the process boundary for commands that require a
 // credential on standard input. The input is never placed in argv or output.
 func RunWithInputSecrets(ctx context.Context, path string, args, env []string, input string, timeout time.Duration, engine string) (string, error) {
-	return runWithInput(ctx, path, args, env, input, timeout, engine, false, false, nil, nil)
+	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, input, timeout, engine, false, false, nil, nil)
 }
 
 // RunWithInputSecretsPrivateOutput is for commands whose standard output is
 // sensitive data. On failure, neither output stream is returned or included in
 // the public error.
 func RunWithInputSecretsPrivateOutput(ctx context.Context, path string, args, env []string, input string, timeout time.Duration, engine string) (string, error) {
-	return runWithInput(ctx, path, args, env, input, timeout, engine, true, false, nil, nil)
+	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, input, timeout, engine, true, false, nil, nil)
 }
 
 // RunWithInputSecretsPrivateOutputObservedStderr is the one live-output seam
@@ -327,19 +373,42 @@ func RunWithInputSecretsPrivateOutputObservedStderr(
 	if observe == nil {
 		return "", &Error{Engine: engine, Err: fmt.Errorf("private stderr observer is required")}
 	}
-	return runWithInput(ctx, path, args, env, input, timeout, engine, true, false, observe, nil)
+	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, input, timeout, engine, true, false, observe, nil)
 }
 
 // RunDiscardOutput drains stdout and stderr without retaining either stream.
 // It is for current-user hooks whose arbitrary output is private and is never
-// presented. The ordinary process-tree and cancellation lifecycle
-// remains unchanged.
-func RunDiscardOutput(ctx context.Context, path string, args, env []string, engine string) error {
-	_, err := runWithInput(ctx, path, args, env, "", NoTotalDeadline, engine, true, true, nil, nil)
+// presented. The hook runs in dir with all of Replicaro's own environment, so
+// it sees what it would see when the user runs it (USER, ProgramFiles, XDG_*
+// and so on). Replicaro never puts a vault password, key or provider
+// credential in its own environment; those go only into the overrides of the
+// engine and rclone children that need them.
+//
+// Process-tree cleanup and cancellation work as for any other command, so the
+// hook's processes are ended on cancellation and as soon as the hook exits. A
+// process that leaves the hook's process group (Linux) or session (macOS), for
+// example with setsid, or one started through a service manager, isn't ended.
+// It doesn't hold up the hook step either: once the hook exits, Replicaro
+// closes its end of the hook's output pipes, so such a process's next write
+// to them raises SIGPIPE and ends it unless it redirects its output.
+func RunDiscardOutput(ctx context.Context, path string, args []string, dir string, engine string) error {
+	// Leave env nil rather than passing os.Environ(): os/exec sets PWD to dir
+	// only for an inherited environment, and a hook that isn't a shell script
+	// (Python, Node, Perl) would otherwise read Replicaro's own PWD.
+	_, err := runWithInput(ctx, path, args, childProcess{dir: dir}, "", NoTotalDeadline, engine, true, true, nil, nil)
 	return err
 }
 
-func runWithInput(ctx context.Context, path string, args, env []string, input string, timeout time.Duration, engine string, privateOutput, discardOutput bool, observeStderr func([]byte) error, captured *CapturedOutput) (string, error) {
+// childProcess is what a child gets besides its arguments: its environment
+// (nil inherits all of Replicaro's) and its working directory (empty keeps
+// Replicaro's). Engine and rclone children always get a non-nil environment
+// from nativeEnvironment.
+type childProcess struct {
+	env []string
+	dir string
+}
+
+func runWithInput(ctx context.Context, path string, args []string, child childProcess, input string, timeout time.Duration, engine string, privateOutput, discardOutput bool, observeStderr func([]byte) error, captured *CapturedOutput) (string, error) {
 	commandContext := ctx
 	cancel := func() {}
 	if timeout != NoTotalDeadline {
@@ -352,7 +421,8 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	}
 	defer tree.close()
 	process := exec.Command(path, args...)
-	process.Env = minimalEnvironment(env)
+	process.Env = child.env
+	process.Dir = child.dir
 	if fence := nativeProcessFenceFromContext(ctx); fence != nil && fence.file != nil {
 		process.ExtraFiles = append(process.ExtraFiles, fence.file)
 	}
@@ -360,6 +430,9 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 		process.Stdin = strings.NewReader(input)
 	}
 	configureWindowsCommand(process)
+	if !OutlivesReplicaro(ctx) {
+		endWithReplicaro(process)
+	}
 	stdoutLimit := maxCommandOutputBytes
 	if captured != nil {
 		stdoutLimit = maxCapturedDiagnosticBytes
@@ -394,8 +467,8 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	if !privateOutput && !discardOutput {
 		live = liveOutputObserver(commandContext)
 		if live != nil {
-			// Raw buffers stay first in each tee. The selected engines own ordinary
-			// output content; Replicaro only assembles bounded complete live records.
+			// Raw buffers stay first in each tee. The engine's output is kept as-is; the
+			// live writers only split it into bounded, complete records for display.
 			liveStdout = newLiveRecordWriter("stdout", live)
 			liveStderr = newLiveRecordWriter("stderr", live)
 			stdoutDestination = io.MultiWriter(stdoutDestination, liveStdout)
@@ -425,6 +498,9 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 		_ = stderrWriter.Close()
 		return "", err
 	}
+	// Held until this function has waited for the child; see
+	// lockStartingThread.
+	defer lockStartingThread()()
 	if err := process.Start(); err != nil {
 		_ = stdoutPipe.Close()
 		_ = stdoutWriter.Close()
@@ -440,22 +516,20 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 	readDone := make(chan struct{})
-	stdoutReader, stderrReader := newCommandOutputReader(stdoutPipe), newCommandOutputReader(stderrPipe)
-	var stdoutReadErr, stderrReadErr error
 	go func() {
 		defer close(readDone)
 		var copies sync.WaitGroup
 		copies.Add(2)
 		go func() {
 			defer copies.Done()
-			_, stdoutReadErr = io.Copy(stdoutDestination, stdoutReader)
+			_, _ = io.Copy(stdoutDestination, stdoutPipe)
 			if liveStdout != nil {
 				liveStdout.flush()
 			}
 		}()
 		go func() {
 			defer copies.Done()
-			_, stderrReadErr = io.Copy(stderrDestination, stderrReader)
+			_, _ = io.Copy(stderrDestination, stderrPipe)
 			if liveStderr != nil {
 				liveStderr.flush()
 			}
@@ -487,7 +561,6 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	go func() { waitResult <- tree.wait(process) }()
 	var err error
 	var cleanupErr error
-	var descendantCollectionErr error
 	var waitReaped bool
 	select {
 	case result := <-waitResult:
@@ -536,19 +609,14 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 		cleanupErr = errors.Join(cleanupErr, terminateErr)
 		if terminateErr != nil {
 			// A failed group termination can leave inherited writers open forever.
-			if runtime.GOOS == "linux" && os.Getpid() == 1 {
-				stdoutReader.interrupt()
-				stderrReader.interrupt()
-			} else {
-				_ = stdoutPipe.Close()
-				_ = stderrPipe.Close()
-			}
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
 		}
 	}
 	// On Unix waitid intentionally left the leader unreaped while the process
 	// group was cleaned. Reap only afterward so the top-level PID/PGID remains
-	// anchored throughout cleanup. Darwin's documented accepted same-user
-	// secondary-PGID reuse limitation is explained at terminatePlatform.
+	// anchored throughout cleanup. The Darwin same-user secondary-PGID reuse
+	// limitation is a deliberately accepted one; see terminatePlatform.
 	if !waitReaped {
 		canReap := true
 		if cleanupErr != nil {
@@ -558,33 +626,33 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 			}
 		}
 		if canReap {
-			descendantCollectionErr = tree.collectAdoptedDescendants(process)
-			if descendantCollectionErr != nil {
-				// An uncollected live helper may still hold an output writer.
-				stdoutReader.interrupt()
-				stderrReader.interrupt()
-			}
 			err = errors.Join(err, tree.reap(process))
 		}
 	}
 	// The read handles are parent-owned, so Wait cannot close them before all
 	// buffered output is consumed. Descendant cleanup above guarantees EOF even
-	// when a grandchild inherited the write descriptors.
+	// when a grandchild inherited the write descriptors, as long as it stayed in
+	// the process tree.
 	// Capture writes are part of pipe drainage, so a fixed post-exit timer here
 	// would truncate a healthy command merely because its owner-local filesystem
 	// was slow. Process-tree cleanup above closes leaked descendant writers; once
 	// that boundary is complete, wait for both exact streams without a byte- or
 	// elapsed-time cap.
+	if discardOutput {
+		// A hook can start a process that leaves its process group or session
+		// (setsid, a daemon) and still holds the hook's stdout or stderr. Cleanup
+		// can't reach that process, so waiting for EOF would hold the hook step,
+		// and with it Cancel and Quit, until it exits. Nothing is kept from this
+		// output, so stop reading once the hook itself is done; a later write
+		// from the escaped process gets a broken pipe.
+		_ = stdoutPipe.Close()
+		_ = stderrPipe.Close()
+	}
 	<-readDone
 	_ = stdoutPipe.Close()
 	_ = stderrPipe.Close()
-	if runtime.GOOS == "linux" && os.Getpid() == 1 {
-		// PID 1 collection/drainage failures are follow-up causes, not native results.
-		descendantCollectionErr = errors.Join(descendantCollectionErr, cleanupErr, stdoutReadErr, stderrReadErr)
-		cleanupErr = nil
-	}
 	err = tree.joinCleanupResult(err, cleanupErr, commandContext.Err())
-	outputErr := descendantCollectionErr
+	var outputErr error
 	if captured != nil {
 		outputErr = errors.Join(outputErr, captured.finish())
 	}
@@ -611,7 +679,9 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	if err != nil || outputErr != nil {
 		if privateOutput {
 			cause := commandError(engine, "", err, outputErr)
-			return "", &PrivateOutputError{Kind: classifyPrivateFailure(stderr.String()), Cause: cause}
+			redactions, _ := commandContext.Value(privateFailureRedactionsKey{}).([]string)
+			storageFull, _ := commandContext.Value(storageFullMarkersKey{}).([]string)
+			return "", &PrivateOutputError{Kind: classifyPrivateFailure(redactPrivateFailureText(stderr.String(), redactions), storageFull...), Cause: cause}
 		}
 		return diagnostic, commandError(engine, diagnostic, err, outputErr)
 	}
@@ -620,20 +690,46 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	if !privateOutput && !discardOutput {
 		recordSuccessfulStderr(commandContext, boundedDiagnosticWithOmission(diagnosticStderr, stderrOmitted))
 	}
-	// Investigation of the pinned ordinary Restic and Kopia commands found no
-	// evidence that they print passwords or keys. Their output therefore remains
-	// native and engine-owned; Replicaro redacts only the explicitly public
-	// support-report copy.
+	// We have found nothing in the normal (non-private) pinned Restic and Kopia
+	// commands that prints passwords or keys, so their output is returned
+	// unmodified. Only the public support-report copy is redacted.
 	if captured != nil {
 		return diagnostic, nil
 	}
 	return raw, nil
 }
 
-func classifyPrivateFailure(stderr string) PrivateFailureKind {
+// redactPrivateFailureText lowercases stderr and replaces each redaction with
+// NUL, longest first so a shorter value can't split a longer one. No marker
+// contains NUL, so the replacement can neither join the text around it into a
+// new marker nor hide a marker rclone wrote outside the redacted value.
+func redactPrivateFailureText(stderr string, redactions []string) string {
+	text := strings.ToLower(stderr)
+	values := make([]string, 0, len(redactions))
+	for _, value := range redactions {
+		if value = strings.ToLower(value); value != "" {
+			values = append(values, value)
+		}
+	}
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	for _, value := range values {
+		text = strings.ReplaceAll(text, value, "\x00")
+	}
+	return text
+}
+
+func classifyPrivateFailure(stderr string, storageFullMarkers ...string) PrivateFailureKind {
 	lower := strings.ToLower(stderr)
 	if strings.Contains(lower, "failed to authenticate decrypted block - bad password?") {
 		return PrivateFailureDecryptAuthentication
+	}
+	// rclone's SFTP backend refuses a server whose host key isn't in, or
+	// differs from, the known_hosts file with these Go knownhosts errors.
+	if strings.Contains(lower, "knownhosts: key mismatch") {
+		return PrivateFailureSSHHostKeyChanged
+	}
+	if strings.Contains(lower, "knownhosts: key is unknown") {
+		return PrivateFailureSSHHostKeyUnknown
 	}
 	for _, marker := range []string{"credential", "authentication", "authorization", "access denied", "permission denied", "unauthorized", "forbidden", "private key", "certificate"} {
 		if strings.Contains(lower, marker) {
@@ -648,6 +744,15 @@ func classifyPrivateFailure(stderr string) PrivateFailureKind {
 	for _, marker := range []string{"directory not found", "object not found", "file not found", "path not found", "doesn't exist", "does not exist"} {
 		if strings.Contains(lower, marker) {
 			return PrivateFailureMissingObject
+		}
+	}
+	// Out of space is checked last on purpose: when rclone's text also has
+	// credential, missing-object or directory wording, that category decides,
+	// because it changes what the caller does next and this one only adds an
+	// explanation.
+	for _, marker := range storageFullMarkers {
+		if marker = strings.ToLower(marker); marker != "" && strings.Contains(lower, marker) {
+			return PrivateFailureStorageFull
 		}
 	}
 	return PrivateFailureUnknown
@@ -726,9 +831,9 @@ func (writer *liveRecordWriter) emit() {
 func (writer *liveRecordWriter) observe(text string) {
 	// The operation runtime manager is the only production observer and performs
 	// one bounded in-memory append. Calling it directly avoids a second queue
-	// whose saturation could silently discard an otherwise complete record.
-	// Presentation failures remain isolated from native parser bytes and result
-	// truth.
+	// whose saturation could silently discard an otherwise complete record. The
+	// recover keeps a presentation failure from affecting parser input or the
+	// command result.
 	defer func() { _ = recover() }()
 	writer.observer(writer.stream, text)
 }
@@ -871,10 +976,6 @@ func (buffer *headTailDiagnosticBuffer) String() string {
 	return string(buffer.head) + string(buffer.tail)
 }
 
-func (buffer *headTailDiagnosticBuffer) Parts() (head, tail string) {
-	return string(buffer.head), string(buffer.tail)
-}
-
 func newCappedDiagnosticBuffer(limit int) *cappedDiagnosticBuffer {
 	return &cappedDiagnosticBuffer{limit: limit}
 }
@@ -904,10 +1005,6 @@ func (buffer *cappedDiagnosticBuffer) String() string {
 	return value
 }
 
-func boundedDiagnostic(value string) string {
-	return boundedDiagnosticWithOmission(value, false)
-}
-
 const diagnosticTruncationLabel = "[diagnostic output truncated]"
 const diagnosticTruncationMarker = "\n" + diagnosticTruncationLabel + "\n"
 
@@ -932,15 +1029,104 @@ func boundedDiagnosticWithOmissionLimit(value string, omitted bool, limit int) s
 	return value[:middle] + diagnosticTruncationMarker + value[middle:]
 }
 
-func minimalEnvironment(overrides []string) []string {
-	allowed := map[string]bool{}
-	for _, name := range []string{"PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS", "LANG", "LC_ALL", "TERM"} {
-		allowed[strings.ToUpper(name)] = true
+// minimalEnvironmentNames are the variables every engine and rclone child
+// inherits from Replicaro's own environment, together with
+// networkEnvironmentNames.
+var minimalEnvironmentNames = []string{"PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS", "LANG", "LC_ALL", "TERM"}
+
+// networkEnvironmentNames let Restic, Kopia and rclone use the proxy and
+// certificate environment variables, the same way they do when the user runs
+// them directly. Names match in any letter case, so the lowercase proxy forms
+// pass too. The certificate variables take effect on Linux and in Docker;
+// macOS and Windows builds use the system trust store. Only these variables
+// are read, not the Windows or macOS system proxy settings.
+//
+// They are kept apart from minimalEnvironmentNames on purpose: callers refuse
+// the minimal names in variables a user enters, but an Any Rclone Remote vault
+// may set its own proxy. A vault's value replaces the inherited one in every
+// letter case, because Go-based tools read HTTPS_PROXY before https_proxy and
+// would otherwise keep Replicaro's value whenever the cases differ.
+var networkEnvironmentNames = []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+
+// timeZoneEnvironmentNames are inherited only in the Docker package, after
+// InheritTimeZone. There TZ is how the user sets the container's time zone,
+// and Restic, Kopia and rclone should use the same zone as Replicaro's
+// schedules, its hooks and the image's own tools. Desktop builds never
+// inherit it: their engines follow the system's time zone, as before.
+//
+// TZ is kept out of minimalEnvironmentNames for the same reason as the
+// network names: an Any Rclone Remote vault refuses the minimal names, and it
+// checks that on every use, not only when saved, so a vault saved with its
+// own TZ would stop working. Here a vault's TZ replaces the inherited one.
+var timeZoneEnvironmentNames = []string{"TZ"}
+
+var inheritTimeZone atomic.Bool
+
+// InheritTimeZone makes every later engine and rclone child inherit TZ from
+// Replicaro's environment. main calls it once at startup, only after it has
+// confirmed that it is running in the Docker package. Don't call it for a
+// desktop build.
+func InheritTimeZone() {
+	inheritTimeZone.Store(true)
+}
+
+// MinimalEnvironmentNames returns the names a native child inherits from
+// Replicaro's environment. Callers that accept variables from the user refuse
+// these so the inherited values can't be replaced.
+func MinimalEnvironmentNames() []string {
+	return append([]string(nil), minimalEnvironmentNames...)
+}
+
+// ProxyEnvironmentValues returns Replicaro's own proxy settings, in every
+// letter case that is set. Proxy URLs can carry a user name and password, so
+// the support report redacts these values like any other credential.
+func ProxyEnvironmentValues() []string {
+	var values []string
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || value == "" {
+			continue
+		}
+		switch strings.ToUpper(key) {
+		case "HTTP_PROXY", "HTTPS_PROXY":
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// nativeEnvironment is the complete environment of an engine or rclone child:
+// the minimal and network names from Replicaro's environment (and TZ in the
+// Docker package), then overrides, which win.
+func nativeEnvironment(overrides []string) []string {
+	minimal := map[string]bool{}
+	for _, name := range minimalEnvironmentNames {
+		minimal[strings.ToUpper(name)] = true
+	}
+	// The network names, and TZ when inherited, give way to an override.
+	overridable := map[string]bool{}
+	for _, name := range networkEnvironmentNames {
+		overridable[name] = true
+	}
+	if inheritTimeZone.Load() {
+		for _, name := range timeZoneEnvironmentNames {
+			overridable[name] = true
+		}
+	}
+	overridden := map[string]bool{}
+	for _, item := range overrides {
+		if key, _, ok := strings.Cut(item, "="); ok && key != "" {
+			overridden[strings.ToUpper(key)] = true
+		}
 	}
 	values := map[string]string{}
 	for _, item := range os.Environ() {
 		key, value, ok := strings.Cut(item, "=")
-		if ok && allowed[strings.ToUpper(key)] {
+		if !ok {
+			continue
+		}
+		name := strings.ToUpper(key)
+		if minimal[name] || overridable[name] && !overridden[name] {
 			values[key] = value
 		}
 	}

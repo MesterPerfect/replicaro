@@ -168,8 +168,8 @@ func LongestEligibleObjectLockMaintenance(settings ObjectLockSettings) (string, 
 	return "", fmt.Errorf("object lock duration does not permit a space reclamation schedule")
 }
 
-// ValidateObjectLockTransition enforces the provider guarantees Replicaro can
-// truthfully preserve after initial enrollment. Provider locks cannot be
+// ValidateObjectLockTransition rejects changes that would break the provider's
+// lock guarantees after initial enrollment. Provider locks cannot be
 // shortened, and S3 Compliance cannot safely be weakened to Governance.
 func ValidateObjectLockTransition(current, next ObjectLockSettings) error {
 	if current.Enrolled != next.Enrolled {
@@ -200,6 +200,10 @@ func ValidateObjectLockTransition(current, next ObjectLockSettings) error {
 	return nil
 }
 
+// Repository.ResolvedRepositoryPath and ResolvedRepositoryObservedAt mirror
+// the retired automatic vault alias columns. Startup clears them and nothing
+// writes them; a vault always runs at Location. The columns stay only to avoid
+// a schema change.
 type Repository struct {
 	ID                           string             `json:"id"`
 	Name                         string             `json:"name"`
@@ -240,6 +244,12 @@ type Repository struct {
 	NativeRepositoryID           string             `json:"native_repository_id"`
 	IsVaultOwner                 bool               `json:"isVaultOwner"`
 	ObjectLock                   ObjectLockSettings `json:"objectLock"`
+	// ReconnectRequired is the vault's saved "needs reconnect" state (see
+	// package vaultreconnect). It drives the vault card's Reconnect button and
+	// message, so it survives a reload and shows in every browser.
+	ReconnectRequired bool `json:"reconnectRequired"`
+	// RcloneRemote is set only for an Any Rclone Remote vault.
+	RcloneRemote *RcloneRemoteSettings `json:"rcloneRemote,omitempty"`
 
 	// Secrets and connector configuration stay server-side.
 	Passphrase        string            `json:"-"`
@@ -255,14 +265,16 @@ type Repository struct {
 	RcloneConfigPath string `json:"-"`
 }
 
-// RuntimeView selects the local-only cached filesystem alias without changing
-// the immutable configured Location exposed by the API or protected profiles.
-// Admission code must resolve and freeze the path before constructing a view.
-func (r Repository) RuntimeView() Repository {
-	if r.Connector == "fs" && strings.TrimSpace(r.ResolvedRepositoryPath) != "" {
-		r.Location = r.ResolvedRepositoryPath
-	}
-	return r
+// RcloneRemoteSettings are an Any Rclone Remote vault's settings that aren't
+// secret, for the vault card's remote label and for Reconnect. The rclone
+// config password and the environment variable values are never included;
+// VariableNames only tells which variables are saved.
+type RcloneRemoteSettings struct {
+	ConfigFile      string   `json:"configFile"`
+	ConfigEncrypted bool     `json:"configEncrypted"`
+	Remote          string   `json:"remote"`
+	Path            string   `json:"path"`
+	VariableNames   []string `json:"variableNames"`
 }
 
 // ValidateVaultPassword rejects values that cannot be delivered unchanged to
@@ -311,9 +323,36 @@ type VaultSizeStatus struct {
 	Running             bool   `json:"running"`
 	Pending             bool   `json:"pending"`
 	Paused              bool   `json:"paused"`
-	Failure             string `json:"failure,omitempty"`
+	// Failure is a stable code naming the step that failed, such as
+	// "vault_size_storage_unreachable", that the UI maps to translated text.
+	// It never carries native error text.
+	Failure string `json:"failure,omitempty"`
 }
 
 func ValidEngine(engine string) bool {
 	return engine == "restic" || engine == "kopia"
+}
+
+// SoleProfileConnector reports whether a vault on connector keeps exactly one
+// profile. These providers use an attachment-local, opaque rclone
+// authorization that Replicaro does not coordinate across computers. They are
+// also slower, eventually consistent backends, where several profiles writing
+// to one vault would not reliably see each other's changes. Each vault
+// therefore has one transferable profile: reconnect it for the same client,
+// take it over for a different client, and fail closed if any additional
+// profile exists. An Any Rclone Remote vault can be on any rclone backend,
+// which Replicaro can't tell apart, so it takes the same limits.
+//
+// WebDAV is deliberately not listed. Restic reaches it through rclone too, but
+// it is an ordinary server connector like SFTP, with no per-computer
+// authorization, so it keeps Join and multiple profiles. The Normal
+// concurrency cap in NormalizeConcurrencyModeForConnector covers the same
+// connectors; keep the two in step.
+func SoleProfileConnector(connector string) bool {
+	switch connector {
+	case "dropbox", "google_drive", "onedrive", "rclone_remote":
+		return true
+	default:
+		return false
+	}
 }

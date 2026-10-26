@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/local/replicaro/models"
@@ -19,25 +20,68 @@ func EnsureLanguageSetting(db *sql.DB) error {
 	return err
 }
 
+// ErrInstallationIDDamaged means the stored installation ID is present but
+// isn't a canonical UUID. Every vault attachment and the browser's client
+// UUID check use this ID, so a damaged value is never replaced without asking:
+// a new ID makes every attached vault need reconnecting, and that needs the
+// user's go-ahead (see RepairInstallationID).
+var ErrInstallationIDDamaged = errors.New("the stored installation ID is damaged")
+
+// ValidInstallationID reports whether id is a canonical UUID: lowercase,
+// hyphenated, without braces or a urn:uuid: prefix, and not the nil UUID. It's
+// the one test of a stored installation ID. The nil UUID is refused because
+// every vault check of a client UUID refuses it too, so an installation with
+// that ID couldn't use any vault.
+func ValidInstallationID(id string) bool {
+	parsed, err := uuid.Parse(id)
+	return err == nil && parsed != uuid.Nil && parsed.String() == id
+}
+
+// InstallationID returns the stored installation ID. A new one is created only
+// when none is stored at all, as on a fresh install. A read error is returned
+// as it is, and a damaged value returns ErrInstallationIDDamaged; neither
+// creates a new ID.
 func InstallationID(db *sql.DB) (string, error) {
 	var id string
 	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, installationIDKey).Scan(&id)
 	if err == nil {
-		parsed, parseErr := uuid.Parse(id)
-		if parseErr == nil && parsed.String() == id {
+		if ValidInstallationID(id) {
 			return id, nil
 		}
-		id = uuid.NewString()
-		_, updateErr := db.Exec(`UPDATE settings SET value = ? WHERE key = ?`, id, installationIDKey)
-		return id, updateErr
+		return "", ErrInstallationIDDamaged
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	id = uuid.NewString()
 	_, err = db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
-		ON CONFLICT(key) DO NOTHING`, installationIDKey, id)
+		ON CONFLICT(key) DO NOTHING`, installationIDKey, uuid.NewString())
 	if err != nil {
+		return "", err
+	}
+	return InstallationID(db)
+}
+
+// RepairInstallationID replaces a damaged installation ID with a new one and
+// returns the ID that is stored afterwards. An intact ID is returned
+// unchanged, and a missing one is created as InstallationID does. Only the
+// damaged value read here is replaced, so an ID stored in the meantime is
+// never overwritten.
+func RepairInstallationID(db *sql.DB) (string, error) {
+	var current string
+	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, installationIDKey).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return InstallationID(db)
+	}
+	if err != nil {
+		return "", err
+	}
+	if ValidInstallationID(current) {
+		return current, nil
+	}
+	// The stored value can be a BLOB, which never equals the text read back
+	// here, so it's compared as text.
+	if _, err := db.Exec(`UPDATE settings SET value = ? WHERE key = ? AND CAST(value AS TEXT) = ?`,
+		uuid.NewString(), installationIDKey, current); err != nil {
 		return "", err
 	}
 	return InstallationID(db)
@@ -58,8 +102,9 @@ func GetSettings(
 ) (models.Settings, error) {
 
 	settings := models.Settings{
-		DefaultEngine:                "restic",
-		AutoStart:                    true,
+		DefaultEngine: "restic",
+		// autoStart and minimizeToTray rows from older versions are left in
+		// place and ignored; nothing in Replicaro acts on either preference.
 		LogRetentionDays:             30,
 		Theme:                        models.ThemeDark,
 		Language:                     models.LanguageSystem,
@@ -67,7 +112,6 @@ func GetSettings(
 		NativeNotificationsOnFailure: true,
 		StartWithWindows:             true,
 		StartAtLogin:                 true,
-		MinimizeToTray:               true,
 		MaxConcurrentJobRuns:         DefaultMaxConcurrentJobRuns,
 	}
 
@@ -118,11 +162,6 @@ func GetSettings(
 				settings.Language = value
 			}
 
-		case "autoStart":
-
-			settings.AutoStart =
-				value == "true"
-
 		case "logRetentionDays":
 
 			if days, err := strconv.Atoi(value); err == nil {
@@ -137,11 +176,6 @@ func GetSettings(
 			settings.StartAtLogin = value == "true"
 			settings.StartWithWindows = settings.StartAtLogin
 			neutralStartSeen = true
-
-		case "minimizeToTray":
-
-			settings.MinimizeToTray =
-				value == "true"
 
 		case "webhookUrl":
 			settings.WebhookURL = value
@@ -220,8 +254,8 @@ func SaveSettings(
 	defer func() { _ = tx.Rollback() }()
 	if settings.Language == "" {
 		// A missing language field means an older writer supplied the prior
-		// settings shape. Resolve it inside this replacement transaction so
-		// that writer cannot reset a newer client's explicit choice.
+		// settings shape. Resolve it inside this save's transaction so that
+		// writer cannot reset a newer client's explicit choice.
 		err = tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, languageKey).Scan(&settings.Language)
 		if err == sql.ErrNoRows {
 			settings.Language = models.LanguageSystem
@@ -233,63 +267,34 @@ func SaveSettings(
 		}
 	}
 
-	var dashboardIssuesReviewedAt string
-	_ = tx.QueryRow(
-		`SELECT value FROM settings WHERE key = ?`,
-		dashboardIssuesReviewedAtKey,
-	).Scan(&dashboardIssuesReviewedAt)
-	var installationID string
-	_ = tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, installationIDKey).Scan(&installationID)
-	_, err = tx.Exec(
-		`DELETE FROM settings WHERE key NOT IN (?, ?, ?, ?)`,
-		appUpdateLastAutomaticAttemptKey, appUpdateLastResultKey,
-		appUpdateLastAvailableVersionKey, appUpdateSkippedVersionKey,
-	)
-
-	if err != nil {
-		return err
-	}
-
+	// Only the user-facing keys below are written, each one upserted. Every
+	// other row is internal state that the settings form doesn't carry (the
+	// installation ID, the issue review watermark, update-check state,
+	// one-time migration markers and anything added later), so a save leaves
+	// it as it is rather than reading it back and writing it again.
 	values := map[string]string{
-		"defaultEngine":                settings.DefaultEngine,
-		"theme":                        settings.Theme,
-		languageKey:                    settings.Language,
-		"webhookUrl":                   settings.WebhookURL,
+		"defaultEngine": settings.DefaultEngine,
+		"theme":         settings.Theme,
+		languageKey:     settings.Language,
+		"webhookUrl":    settings.WebhookURL,
+		// The notification and startup preferences each have an older key name
+		// and a newer one. Both names are written, so a build that reads either
+		// one sees the same choice.
 		"notifyWindowsOnSuccess":       strconv.FormatBool(settings.NotifyWindowsOnSuccess),
 		"notifyWindowsOnFailure":       strconv.FormatBool(settings.NotifyWindowsOnFailure),
 		"nativeNotificationsOnSuccess": strconv.FormatBool(settings.NativeNotificationsOnSuccess || settings.NotifyWindowsOnSuccess),
 		"nativeNotificationsOnFailure": strconv.FormatBool(settings.NativeNotificationsOnFailure || settings.NotifyWindowsOnFailure),
 		"notifyWebhookOnSuccess":       strconv.FormatBool(settings.NotifyWebhookOnSuccess),
 		"notifyWebhookOnFailure":       strconv.FormatBool(settings.NotifyWebhookOnFailure),
-		"autoStart": strconv.FormatBool(
-			settings.AutoStart,
-		),
-		"logRetentionDays": strconv.Itoa(
-			settings.LogRetentionDays,
-		),
-		"startWithWindows": strconv.FormatBool(
-			settings.StartWithWindows,
-		),
-		"startAtLogin": strconv.FormatBool(settings.StartAtLogin || settings.StartWithWindows),
-		"minimizeToTray": strconv.FormatBool(
-			settings.MinimizeToTray,
-		),
-		"maxConcurrentJobRuns":       strconv.Itoa(settings.MaxConcurrentJobRuns),
-		dashboardIssuesReviewedAtKey: dashboardIssuesReviewedAt,
-		installationIDKey:            installationID,
-		appUpdateDisableAutomaticKey: strconv.FormatBool(settings.DisableAutomaticUpdateChecks),
+		"logRetentionDays":             strconv.Itoa(settings.LogRetentionDays),
+		"startWithWindows":             strconv.FormatBool(settings.StartWithWindows),
+		"startAtLogin":                 strconv.FormatBool(settings.StartAtLogin || settings.StartWithWindows),
+		"maxConcurrentJobRuns":         strconv.Itoa(settings.MaxConcurrentJobRuns),
+		appUpdateDisableAutomaticKey:   strconv.FormatBool(settings.DisableAutomaticUpdateChecks),
 	}
 	for key, value := range values {
-
-		_, err := tx.Exec(
-			`INSERT INTO settings
-			(key, value)
-			VALUES (?, ?)`,
-			key,
-			value,
-		)
-
-		if err != nil {
+		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
 			return err
 		}
 	}

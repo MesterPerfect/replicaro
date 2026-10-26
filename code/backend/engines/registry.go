@@ -40,13 +40,6 @@ func ConfiguredPaths() map[string]string {
 }
 
 func Resolve(repo models.Repository) (Engine, error) {
-	return ResolveWithRepositoryAvailabilityCheck(repo, nil)
-}
-
-func ResolveWithRepositoryAvailabilityCheck(
-	repo models.Repository,
-	check RepositoryAvailabilityCheck,
-) (Engine, error) {
 	registryMu.RLock()
 	custom := paths[repo.Engine]
 	registryMu.RUnlock()
@@ -62,7 +55,7 @@ func ResolveWithRepositoryAvailabilityCheck(
 	if err := models.ValidateVaultPassword(repo.Passphrase); err != nil {
 		return nil, err
 	}
-	return &publicEngine{Engine: resolved, repo: repo, availabilityCheck: check}, nil
+	return &publicEngine{Engine: resolved}, nil
 }
 
 func AllDescriptors(ctx context.Context) []Descriptor {

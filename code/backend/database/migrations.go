@@ -4,22 +4,60 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/operationlog"
 )
 
-// Schema 70 binds the local/network identity contract to descriptor/helper v4.
-// Reject older databases explicitly; never reinterpret fixed/removable bindings
-// or delete an installation as an automatic compatibility step.
+// Schema 70 binding columns hold either a legacy storage-identity descriptor
+// or the recorded mount-point and filesystem-type facts; a legacy binding is
+// converted in place at its first successful probe (see
+// storageidentity.DecodeBinding), so no schema bump is needed. Reject older
+// databases explicitly; never delete an installation as an automatic
+// compatibility step.
 const CurrentSchemaVersion = 70
 
-var ErrDatabaseResetRequired = errors.New("database schema is incompatible; delete replicaro.db and restart")
+// ErrDatabaseResetRequired covers every replicaro.db this version can't use.
+// Startup shows its text to the user as the reason Replicaro couldn't start.
+// The database holds the only local copy of the vault credentials and jobs,
+// so the advice is to move it aside, never to delete it.
+var ErrDatabaseResetRequired = errors.New("This data isn't in a format this version of Replicaro can use. To start over with this version, move replicaro.db, and replicaro.db-wal and replicaro.db-shm if they exist, somewhere else first (don't delete them)")
 
-// Migrate initializes only the current schema. Older application databases
-// are rejected without migration, import, or metadata-cache backfill.
-func Migrate(db *sql.DB) error {
+// ErrDatabaseFromNewerVersion is the incompatible case users actually hit:
+// they went back to an older Replicaro after a newer one had already written
+// replicaro.db. Reinstalling the newer version is the fix that keeps their
+// data, so it gets its own wording. It still matches ErrDatabaseResetRequired
+// with errors.Is.
+var ErrDatabaseFromNewerVersion error = newerDatabaseError{}
+
+type newerDatabaseError struct{}
+
+func (newerDatabaseError) Error() string {
+	return "This data was written by a newer version of Replicaro. Install that version again. To start over with this version instead, move replicaro.db, and replicaro.db-wal and replicaro.db-shm if they exist, somewhere else first (don't delete them)."
+}
+
+func (newerDatabaseError) Is(target error) bool { return target == ErrDatabaseResetRequired }
+
+// incompatibleSchemaVersion is the error for a database whose schema version
+// this version can't use: a user_version other than CurrentSchemaVersion, or
+// version 0 with tables already in it. The two numbers go on their own log
+// line rather than into the error, because the error is the sentence the
+// user reads and support is the one who needs the numbers.
+func incompatibleSchemaVersion(found int) error {
+	log.Printf("replicaro.db has schema version %d; this version of Replicaro uses schema version %d", found, CurrentSchemaVersion)
+	if found > CurrentSchemaVersion {
+		return ErrDatabaseFromNewerVersion
+	}
+	return ErrDatabaseResetRequired
+}
+
+// checkSchemaVersion accepts a database this version can use: one at
+// CurrentSchemaVersion, or an empty one (user_version 0 and no tables) that
+// Migrate initializes.
+func checkSchemaVersion(db *sql.DB) error {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
@@ -31,10 +69,21 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 		if existing > 0 {
-			return ErrDatabaseResetRequired
+			return incompatibleSchemaVersion(version)
 		}
-	} else if version != CurrentSchemaVersion {
-		return fmt.Errorf("%w (found version %d, expected %d)", ErrDatabaseResetRequired, version, CurrentSchemaVersion)
+		return nil
+	}
+	if version != CurrentSchemaVersion {
+		return incompatibleSchemaVersion(version)
+	}
+	return nil
+}
+
+// Migrate initializes only the current schema. Older application databases
+// are rejected without migration, import, or metadata-cache backfill.
+func Migrate(db *sql.DB) error {
+	if err := checkSchemaVersion(db); err != nil {
+		return err
 	}
 
 	tx, err := db.Begin()
@@ -71,6 +120,7 @@ func Migrate(db *sql.DB) error {
 		vault_size_bytes INTEGER CHECK (vault_size_bytes IS NULL OR vault_size_bytes >= 0),
 		vault_size_measured_at TEXT NOT NULL DEFAULT '',
 		vault_size_dirty INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty IN (0,1)),
+		vault_size_dirty_count INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0),
 		vault_size_last_attempt_at TEXT NOT NULL DEFAULT '',
 		check_schedule TEXT NOT NULL DEFAULT 'manual',
 		next_check TEXT NOT NULL DEFAULT '',
@@ -120,6 +170,9 @@ func Migrate(db *sql.DB) error {
 		retention_monthly INTEGER CHECK (retention_monthly BETWEEN 1 AND 2147483647),
 		retention_yearly INTEGER CHECK (retention_yearly BETWEEN 1 AND 2147483647),
 		excludes TEXT NOT NULL DEFAULT '',
+		skip_nobackup_folders INTEGER NOT NULL DEFAULT 0 CHECK (skip_nobackup_folders IN (0,1)),
+		skip_cachedir_folders INTEGER NOT NULL DEFAULT 0 CHECK (skip_cachedir_folders IN (0,1)),
+		skip_marker_file_name TEXT NOT NULL DEFAULT '',
 		tag TEXT NOT NULL DEFAULT '',
 		before_script_path TEXT NOT NULL DEFAULT '',
 		before_script_must_succeed INTEGER NOT NULL DEFAULT 0 CHECK (before_script_must_succeed IN (0,1)),
@@ -159,6 +212,7 @@ func Migrate(db *sql.DB) error {
 		target_reason_code TEXT NOT NULL DEFAULT 'not_checked',
 		target_checked_at TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL DEFAULT '',
+		full_source_read_pending INTEGER NOT NULL DEFAULT 0 CHECK (full_source_read_pending IN (0,1)),
 		PRIMARY KEY (job_id, repository_id),
 		FOREIGN KEY (job_id, repository_id)
 			REFERENCES backup_job_targets(job_id, repository_id) ON DELETE CASCADE,
@@ -196,7 +250,8 @@ func Migrate(db *sql.DB) error {
 		job_id TEXT NOT NULL DEFAULT '',
 		repository_id TEXT NOT NULL DEFAULT '',
 		started_at DATETIME NOT NULL,
-		finished_at DATETIME NOT NULL DEFAULT ''
+		finished_at DATETIME NOT NULL DEFAULT '',
+		issue_kind TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS operation_steps (
@@ -319,6 +374,28 @@ func Migrate(db *sql.DB) error {
 		updated_at TEXT NOT NULL
 	);
 
+	-- One row per vault that has, or had, a reconnect problem (see
+	-- vault_reconnect.go). It is kept apart from vault_profile_sync and
+	-- kopia_policy_state on purpose: a local edit resets the profile sync
+	-- attempt count and startup resets every Kopia policy error to dirty,
+	-- and the failing-since times here must survive both. Schema 70
+	-- databases from before this table existed get it from this same
+	-- CREATE TABLE IF NOT EXISTS on their next start; nothing is backfilled,
+	-- so every existing vault starts with no reconnect state and no clock.
+	CREATE TABLE IF NOT EXISTS vault_reconnect_state (
+		repository_id TEXT PRIMARY KEY,
+		reconnect_required INTEGER NOT NULL DEFAULT 0 CHECK (reconnect_required IN (0,1)),
+		reconnect_source TEXT NOT NULL DEFAULT '',
+		reconnect_set_at TEXT NOT NULL DEFAULT '',
+		profile_sync_failing_since TEXT NOT NULL DEFAULT '',
+		kopia_policy_failing_since TEXT NOT NULL DEFAULT '',
+		profile_sync_last_failure_at TEXT NOT NULL DEFAULT '',
+		kopia_policy_last_failure_at TEXT NOT NULL DEFAULT '',
+		CHECK ((reconnect_required = 0 AND reconnect_source = '' AND reconnect_set_at = '') OR
+		       (reconnect_required = 1 AND reconnect_source <> '' AND reconnect_set_at <> '')),
+		FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS dormant_recovery_jobs (
 		repository_id TEXT NOT NULL,
 		job_id TEXT NOT NULL,
@@ -399,9 +476,9 @@ func Migrate(db *sql.DB) error {
 	if _, err := tx.Exec(schema); err != nil {
 		return err
 	}
-	// Schema 70 predates the optional password-mutation disposition. Adding the
-	// conservative default in place keeps existing current-schema operations
-	// fail-closed without admitting any older schema version.
+	// Some schema 70 databases were created before the password-mutation
+	// disposition column existed. Add it in place with the conservative default so
+	// existing operations stay fail-closed; older schema versions are still rejected.
 	var dispositionColumns int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('vault_password_change_operations')
 		WHERE name='native_mutation_disposition'`).Scan(&dispositionColumns); err != nil {
@@ -414,8 +491,84 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// Same in-place treatment for the per-target "re-read every source file"
+	// flag (see markJobTargetFullSourceRead for when it is set). Existing rows
+	// start at 0 on purpose: an alias changed before this column existed is
+	// not retroactively re-read, and the schema version stays 70. The
+	// schedule-state trigger keeps inserting new rows with the default 0; the
+	// few paths that need a new pair flagged set it explicitly.
+	var fullReadColumns int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('job_target_schedule_state')
+		WHERE name='full_source_read_pending'`).Scan(&fullReadColumns); err != nil {
+		return err
+	}
+	if fullReadColumns == 0 {
+		if _, err := tx.Exec(`ALTER TABLE job_target_schedule_state
+			ADD COLUMN full_source_read_pending INTEGER NOT NULL DEFAULT 0
+			CHECK (full_source_read_pending IN (0,1))`); err != nil {
+			return err
+		}
+	}
+	// vault_reconnect_state tables created by an earlier start of this version
+	// have no last-failure columns. Add them in place, empty: an empty last
+	// failure makes the next failure start a new run (see
+	// RecordVaultWorkerFailure), so a clock saved before the column existed can
+	// only escalate later than it would have, never earlier. Every other column
+	// and row is kept.
+	for _, column := range []string{"profile_sync_last_failure_at", "kopia_policy_last_failure_at"} {
+		var present int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('vault_reconnect_state')
+			WHERE name=?`, column).Scan(&present); err != nil {
+			return err
+		}
+		if present == 0 {
+			if _, err := tx.Exec(`ALTER TABLE vault_reconnect_state
+				ADD COLUMN ` + column + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
+	// The job's "skip the contents of any folder that contains ..." choices.
+	// Existing jobs start with all three of the user's own choices off. A job
+	// with a Kopia vault still skips CACHEDIR.TAG folders, because that box
+	// is forced on while the job has one (see models.BackupJob.UsesKopia);
+	// for a job that also has Restic vaults, that means its Restic backups
+	// now pass --exclude-caches as well.
+	for _, column := range []struct{ name, definition string }{
+		{"skip_nobackup_folders", `INTEGER NOT NULL DEFAULT 0 CHECK (skip_nobackup_folders IN (0,1))`},
+		{"skip_cachedir_folders", `INTEGER NOT NULL DEFAULT 0 CHECK (skip_cachedir_folders IN (0,1))`},
+		{"skip_marker_file_name", `TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := addColumnIfMissing(tx, "backup_jobs", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	// Vault Size measures without holding the vault lock, so a backup can
+	// mark the vault dirty while a measurement runs. The count lets the
+	// measurement's result clear the flag only when nothing marked the vault
+	// after the measurement started (see PublishVaultSize). Existing vaults
+	// start at 0; the count only has to change, not mean anything absolute.
+	if err := addColumnIfMissing(tx, "repositories", "vault_size_dirty_count",
+		`INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0)`); err != nil {
+		return err
+	}
+	// A completed_with_issues backup can carry a qualifier such as
+	// "locked_files" (see models.OperationIssueLockedFiles). Existing rows get
+	// '' and keep showing plain completed with issues; they are not
+	// reclassified. The status values themselves are unchanged, so nothing
+	// that matches on them needs migrating.
+	if err := addColumnIfMissing(tx, "operations", "issue_kind", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)
 		ON CONFLICT(key) DO NOTHING`, uuid.NewString()); err != nil {
+		return err
+	}
+	discardedReconnects, err := retireAutomaticRelocationState(tx)
+	if err != nil {
+		return err
+	}
+	if err := refreshMetadataGroupingRootsOnce(tx); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DROP TABLE IF EXISTS temp.startup_stuck_restic_repositories`); err != nil {
@@ -426,11 +579,18 @@ func Migrate(db *sql.DB) error {
 	)`); err != nil {
 		return err
 	}
+	// Only the kinds that run native Restic commands under the vault lock can
+	// leave a stale Restic lock behind: backup, restore, check, maintenance and
+	// snapshot deletion ("delete"). A job deletion record runs no Restic
+	// command, and a queued record never started anything, so neither selects
+	// a vault for the unlock. Keep this list to those kinds when adding new
+	// operation kinds.
 	if _, err := tx.Exec(`INSERT INTO startup_stuck_restic_repositories (repository_id)
 		SELECT r.id FROM repositories r
 		WHERE r.engine = 'restic' AND r.auto_unlock = 1 AND (
 			r.last_check_status = 'running' OR r.last_maintenance_status = 'running' OR
-			EXISTS (SELECT 1 FROM operations o WHERE o.repository_id = r.id AND o.status = 'running')
+			EXISTS (SELECT 1 FROM operations o WHERE o.repository_id = r.id AND o.status = 'running'
+				AND o.kind IN ('backup', 'restore', 'check', 'maintenance', 'delete'))
 		)`); err != nil {
 		return err
 	}
@@ -438,10 +598,19 @@ func Migrate(db *sql.DB) error {
 		return err
 	}
 
-	// Restore admitted scheduled occurrences that did not reach the requested
-	// native backup boundary. Process activation alone is not consumption; a
-	// non-skipped native backup step is the conservative crash-time start truth,
-	// while a skipped step durably confirms that the requested child did not run.
+	// A database can already hold a never-started group that retention, vault
+	// removal or job target removal emptied (see
+	// deleteEmptyUnstartedAdmissionGroups); the group check below would refuse
+	// every start. Remove such groups before anything here reconciles a job.
+	// It deletes nothing on a consistent database, so running it on every
+	// start is harmless.
+	if _, err := tx.Exec(deleteEmptyUnstartedAdmissionGroups); err != nil {
+		return err
+	}
+	// Put back admitted scheduled occurrences whose requested native backup never
+	// started. Starting the operation process does not consume an occurrence. After
+	// a crash, any non-skipped native backup step is conservatively treated as a
+	// start, while a skipped step records that the requested backup did not run.
 	queuedRows, err := tx.Query(`SELECT o.id FROM operations o
 		LEFT JOIN scheduled_operation_restorations r ON r.operation_id=o.id
 		WHERE o.kind='backup' AND (
@@ -464,7 +633,7 @@ func Migrate(db *sql.DB) error {
 		}
 		queuedIDs = append(queuedIDs, operationID)
 	}
-	if err := queuedRows.Close(); err != nil {
+	if err := closeRows(queuedRows); err != nil {
 		return err
 	}
 	for _, operationID := range queuedIDs {
@@ -505,13 +674,40 @@ func Migrate(db *sql.DB) error {
 		}
 		reconciliationJobs = append(reconciliationJobs, jobID)
 	}
-	if err := reconciliationRows.Close(); err != nil {
+	if err := closeRows(reconciliationRows); err != nil {
 		return err
 	}
 	for _, jobID := range reconciliationJobs {
 		if err := reconcileScheduledAdmissionGroupsTx(tx, jobID); err != nil {
 			return err
 		}
+	}
+	// A request-started operation (restore, manual check or maintenance,
+	// snapshot or job deletion, vault password change, settings save or
+	// removal) is queued while it waits for the vault. Queued
+	// means nothing has run yet, so there is nothing to recover: it becomes
+	// interrupted and is not resumed. Queued backups are the exception handled
+	// above; their scheduled occurrence goes back for catch-up. Without this the
+	// record would stay queued forever and keep blocking vault removal.
+	neverStartedRows, err := tx.Query(`SELECT id FROM operations WHERE status='queued' AND kind<>'backup' ORDER BY started_at,id`)
+	if err != nil {
+		return err
+	}
+	neverStartedIDs := []string{}
+	for neverStartedRows.Next() {
+		var operationID string
+		if err := neverStartedRows.Scan(&operationID); err != nil {
+			_ = neverStartedRows.Close()
+			return err
+		}
+		neverStartedIDs = append(neverStartedIDs, operationID)
+	}
+	if err := closeRows(neverStartedRows); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE operations SET status='interrupted', finished_at=?
+		WHERE status='queued' AND kind<>'backup'`, formatSortableTimestamp(time.Now())); err != nil {
+		return err
 	}
 	type startupStep struct{ operationID, engine, domain, kind string }
 	startupSteps := []startupStep{}
@@ -529,12 +725,19 @@ func Migrate(db *sql.DB) error {
 		}
 		startupSteps = append(startupSteps, step)
 	}
-	if err := stepRows.Close(); err != nil {
+	if err := closeRows(stepRows); err != nil {
 		return err
 	}
 	type startupOperation struct{ id, engine, kind string }
 	startupOperations := []startupOperation{}
-	operationRows, err := tx.Query(`SELECT id,engine,kind FROM operations WHERE status='running' ORDER BY started_at,id`)
+	// A running vault password change is the one exception to "every running
+	// operation becomes interrupted": its saved phase record is the recovery
+	// authority, and startup password recovery (runner.StartupPasswordRecovery,
+	// prepared right after Migrate) resumes it and finishes this record with
+	// the phase outcome. Marking it interrupted here would report a change that
+	// recovery then completes. A queued one never started and is interrupted
+	// above like every other queued operation.
+	operationRows, err := tx.Query(`SELECT id,engine,kind FROM operations WHERE status='running' AND kind<>? ORDER BY started_at,id`, VaultPasswordChangeKind)
 	if err != nil {
 		return err
 	}
@@ -546,7 +749,7 @@ func Migrate(db *sql.DB) error {
 		}
 		startupOperations = append(startupOperations, operation)
 	}
-	if err := operationRows.Close(); err != nil {
+	if err := closeRows(operationRows); err != nil {
 		return err
 	}
 	retentionOperations := []startupOperation{}
@@ -568,7 +771,7 @@ func Migrate(db *sql.DB) error {
 		}
 		retentionOperations = append(retentionOperations, operation)
 	}
-	if err := retentionRows.Close(); err != nil {
+	if err := closeRows(retentionRows); err != nil {
 		return err
 	}
 	interruptedAt := formatSortableTimestamp(time.Now())
@@ -591,9 +794,9 @@ func Migrate(db *sql.DB) error {
 		)`); err != nil {
 		return err
 	}
-	// A conclusive Restic backup may have committed immediately before a crash
-	// that preceded retention-step persistence. Record definite no-start truth;
-	// do not infer a native result or launch the missed command on startup.
+	// A Restic backup may have completed just before a crash, before its retention
+	// step was recorded. Record the retention step as skipped (it never started);
+	// do not guess a native result or launch the missed command on startup.
 	if _, err := tx.Exec(`INSERT INTO operation_steps
 		(id,operation_id,domain,kind,status,started_at,finished_at)
 		SELECT lower(hex(randomblob(16))),o.id,'native','retention','skipped',
@@ -610,7 +813,7 @@ func Migrate(db *sql.DB) error {
 	if _, err := tx.Exec(`UPDATE operations
 		SET status = 'interrupted',
 			finished_at = ?
-		WHERE status = 'running'`, interruptedAt); err != nil {
+		WHERE status = 'running' AND kind <> ?`, interruptedAt, VaultPasswordChangeKind); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE operation_steps
@@ -619,18 +822,28 @@ func Migrate(db *sql.DB) error {
 		WHERE status = 'running'`, interruptedAt); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE repositories SET last_check_status = 'failed' WHERE last_check_status = 'running'`); err != nil {
+	// The running check or maintenance operation was just marked interrupted,
+	// so the vault's own last status says the same instead of failed.
+	if _, err := tx.Exec(`UPDATE repositories SET last_check_status = 'interrupted' WHERE last_check_status = 'running'`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE repositories SET last_maintenance_status = 'failed' WHERE last_maintenance_status = 'running'`); err != nil {
+	if _, err := tx.Exec(`UPDATE repositories SET last_maintenance_status = 'interrupted' WHERE last_maintenance_status = 'running'`); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Best effort, after the rows are gone: a leftover staged or previous
+	// config copy is harmless residue (no credentials), and the next start no
+	// longer knows its token, so a failure here is only logged.
+	for _, intent := range discardedReconnects {
+		if err := engines.DiscardKopiaReconnectArtifacts(intent.repositoryID, intent.intentID); err != nil {
+			log.Printf("discarded Kopia reconnect files for vault %s could not be removed: %v", intent.repositoryID, err)
+		}
+	}
 	// Startup status repair remains authoritative even when its corresponding
 	// local diagnostic append fails; the file can be absent or incomplete.
-	for _, operationID := range queuedIDs {
+	for _, operationID := range append(queuedIDs, neverStartedIDs...) {
 		var engine, kind string
 		_ = db.QueryRow(`SELECT engine,kind FROM operations WHERE id=?`, operationID).Scan(&engine, &kind)
 		_ = operationlog.AppendFinal(operationID, engine, kind, "interrupted", "Application stopped before the operation started.")
@@ -659,4 +872,73 @@ func Migrate(db *sql.DB) error {
 			"Application stopped before the operation completed; the operation was marked interrupted.")
 	}
 	return nil
+}
+
+// retireAutomaticRelocationState removes what automatic relocation left
+// behind. Automatic relocation (cached vault aliases, mounted fallback, and the
+// Kopia reconnect that published an alias) was removed: a vault now runs only
+// at its registered location, and a moved vault is reconnected by the user
+// through the existing connect/update flow.
+//
+//   - resolved_repository_path is cleared. Nothing writes it any more, so this
+//     is idempotent and runs on every start. A Kopia vault whose native config
+//     still points at a former alias reports its ordinary configuration error.
+//   - Filesystem Kopia reconnect intents without a pending confirmed
+//     connection update are automatic-relocation intents; resuming them would
+//     publish an alias again, so they are discarded, and Migrate then deletes
+//     their staged and previous config copies. Intents already in cleanup
+//     only remove staged local files and are left for the normal startup
+//     recovery. Confirmed connection updates keep their intents.
+//
+// Job aliases (resolved_source_path) are deliberately kept: an alias created by
+// automatic relocation stays the job's user-visible location until the user
+// changes it. This cleanup needs no schema change.
+type discardedKopiaReconnect struct{ repositoryID, intentID string }
+
+func retireAutomaticRelocationState(tx *sql.Tx) ([]discardedKopiaReconnect, error) {
+	if _, err := tx.Exec(`UPDATE repositories SET resolved_repository_path='',resolved_repository_observed_at=''
+		WHERE resolved_repository_path<>'' OR resolved_repository_observed_at<>''`); err != nil {
+		return nil, err
+	}
+	const automatic = `state<>'cleanup'
+		  AND repository_id IN (SELECT id FROM repositories WHERE connector='fs')
+		  AND NOT EXISTS (SELECT 1 FROM repository_connection_intents c
+			WHERE c.canonical_identity=kopia_filesystem_reconnect_intents.repository_id)`
+	rows, err := tx.Query(`SELECT repository_id,intent_id FROM kopia_filesystem_reconnect_intents WHERE ` + automatic)
+	if err != nil {
+		return nil, err
+	}
+	discarded := []discardedKopiaReconnect{}
+	for rows.Next() {
+		var intent discardedKopiaReconnect
+		if err := rows.Scan(&intent.repositoryID, &intent.intentID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		discarded = append(discarded, intent)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM kopia_filesystem_reconnect_intents WHERE ` + automatic); err != nil {
+		return nil, err
+	}
+	return discarded, nil
+}
+
+// addColumnIfMissing adds one column to a schema 70 table in place when a
+// database created by an earlier build doesn't have it yet. New tables get the
+// column from CREATE TABLE above; the definition must give existing rows a
+// safe default. The schema version stays 70, so an older Replicaro still opens
+// the database and simply ignores the column.
+func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {
+	var present int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&present); err != nil {
+		return err
+	}
+	if present > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }

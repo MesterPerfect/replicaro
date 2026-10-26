@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/database"
@@ -19,7 +17,6 @@ import (
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/storageavailability"
-	"github.com/local/replicaro/vaultlock"
 )
 
 const metadataPageSize = 200
@@ -51,9 +48,10 @@ func visibleNativeRestoreSnapshot(ctx context.Context, db *sql.DB, repo models.R
 }
 
 func visibleCachedRestoreSnapshots(ctx context.Context, db *sql.DB, repo models.Repository, authority database.MetadataReadAuthority, snapshotIDs []string) (map[string]models.Snapshot, error) {
-	// Restore Browse is intentionally snapshot-scoped: a ready snapshot remains
+	// Restore Browse deliberately works per snapshot: a ready snapshot stays
 	// usable while another snapshot is indexing or the whole-vault generation is
-	// dirty. Actual restore still performs its fresh locked authoritative checks.
+	// dirty. The restore itself still re-checks against fresh data under the
+	// vault lock.
 	knownJobs, err := database.JobIDsForRepository(db, repo.ID)
 	if err != nil {
 		return nil, err
@@ -161,10 +159,10 @@ func fileSearch(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Request
 		badRequest(w, err.Error())
 		return
 	}
-	// This authoritative read and the following coherent cache transaction are
-	// the request's complete database handshake. A later main mutation linearizes
-	// after this read and is gated on the next request; no second main read is
-	// needed to make this response truthful.
+	// The authority read at the top of this handler and the cache transaction
+	// below are all the database work this request does. A main-database change
+	// committed after that read is ordered after it and is picked up by the next
+	// request, so this response needs no second main read to be correct.
 	results, revision, state, err := database.SearchReadyMetadataFilesPageForAuthority(
 		r.Context(), readDB, authority, query, metadataPageSize+1, offset, expectedRevision,
 	)
@@ -380,10 +378,6 @@ func snapshotIDs(snapshots []models.Snapshot) []string {
 	return ids
 }
 
-func logMetadataError(operation, repository string, err error) {
-	log.Printf("metadata cache %s for %s: %v", operation, repository, err)
-}
-
 // These strings name the native tree, never the viewing machine's filesystem.
 func normalizeSnapshotPath(value string) string { return strings.Trim(value, "/") }
 
@@ -405,12 +399,121 @@ func canonicalRestoreSelectionPath(value string) (string, error) {
 	return value, nil
 }
 
-func pathBase(value string) string {
-	value = normalizeSnapshotPath(value)
-	if index := strings.LastIndex(value, "/"); index >= 0 {
-		return value[index+1:]
+// writeRestoreRequestRefusal reports a restore refused before any work was
+// queued, by engines.ValidateRestoreRequest or by restoreSelection's Kopia
+// rules: its folder check, and its destination check for selected files, both
+// done inline there. /api/restore runs the same destination check through
+// refuseKopiaFileIntoMissingDestination. The coded refusals let the UI show
+// its own text, and for an invalid name offer to restore the containing
+// folder instead.
+func writeRestoreRequestRefusal(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, engines.ErrRestoreSelectionNameInvalid):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_selection_name_invalid", err.Error())
+	case errors.Is(err, engines.ErrRestoreDestinationNotAbsolute):
+		writeCodedError(w, http.StatusBadRequest, "restore_destination_not_absolute", err.Error())
+	case errors.Is(err, engines.ErrKopiaSelectionIncludesFolder):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_kopia_folder_selection", err.Error())
+	case errors.Is(err, engines.ErrKopiaSelectedFileDestinationMissing):
+		writeCodedError(w, http.StatusUnprocessableEntity, "restore_kopia_destination_missing", err.Error())
+	case errors.Is(err, engines.ErrUnsupported):
+		writeError(w, http.StatusUnprocessableEntity, err)
+	default:
+		writeError(w, http.StatusBadRequest, err)
 	}
-	return value
+}
+
+// errSelectionSnapshotNotReady means a selected item's snapshot is known to the
+// metadata cache but its entries are not indexed yet.
+var errSelectionSnapshotNotReady = errors.New("selected snapshot entries are not indexed yet")
+
+// cachedSelectionKinds reports whether the metadata cache, which the
+// selection was made from, lists any selected item as a folder, and whether
+// it lists any as a file. It runs before any work is queued, so a Kopia
+// request that would merge folders (see engines.ErrKopiaSelectionIncludesFolder)
+// or restore a file into a folder that doesn't exist (see
+// engines.ErrKopiaSelectedFileDestinationMissing) is refused with nothing
+// restored.
+//
+// An item whose snapshot is still being indexed can't be checked, and the
+// snapshot may be ready by the time the queued restore runs. The answer then
+// also carries errSelectionSnapshotNotReady, after the other items had their
+// chance to show a folder or a file, and the caller decides what that means
+// for its rule. Any other item the cache cannot place (its snapshot is
+// unknown to the cache, or the root or entry is missing) is left alone: the
+// restore refuses an unknown snapshot or root before any native call, and
+// the Kopia adapter checks the native type before each restore.
+func cachedSelectionKinds(ctx context.Context, db *sql.DB, repositoryID string, items []RestoreSelectionItem) (folder, file bool, err error) {
+	authority, err := database.LoadMetadataReadAuthority(ctx, db, repositoryID)
+	if err != nil {
+		return false, false, err
+	}
+	type listing struct {
+		snapshot models.Snapshot
+		entries  []models.SnapshotEntry
+		ready    bool
+	}
+	listings := map[string]listing{}
+	notReady := false
+	for _, item := range items {
+		parent := ""
+		if index := strings.LastIndex(item.Path, "/"); index >= 0 {
+			parent = item.Path[:index]
+		}
+		key := item.SnapshotID + "\x00" + parent
+		children, cached := listings[key]
+		if !cached {
+			children.snapshot, children.entries, children.ready, err =
+				database.ReadyMetadataSnapshotEntriesForAuthority(ctx, db, authority, item.SnapshotID, parent)
+			if err != nil {
+				return folder, file, err
+			}
+			listings[key] = children
+		}
+		if !children.ready {
+			// A snapshot the cache doesn't know comes back with an empty ID.
+			if children.snapshot.ID != "" {
+				notReady = true
+			}
+			continue
+		}
+		root, rootErr := exactRestoreNativeRoot(children.snapshot, item.NativeRootID, true)
+		if rootErr != nil {
+			continue
+		}
+		for _, entry := range children.entries {
+			if entry.Path == item.Path && entry.SourceRoot == root.Path {
+				folder = folder || entry.IsDir
+				file = file || !entry.IsDir
+			}
+		}
+	}
+	if notReady {
+		return folder, file, errSelectionSnapshotNotReady
+	}
+	return folder, file, nil
+}
+
+// refuseKopiaFileIntoMissingDestination is the destination rule of
+// restoreSelection for /api/restore's one selected item: a Kopia restore of a
+// selected file into a destination folder that doesn't exist is refused (see
+// engines.ErrKopiaSelectedFileDestinationMissing). When the cache can't tell
+// yet, the request goes on and the Kopia adapter checks again before it
+// restores the file. It reports whether it wrote a response.
+func refuseKopiaFileIntoMissingDestination(w http.ResponseWriter, r *http.Request, db *sql.DB, repositoryID, destination string, items []RestoreSelectionItem) bool {
+	if !engines.RestoreDestinationMissing(destination) {
+		return false
+	}
+	_, file, err := cachedSelectionKinds(r.Context(), db, repositoryID, items)
+	if file {
+		writeRestoreRequestRefusal(w, engines.ErrKopiaSelectedFileDestinationMissing)
+		return true
+	}
+	if err != nil && !errors.Is(err, errSelectionSnapshotNotReady) && !errors.Is(err, database.ErrMetadataIndexingUnavailable) {
+		writeError(w, http.StatusInternalServerError, err)
+		return true
+	}
+	return false
 }
 
 func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w http.ResponseWriter, r *http.Request) {
@@ -466,26 +569,6 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 			}
 		}
 	}
-	requestedID, operationIDErr := requestedOperationID(req.OperationID)
-	if operationIDErr != nil {
-		writeError(w, http.StatusBadRequest, operationIDErr)
-		return
-	}
-	if requestedID != nil {
-		if err := database.ValidateOperationID(*requestedID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		exists, err := database.OperationIDExists(db, *requestedID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if exists {
-			writeError(w, http.StatusConflict, database.ErrOperationIDExists)
-			return
-		}
-	}
 	manager, engineErr := resolveEngine(repoModel)
 	if engineErr != nil {
 		writeError(w, http.StatusBadRequest, engineErr)
@@ -497,96 +580,117 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 	}
 	for _, item := range normalized {
 		options := engines.RestoreOptions{Destination: req.TargetPath, Selection: item.Path, ConflictMode: req.ConflictMode}
-		if capabilityErr := engines.ValidateRestoreCapability(descriptor, options); capabilityErr != nil {
-			writeError(w, http.StatusUnprocessableEntity, capabilityErr)
+		if validationErr := engines.ValidateRestoreRequest(descriptor, options); validationErr != nil {
+			writeRestoreRequestRefusal(w, validationErr)
 			return
 		}
 	}
-	releaseMetadataDeferral, yieldErr := deferMetadataSyncForRestore(r.Context(), db, repoModel)
-	if yieldErr != nil {
-		return
-	}
-	unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), repoModel.ID)
-	if lockErr != nil {
-		releaseMetadataDeferral()
-		return
-	}
-	if !ok {
-		releaseMetadataDeferral()
-		writeError(w, http.StatusConflict, fmt.Errorf("vault is busy with another operation"))
-		return
-	}
-	var releaseRestoreRuntime func(bool)
-	terminalPersisted := false
-	defer func() {
-		unlock()
-		releaseMetadataDeferral()
-		if releaseRestoreRuntime != nil {
-			releaseRestoreRuntime(terminalPersisted)
+	// These rules depend on the whole request and on the cached entry types,
+	// so they sit here rather than in engines.ValidateRestoreRequest, which
+	// checks one item without the database. /api/restore restores one item
+	// and needs only the destination rule.
+	destinationMissing := descriptor.ID == engines.KopiaID && engines.RestoreDestinationMissing(req.TargetPath)
+	if descriptor.ID == engines.KopiaID && (len(normalized) > 1 || destinationMissing) {
+		includesFolder, includesFile, cacheErr := cachedSelectionKinds(r.Context(), db, repoModel.ID, normalized)
+		if len(normalized) > 1 && includesFolder {
+			writeRestoreRequestRefusal(w, engines.ErrKopiaSelectionIncludesFolder)
+			return
 		}
-	}()
-	repoModel, err = admitPersistedRepository(r.Context(), db, repoModel)
-	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		if destinationMissing && includesFile {
+			writeRestoreRequestRefusal(w, engines.ErrKopiaSelectedFileDestinationMissing)
+			return
+		}
+		// The cache is briefly unreadable while it is rebuilt, its vault is
+		// removed, or the app shuts down, and a selected snapshot can still be
+		// indexing. That is not a failure of this request: nothing has been
+		// queued or restored, so answer the same retryable 409 that browsing
+		// gives and let the user try again. A single item only needed the
+		// destination rule, which the Kopia adapter checks again, so it goes on.
+		retryable := errors.Is(cacheErr, database.ErrMetadataIndexingUnavailable) || errors.Is(cacheErr, errSelectionSnapshotNotReady)
+		if retryable && len(normalized) > 1 {
+			writeCodedError(w, http.StatusConflict, "metadata_not_ready", "backup data is still being prepared")
+			return
+		}
+		if cacheErr != nil && !retryable {
+			writeError(w, http.StatusInternalServerError, cacheErr)
+			return
+		}
+	}
+	if refuseWhilePasswordChangeUnfinished(w, db, repoModel.ID) {
 		return
 	}
-	manager, err = resolveEngine(repoModel)
+	title := fmt.Sprintf("Restore %d selected items", len(req.Items))
+	operationID, err := startTrackedOperation(db, runtimeManager, database.QueuedOperation{
+		Kind: "restore", Title: title, RepositoryID: repoModel.ID,
+	}, func(operationID, status string) func() {
+		return prepareOperationNotification(db, operationID, "restore", title, status, len(req.Items))
+	}, func(op *trackedOperation) {
+		restoreSelectionInBackground(op, repoModel, req, normalized)
+	})
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeTrackedStartError(w, err)
+		return
+	}
+	// The response carries only the operation ID. The per-item results are in
+	// the operation's log (read through /api/operations/output) once it
+	// finishes, because the work outlives this request.
+	writeTrackedOperationStarted(w, operationID)
+}
+
+// restoreSelectionInBackground restores each selected item with its own native
+// restore, under one vault lock and one operation record.
+func restoreSelectionInBackground(op *trackedOperation, repoModel models.Repository, req RestoreSelectionRequest, normalized []RestoreSelectionItem) {
+	db := op.db
+	releaseMetadataDeferral, err := deferMetadataSyncForRestore(op.ctx, db, repoModel)
+	if err != nil {
+		op.notStarted(err)
+		return
+	}
+	defer releaseMetadataDeferral()
+	unlock, err := op.waitForVault(repoModel.ID)
+	if err != nil {
+		op.notStarted(err)
+		return
+	}
+	defer unlock()
+	if err := op.activate(); err != nil {
+		op.fail(fmt.Errorf("start restore: %w", err))
+		return
+	}
+	repoModel, err = admitPersistedRepository(op.ctx, db, repoModel)
+	if err != nil {
+		op.fail(err)
+		return
+	}
+	manager, err := resolveEngine(repoModel)
+	if err != nil {
+		op.fail(err)
 		return
 	}
 	snapshotIDs := make([]string, 0, len(normalized))
 	for _, item := range normalized {
 		snapshotIDs = append(snapshotIDs, item.SnapshotID)
 	}
-	authority, authorityErr := database.LoadMetadataReadAuthority(r.Context(), db, repoModel.ID)
+	authority, authorityErr := database.LoadMetadataReadAuthority(op.ctx, db, repoModel.ID)
 	if authorityErr != nil {
-		writeError(w, http.StatusConflict, authorityErr)
+		op.fail(authorityErr)
 		return
 	}
-	visibleSnapshots, visibilityErr := visibleCachedRestoreSnapshots(r.Context(), db, repoModel, authority, snapshotIDs)
+	visibleSnapshots, visibilityErr := visibleCachedRestoreSnapshots(op.ctx, db, repoModel, authority, snapshotIDs)
 	if visibilityErr != nil {
-		writeError(w, http.StatusForbidden, visibilityErr)
+		op.fail(visibilityErr)
 		return
 	}
 	nativeRoots := make(map[string]models.SnapshotSourceRoot, len(normalized))
 	for _, item := range normalized {
 		root, rootErr := exactRestoreNativeRoot(visibleSnapshots[item.SnapshotID], item.NativeRootID, true)
 		if rootErr != nil {
-			writeError(w, http.StatusUnprocessableEntity, rootErr)
+			op.fail(rootErr)
 			return
 		}
 		nativeRoots[item.SnapshotID+"\x00"+item.Path] = root
 	}
-	started := time.Now()
-	operationID, operationErr := database.StartOperationWithID(
-		db,
-		"restore",
-		fmt.Sprintf("Restore %d selected items", len(req.Items)),
-		"",
-		repoModel.ID,
-		requestedID,
-		started,
-	)
-	if operationErr != nil {
-		if errors.Is(operationErr, database.ErrInvalidOperationID) {
-			writeError(w, http.StatusBadRequest, operationErr)
-			return
-		}
-		if errors.Is(operationErr, database.ErrOperationIDExists) {
-			writeError(w, http.StatusConflict, operationErr)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, operationErr)
-		return
-	}
-	operationCtx, closeCancelGate, releaseRuntime, runtimeErr := beginOperationRuntime(r.Context(), runtimeManager, operationID)
-	if runtimeErr != nil {
-		_ = finishOperationDurably(db, operationID, "failed", runtimeErr.Error(), time.Now())
-		writeError(w, http.StatusInternalServerError, runtimeErr)
-		return
-	}
-	releaseRestoreRuntime = releaseRuntime
+	operationCtx, closeCancelGate := op.ctx, op.closeGate
 
 	var kopiaNames *engines.KopiaRestoreFileNames
 	if manager.ID() == engines.KopiaID {
@@ -596,10 +700,13 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		}
 		kopiaNames = engines.NewKopiaRestoreFileNames(selections)
 	}
-	attempted, restored, failed, notAttempted, orchestrationFailed := 0, 0, 0, 0, 0
+	attempted, restored, failed, notAttempted, orchestrationFailed, completedWithIssues := 0, 0, 0, 0, 0, 0
 	results := make([]RestoreSelectionItemResult, 0, len(normalized))
 	stopReason := ""
 	cancellationInterrupted := false
+	// itemErrors keeps each item's error for the operation's cause (see the
+	// end of this function).
+	var itemErrors []error
 	for itemIndex, item := range normalized {
 		if stopReason != "" || operationCtx.Err() != nil {
 			closeCancelGate()
@@ -622,11 +729,19 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		output, restoreErr := manager.Restore(nativeContext, repoModel, item.SnapshotID, options)
 		operationStatus, processStarted, _, nativeStageErr, followupErr, stageKnown :=
 			engines.RequestedOperationOutcome(restoreErr)
-		if itemIndex == len(normalized)-1 || operationCtx.Err() != nil ||
-			stageKnown && operationStatus == engines.RequestedOperationInterrupted {
-			// The last requested restore child has returned, or cancellation has
-			// already made every later selection ineligible. Close before per-item
-			// bookkeeping so a late request cannot rewrite established native truth.
+		// The engine reports any context error as interrupted, including an
+		// internal deadline such as a local rclone preparation command's time
+		// limit. Only this request's own cancel or shutdown makes the item (and
+		// the request) interrupted; an internal timeout is handled as the
+		// preparation or native failure it is, so the request still fails and
+		// notifies, the same way a whole restore does.
+		ownCancel := stageKnown && operationStatus == engines.RequestedOperationInterrupted &&
+			operationruntime.TerminalStatus(operationCtx, restoreErr) == "interrupted"
+		if itemIndex == len(normalized)-1 || operationCtx.Err() != nil || ownCancel {
+			// The last requested restore child has returned, or cancellation means no
+			// later selection will run. Close the cancel gate before per-item
+			// bookkeeping so a late cancel request cannot change results the engine has
+			// already reported.
 			closeCancelGate()
 		}
 		result := RestoreSelectionItemResult{
@@ -636,12 +751,61 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		if destinationNotice != "" {
 			result.Output = destinationNotice + "\n" + output
 		}
-		if restoreErr != nil {
+		if engines.RestoreReportedErrors(restoreErr) {
+			// The engine finished this item and reported that some of its files
+			// failed. That is neither "restored" nor "failed": the item is
+			// completed with issues, and so is the whole request.
+			//
+			// nativeStatus still says exactly how the engine exited, using the
+			// same values as every other item: Restic ends such a restore with
+			// exit code 1, so it is "failed" with that exit as the native error;
+			// Kopia (run with --ignore-errors) exits 0, so it is "restored". Only
+			// the item status carries the completed-with-issues meaning. Don't
+			// add a separate native value for this case.
+			attempted++
+			completedWithIssues++
+			result.Status = "completed_with_issues"
+			result.Error = restoreErr.Error()
+			if stageKnown && operationStatus == engines.RequestedOperationFailed {
+				result.NativeStatus = "failed"
+				result.NativeError = result.Error
+				if nativeStageErr != nil {
+					result.NativeError = nativeStageErr.Error()
+				}
+			}
+			// A later Replicaro step (for example rclone session cleanup) can
+			// still fail after the engine reported. It is kept as its own fact.
+			if stageKnown && followupErr != nil {
+				orchestrationFailed++
+				result.OrchestrationStatus = "failed"
+				result.OrchestrationError = followupErr.Error()
+			}
+		} else if restoreErr != nil {
+			itemErrors = append(itemErrors, restoreErr)
 			orchestrationErrors := make([]string, 0, 1)
 			if followupErr != nil {
 				orchestrationErrors = append(orchestrationErrors, followupErr.Error())
 			}
 			orchestrationError := strings.Join(orchestrationErrors, "\n")
+			if stageKnown && operationStatus == engines.RequestedOperationSucceeded && engines.RestoreOutcomeIsUnknown(restoreErr) {
+				// Kopia exited 0 but its summary could not be read, so nothing
+				// shows what this item restored. The native status keeps the
+				// exit-0 success, but the item is failed and is not counted as
+				// restored, so it can never lift the request to success or
+				// completed_with_issues on its own (see
+				// engines.RestoreOutcomeUnknown).
+				attempted++
+				failed++
+				orchestrationFailed++
+				result.Domain = "orchestration"
+				result.Status = "failed"
+				result.Error = restoreErr.Error()
+				result.NativeStatus = "restored"
+				result.OrchestrationStatus = "failed"
+				result.OrchestrationError = orchestrationError
+				results = append(results, result)
+				continue
+			}
 			if stageKnown && operationStatus == engines.RequestedOperationSucceeded {
 				attempted++
 				restored++
@@ -670,7 +834,16 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 				result.NativeError = ""
 				result.OrchestrationStatus = "failed"
 				result.OrchestrationError = "native engine preparation failed; requested native restore was not started"
-				if operationStatus == engines.RequestedOperationInterrupted {
+				// Other preparation failures leave the item error empty, but
+				// these refusals are the reason the user has to change the
+				// selection or the destination, so the item carries the text.
+				switch {
+				case errors.Is(restoreErr, engines.ErrKopiaSelectionIncludesFolder):
+					result.Error = engines.ErrKopiaSelectionIncludesFolder.Error()
+				case errors.Is(restoreErr, engines.ErrKopiaSelectedFileDestinationMissing):
+					result.Error = engines.ErrKopiaSelectedFileDestinationMissing.Error()
+				}
+				if ownCancel {
 					cancellationInterrupted = true
 					stopReason = "not attempted because the restore request was cancelled"
 				} else {
@@ -698,7 +871,7 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 					result.Error = nativeStageErr.Error()
 					result.NativeError = result.Error
 				}
-				if stageKnown && operationStatus == engines.RequestedOperationInterrupted {
+				if ownCancel {
 					result.Status = "interrupted"
 					result.NativeStatus = "interrupted"
 					cancellationInterrupted = true
@@ -727,33 +900,38 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		}
 		results = append(results, result)
 	}
+	// Every item is its own native restore, so the request as a whole is:
+	//   - success when every item was restored with nothing left over;
+	//   - failed when no item was restored (restored counts items whose native
+	//     restore succeeded, including ones whose follow-up then failed, but not
+	//     a Kopia exit 0 whose summary could not be read);
+	//   - completed_with_issues otherwise: some items restored and some failed or
+	//     were not attempted, an item's engine reported completed with errors,
+	//     or an item was restored but a Replicaro follow-up failed.
+	// Items skipped because of a cancel make the whole request interrupted
+	// below, which takes precedence.
 	status := "success"
-	if failed > 0 || orchestrationFailed > 0 {
+	if restored == 0 && completedWithIssues == 0 {
 		status = "failed"
+	} else if failed > 0 || orchestrationFailed > 0 || notAttempted > 0 || completedWithIssues > 0 {
+		status = "completed_with_issues"
 	}
-	encoded, _ := json.Marshal(map[string]any{"attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "items": results})
+	encoded, _ := json.Marshal(map[string]any{"attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "completedWithIssues": completedWithIssues, "items": results})
 	operationOutput := string(encoded)
 	persistedStatus := status
 	if cancellationInterrupted {
 		persistedStatus = "interrupted"
 	}
 	closeCancelGate()
-	var dispatchNotification func()
-	if persistedStatus != "interrupted" {
-		dispatchNotification = prepareOperationNotification(db, operationID, "restore", fmt.Sprintf("Restore %d selected items", len(req.Items)), status, len(req.Items))
+	// A failed request passes its item errors as the cause, like a whole
+	// restore passes its one error, so a conclusive reconnect error found while
+	// preparing the items saves the vault as needing a reconnect
+	// (vaultreconnect.RecordOperationResult). Only a failed request does: in
+	// any other outcome at least one item reached the vault. The joined errors
+	// are only classified there; the saved output above is unchanged.
+	var cause error
+	if persistedStatus == "failed" {
+		cause = errors.Join(itemErrors...)
 	}
-	if finishErr := finishOperationDurably(db, operationID, persistedStatus, operationOutput, time.Now()); finishErr != nil {
-		writeError(w, http.StatusInternalServerError, finishErr)
-		return
-	}
-	terminalPersisted = true
-	if dispatchNotification != nil {
-		dispatchNotification()
-	}
-	response := map[string]any{"status": persistedStatus, "attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "items": results}
-	if persistedStatus != "success" {
-		writeJSONStatus(w, http.StatusMultiStatus, response)
-		return
-	}
-	writeJSON(w, response)
+	op.finishWithCause(persistedStatus, operationOutput, cause)
 }

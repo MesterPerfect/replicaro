@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -15,24 +14,13 @@ import (
 	"github.com/local/replicaro/operationlog"
 )
 
-var ErrTargetRunActive = errors.New("backup target already has a queued or running operation")
 var removeOperationLog = operationlog.Remove
 var ErrRepositoryTaskActive = errors.New("repository task already has a running operation")
 var ErrBackupTriggerChanged = errors.New("backup job was disabled or changed before it could be queued")
-var ErrInvalidOperationID = errors.New("operation id must be a canonical lowercase UUID v4")
-var ErrOperationIDExists = errors.New("operation id already exists")
 
-type BackupOperationRequest struct {
-	Title        string
-	JobID        string
-	RepositoryID string
-	Engine       string
-}
-
-type BackupTriggerExpectation struct {
-	Job        models.BackupJob
-	RequireDue bool
-}
+// ErrOperationActive is returned by QueueOperation when an operation it must
+// not duplicate is already queued or running.
+var ErrOperationActive = errors.New("the same operation is already queued or running")
 
 // StartOperation records an operation before its external command begins so
 // the dashboard can show work that is still in progress.
@@ -41,61 +29,122 @@ func StartOperation(
 	kind, title, jobID, repositoryID string,
 	startedAt time.Time,
 ) (string, error) {
-	return StartOperationWithID(db, kind, title, jobID, repositoryID, nil, startedAt)
-}
-
-// StartOperationWithID lets a restore submission carry one exact UI-selected
-// identity into durable state. The canonical UUID v4 check prevents alternate
-// spellings from weakening exact operation lookup, while the database primary
-// key remains the final collision boundary.
-func StartOperationWithID(
-	db *sql.DB,
-	kind, title, jobID, repositoryID string,
-	requestedID *string,
-	startedAt time.Time,
-) (string, error) {
-	id := ""
-	if requestedID == nil {
-		id = uuid.New().String()
-	} else {
-		id = *requestedID
-		if err := ValidateOperationID(id); err != nil {
-			return "", ErrInvalidOperationID
-		}
-	}
-	result, err := db.Exec(
+	id := uuid.New().String()
+	if _, err := db.Exec(
 		`INSERT INTO operations
 			(id, kind, status, title, job_id, repository_id, engine, started_at)
-			VALUES (?, ?, 'running', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)
-			ON CONFLICT(id) DO NOTHING`,
+			VALUES (?, ?, 'running', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)`,
 		id, kind, title, jobID, repositoryID, repositoryID, formatSortableTimestamp(startedAt),
-	)
-	if err != nil {
+	); err != nil {
 		return "", err
-	}
-	if count, err := result.RowsAffected(); err != nil {
-		return "", err
-	} else if count != 1 {
-		return "", ErrOperationIDExists
 	}
 	return id, nil
 }
 
-func ValidateOperationID(id string) error {
-	parsed, err := uuid.Parse(id)
-	if err != nil || parsed == uuid.Nil || parsed.Version() != 4 ||
-		parsed.Variant() != uuid.RFC4122 || parsed.String() != id {
-		return ErrInvalidOperationID
-	}
-	return nil
+// QueuedOperation describes a request-started operation (restore, manual
+// check or maintenance, snapshot or job deletion, vault password change,
+// settings save or removal) whose record is created before its worker waits
+// for the vault.
+type QueuedOperation struct {
+	Kind, Title, JobID, RepositoryID string
+	// Exclusive refuses the new record while another queued or running
+	// operation has the same kind, repository and job. With MatchTitle the
+	// title has to match as well; snapshot deletion uses that because the
+	// snapshot ID is only carried in its title.
+	Exclusive  bool
+	MatchTitle bool
+	// VaultChange marks a vault administration job (password change, settings
+	// save, removal). Only one of those may be queued or running per vault;
+	// another is refused with ErrVaultChangeActive.
+	VaultChange bool
 }
 
-func OperationIDExists(db *sql.DB, id string) (bool, error) {
-	var exists int
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM operations WHERE id = ?)`, id).Scan(&exists); err != nil {
-		return false, err
+// QueueOperation creates the record as queued, with a server-generated ID. The
+// checks and the insert share one transaction so two requests cannot both
+// pass them. Every record for a vault is refused with ErrVaultBeingRemoved
+// while that vault's removal is queued or running, so the removal is not
+// starved by new work; a second removal gets the same answer.
+func QueueOperation(db *sql.DB, operation QueuedOperation, queuedAt time.Time) (string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
 	}
-	return exists != 0, nil
+	defer func() { _ = tx.Rollback() }()
+	if removing, err := vaultRemovalPending(tx, operation.RepositoryID); err != nil {
+		return "", err
+	} else if removing {
+		return "", ErrVaultBeingRemoved
+	}
+	if operation.VaultChange {
+		if err := requireNoVaultChange(tx, operation.RepositoryID); err != nil {
+			return "", err
+		}
+	}
+	if operation.Exclusive {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations
+			WHERE kind = ? AND repository_id = ? AND job_id = ? AND (? = 0 OR title = ?)
+			AND status IN ('queued','running')`,
+			operation.Kind, operation.RepositoryID, operation.JobID, operation.MatchTitle, operation.Title).Scan(&active); err != nil {
+			return "", err
+		}
+		if active != 0 {
+			return "", ErrOperationActive
+		}
+	}
+	id := uuid.New().String()
+	if _, err := tx.Exec(`INSERT INTO operations
+		(id, kind, status, title, job_id, repository_id, engine, started_at)
+		VALUES (?, ?, 'queued', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)`,
+		id, operation.Kind, operation.Title, operation.JobID, operation.RepositoryID,
+		operation.RepositoryID, formatSortableTimestamp(queuedAt)); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// ActivateQueuedOperation moves a queued record to running once its worker
+// holds what it waited for. A manual check or maintenance also marks the
+// vault's last check or maintenance status running here, not when it was
+// queued: until the lock is taken nothing has run, and the startup Restic
+// unlock selection reads that column.
+func ActivateQueuedOperation(db *sql.DB, operationID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var kind, repositoryID string
+	if err := tx.QueryRow(`SELECT kind, repository_id FROM operations WHERE id = ? AND status = 'queued'`,
+		operationID).Scan(&kind, &repositoryID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE operations SET status = 'running' WHERE id = ? AND status = 'queued'`, operationID); err != nil {
+		return err
+	}
+	if kind == "check" || kind == "maintenance" {
+		column := "last_check_status"
+		if kind == "maintenance" {
+			column = "last_maintenance_status"
+		}
+		result, err := tx.Exec(`UPDATE repositories SET `+column+` = 'running' WHERE id = ?`, repositoryID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return sql.ErrNoRows
+		}
+	}
+	return tx.Commit()
+}
+
+// RepositoryOperationTitle is the title of a check or maintenance record,
+// shared by the scheduler and the manual request so both read the same.
+func RepositoryOperationTitle(kind, repositoryName string) string {
+	return strings.Title(kind) + ": " + repositoryName
 }
 
 // StartRepositoryOperation atomically creates the durable running marker and
@@ -113,6 +162,14 @@ func StartRepositoryOperation(db *sql.DB, repo models.Repository, kind string, s
 	if exists != 1 {
 		return "", sql.ErrNoRows
 	}
+	// A scheduled check or maintenance is skipped while the vault's removal is
+	// pending, the same way a paused vault is: no record, no issue, and the
+	// scheduler tries again on a later tick.
+	if removing, err := vaultRemovalPending(tx, repo.ID); err != nil {
+		return "", err
+	} else if removing {
+		return "", ErrVaultBeingRemoved
+	}
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE repository_id = ? AND kind = ? AND status IN ('queued','running')`, repo.ID, kind).Scan(&active); err != nil {
 		return "", err
 	}
@@ -121,7 +178,7 @@ func StartRepositoryOperation(db *sql.DB, repo models.Repository, kind string, s
 	}
 	id := uuid.New().String()
 	if _, err := tx.Exec(`INSERT INTO operations (id, kind, engine, status, title, repository_id, started_at)
-		VALUES (?, ?, ?, 'running', ?, ?, ?)`, id, kind, repo.Engine, strings.Title(kind)+": "+repo.Name, repo.ID, formatSortableTimestamp(startedAt)); err != nil {
+		VALUES (?, ?, ?, 'running', ?, ?, ?)`, id, kind, repo.Engine, RepositoryOperationTitle(kind, repo.Name), repo.ID, formatSortableTimestamp(startedAt)); err != nil {
 		return "", err
 	}
 	column := "last_check_status"
@@ -178,7 +235,11 @@ func FinishRepositoryOperation(db *sql.DB, operationID string, repo models.Repos
 				return err
 			}
 			next := NextRunFrom(schedule, finishedAt)
-			if kind == "maintenance" && status != "success" {
+			// completed_with_issues means native maintenance itself succeeded and
+			// only a later Replicaro step failed, so the provider locks were
+			// renewed. Counting it as done avoids re-running native maintenance an
+			// hour later for nothing.
+			if kind == "maintenance" && status != "success" && status != "completed_with_issues" {
 				var objectLock models.ObjectLockSettings
 				if err := json.Unmarshal([]byte(objectLockJSON), &objectLock); err != nil {
 					return fmt.Errorf("decode stored object lock settings: %w", err)
@@ -200,152 +261,6 @@ func FinishRepositoryOperation(db *sql.DB, operationID string, repo models.Repos
 		}
 		return tx.Commit()
 	})
-}
-
-// QueueBackupOperation atomically records visible queued work and marks the
-// target queued. The coordinator performs admission only after this succeeds.
-func QueueBackupOperation(db *sql.DB, title, jobID, repositoryID string, queuedAt time.Time) (string, error) {
-	ids, err := QueueBackupOperations(db, []BackupOperationRequest{{
-		Title: title, JobID: jobID, RepositoryID: repositoryID,
-	}}, queuedAt, "", false, nil)
-	if err != nil {
-		return "", err
-	}
-	return ids[0], nil
-}
-
-// QueueBackupOperations records an all-target trigger atomically. Either every
-// target becomes visible as queued and the shared schedule advances once, or
-// none of the targets are queued.
-func QueueBackupOperations(
-	db *sql.DB,
-	requests []BackupOperationRequest,
-	queuedAt time.Time,
-	schedule string,
-	markTrigger bool,
-	expectation *BackupTriggerExpectation,
-) ([]string, error) {
-	if len(requests) == 0 {
-		return nil, ErrInvalidTargets
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if expectation != nil {
-		if err := validateBackupTrigger(tx, requests, queuedAt, *expectation); err != nil {
-			return nil, err
-		}
-	}
-	ids := make([]string, 0, len(requests))
-	seen := make(map[string]bool, len(requests))
-	for _, request := range requests {
-		key := request.JobID + "\x00" + request.RepositoryID
-		if request.JobID == "" || request.RepositoryID == "" || seen[key] {
-			return nil, ErrInvalidTargets
-		}
-		seen[key] = true
-		var targetCount, activeCount int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM backup_job_targets WHERE job_id = ? AND repository_id = ?`, request.JobID, request.RepositoryID).Scan(&targetCount); err != nil {
-			return nil, err
-		}
-		if targetCount != 1 {
-			return nil, sql.ErrNoRows
-		}
-		if err := requireKopiaPolicyReady(tx, request.RepositoryID); err != nil {
-			return nil, err
-		}
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND repository_id = ? AND status IN ('queued', 'running')`, request.JobID, request.RepositoryID).Scan(&activeCount); err != nil {
-			return nil, err
-		}
-		if activeCount > 0 {
-			return nil, ErrTargetRunActive
-		}
-		id := uuid.New().String()
-		if _, err := tx.Exec(`INSERT INTO operations (id, kind, status, title, job_id, repository_id, engine, started_at)
-			VALUES (?, 'backup', 'queued', ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT engine FROM repositories WHERE id = ?), ''), ?)`, id, request.Title, request.JobID, request.RepositoryID, request.Engine, request.RepositoryID, formatSortableTimestamp(queuedAt)); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(`UPDATE backup_job_targets SET last_status = 'queued' WHERE job_id = ? AND repository_id = ?`, request.JobID, request.RepositoryID); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if markTrigger {
-		jobID := requests[0].JobID
-		for _, request := range requests[1:] {
-			if request.JobID != jobID {
-				return nil, ErrInvalidTargets
-			}
-		}
-		if _, err := tx.Exec(`UPDATE backup_jobs SET last_run = ?, next_run = ? WHERE id = ?`,
-			queuedAt.Format(time.RFC3339), NextRunFrom(schedule, queuedAt), jobID); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
-func validateBackupTrigger(tx *sql.Tx, requests []BackupOperationRequest, queuedAt time.Time, expectation BackupTriggerExpectation) error {
-	expected := expectation.Job
-	current, err := scanJob(tx.QueryRow(`SELECT `+jobColumns+` FROM backup_jobs WHERE id = ?`, expected.ID).Scan)
-	if err != nil {
-		return err
-	}
-	if current.Name != expected.Name || current.Source != expected.Source || current.Schedule != expected.Schedule ||
-		current.SourceStorageVersion != expected.SourceStorageVersion ||
-		current.SourceStorageKey != expected.SourceStorageKey ||
-		current.SourceStorageDescriptorJSON != expected.SourceStorageDescriptorJSON ||
-		current.Enabled != expected.Enabled || current.NextRun != expected.NextRun || current.LastRun != expected.LastRun ||
-		!models.RetentionPolicyEqual(current, expected) || current.Excludes != expected.Excludes || current.Tag != expected.Tag ||
-		!reflect.DeepEqual(current.EngineSettings, expected.EngineSettings) ||
-		!reflect.DeepEqual(current.PortableTargetIDs, expected.PortableTargetIDs) {
-		return ErrBackupTriggerChanged
-	}
-	expectedTargets := make(map[string]string, len(expected.Targets))
-	for _, target := range expected.Targets {
-		expectedTargets[target.RepositoryID] = target.Engine
-	}
-	if len(expectedTargets) != len(expected.Targets) || len(requests) != len(expectedTargets) {
-		return ErrBackupTriggerChanged
-	}
-	rows, err := tx.Query(`SELECT t.repository_id, r.engine FROM backup_job_targets t
-		JOIN repositories r ON r.id = t.repository_id WHERE t.job_id = ?`, expected.ID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	currentTargets := 0
-	for rows.Next() {
-		var repositoryID, engine string
-		if err := rows.Scan(&repositoryID, &engine); err != nil {
-			return err
-		}
-		if expectedTargets[repositoryID] != engine {
-			return ErrBackupTriggerChanged
-		}
-		currentTargets++
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if currentTargets != len(expectedTargets) {
-		return ErrBackupTriggerChanged
-	}
-	if expectation.RequireDue {
-		if !current.Enabled || current.Schedule == "" || current.Schedule == "manual" || current.NextRun == "" {
-			return ErrBackupTriggerChanged
-		}
-		dueAt, err := time.Parse(time.RFC3339, current.NextRun)
-		if err != nil || dueAt.After(queuedAt) {
-			return ErrBackupTriggerChanged
-		}
-	}
-	return nil
 }
 
 func ActivateBackupOperation(db *sql.DB, operationID, jobID, repositoryID string, _ time.Time) error {
@@ -370,14 +285,26 @@ func ActivateBackupOperation(db *sql.DB, operationID, jobID, repositoryID string
 	if count, _ := targetResult.RowsAffected(); count != 1 {
 		return sql.ErrNoRows
 	}
-	// Process activation is not requested-backup start. Keep the scheduled
-	// occurrence restorable through lock-level admission and supporting native
-	// commands; the runner resolves it only after a conclusive pre-native
-	// availability result or the requested backup boundary has been reached.
+	// Starting the operation is not the same as starting the requested backup. Keep
+	// the scheduled occurrence restorable through the checks under the vault lock
+	// and any supporting native commands; the runner resolves it only once storage
+	// is confirmed unavailable before the native backup, or the requested backup
+	// has been reached.
 	return tx.Commit()
 }
 
 func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status, output string, finishedAt time.Time) error {
+	return FinishBackupOperationWithIssueKind(db, operationID, jobID, repositoryID, status, "", output, finishedAt)
+}
+
+// FinishBackupOperationWithIssueKind is FinishBackupOperation with the
+// qualifier of a completed_with_issues result (models.OperationIssueLockedFiles
+// or ""). It is written in the same transaction as the status, so the two can
+// never disagree.
+func FinishBackupOperationWithIssueKind(db *sql.DB, operationID, jobID, repositoryID, status, issueKind, output string, finishedAt time.Time) error {
+	if issueKind != "" && (issueKind != models.OperationIssueLockedFiles || status != "completed_with_issues") {
+		return fmt.Errorf("backup issue kind %q does not apply to status %q", issueKind, status)
+	}
 	var engine string
 	_ = db.QueryRow(`SELECT engine FROM operations WHERE id=?`, operationID).Scan(&engine)
 	return operationlog.FinalizeOperation(operationID, engine, "backup", status, output, func() error {
@@ -386,7 +313,7 @@ func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status,
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		operationResult, err := tx.Exec(`UPDATE operations SET status = ?, finished_at = ?
+		operationResult, err := tx.Exec(`UPDATE operations SET status = ?, issue_kind = ?, finished_at = ?
 		WHERE id = ? AND (
 			status = 'running' OR (
 				status = 'queued' AND NOT EXISTS (
@@ -395,7 +322,7 @@ func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status,
 				)
 			)
 		)`,
-			status, formatSortableTimestamp(finishedAt), operationID)
+			status, issueKind, formatSortableTimestamp(finishedAt), operationID)
 		if err != nil {
 			return err
 		}
@@ -445,7 +372,7 @@ func FinishOperation(
 
 const operationColumns = `
 	id, kind, status, title, job_id, repository_id,
-	engine, started_at, finished_at`
+	engine, started_at, finished_at, issue_kind`
 
 func scanOperation(scan func(dest ...any) error) (models.Operation, error) {
 	var operation models.Operation
@@ -459,6 +386,7 @@ func scanOperation(scan func(dest ...any) error) (models.Operation, error) {
 		&operation.Engine,
 		&operation.StartedAt,
 		&operation.FinishedAt,
+		&operation.IssueKind,
 	)
 	return operation, err
 }
@@ -470,6 +398,63 @@ func ListOperations(db *sql.DB, limit int) ([]models.Operation, error) {
 	rows, err := db.Query(
 		`SELECT `+operationColumns+` FROM operations
 		 ORDER BY started_at DESC, id DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	operations := []models.Operation{}
+	for rows.Next() {
+		operation, err := scanOperation(rows.Scan)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		operations = append(operations, operation)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range operations {
+		var err error
+		operations[index].Steps, err = ListOperationSteps(db, operations[index].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return operations, nil
+}
+
+// latestVaultOperationOrder ranks operations by start time descending, then
+// ID, as ListOperations does, except that a start time the dashboard can't
+// place ranks after every readable one. Text order alone would put a value
+// such as "garbage" or "zzzz" ahead of every real time and let a damaged row
+// hide a vault's real newest operation.
+var latestVaultOperationOrder = `CASE WHEN ` + dashboardTimeKnown("started_at") + ` THEN 0 ELSE 1 END,
+	started_at DESC, id DESC`
+
+// ListLatestVaultOperations returns the newest operation of each vault, of any
+// status, ranked by latestVaultOperationOrder. An empty kind means any kind;
+// any other kind returns each vault's newest operation of exactly that kind,
+// and none for a kind that never ran. Unlike ListOperations it is not limited
+// to the newest records overall, so a vault whose last operation is old is
+// still included, and a vault whose start times are all unreadable still has
+// one of them listed.
+func ListLatestVaultOperations(db *sql.DB, kind string) ([]models.Operation, error) {
+	rows, err := db.Query(
+		`SELECT `+operationColumns+` FROM (
+			SELECT operations.*, ROW_NUMBER() OVER (
+				PARTITION BY repository_id ORDER BY `+latestVaultOperationOrder+`
+			) AS vault_rank
+			FROM operations
+			WHERE repository_id <> '' AND (? = '' OR kind = ?)
+		)
+		WHERE vault_rank = 1
+		ORDER BY `+latestVaultOperationOrder,
+		kind, kind,
 	)
 	if err != nil {
 		return nil, err
@@ -514,6 +499,7 @@ func GetOperation(db *sql.DB, id string) (models.Operation, error) {
 		&operation.Engine,
 		&operation.StartedAt,
 		&operation.FinishedAt,
+		&operation.IssueKind,
 	)
 	if err == nil {
 		operation.Steps, err = ListOperationSteps(db, operation.ID)
@@ -579,18 +565,72 @@ func PruneOperations(db *sql.DB, days int) error {
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
+	stuck := 0
+	var firstStuckID string
+	var firstStuckErr error
 	for _, id := range ids {
 		if err := removeOperationLog(id); err != nil {
-			return err
+			// Skip this one and keep going. A log that can't be deleted (marked
+			// read-only on Windows, say) would otherwise stop retention for every
+			// older log behind it, on every run. Its row stays, so the log is
+			// still listed and the next run tries again; the error is still
+			// returned once the rest are pruned.
+			if stuck == 0 {
+				firstStuckID, firstStuckErr = id, err
+			}
+			stuck++
+			continue
 		}
 		// Retention deletes only the exact row whose canonical file removal just
 		// succeeded. A concurrent cutoff match cannot be swept accidentally.
-		if _, err := db.Exec(`DELETE FROM operations WHERE id=?`, id); err != nil {
+		if err := deleteExpiredOperation(db, id); err != nil {
+			return errors.Join(stuckOperationLogsError(stuck, firstStuckID, firstStuckErr), err)
+		}
+	}
+	return stuckOperationLogsError(stuck, firstStuckID, firstStuckErr)
+}
+
+// deleteExpiredOperation deletes one operation row. Its scheduled restoration
+// row goes with it (ON DELETE CASCADE), so when that was the last row of a
+// scheduled admission group whose backups never started, the group is
+// deleted in the same transaction. Left behind, such a group fails the group
+// check in reconcileScheduledAdmissionGroupsTx, which Migrate runs on every
+// start. Normally a finished operation's restoration is no longer eligible
+// and its group is already gone; this covers the one left eligible because
+// an earlier database write failed.
+func deleteExpiredOperation(db *sql.DB, id string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var groupID string
+	err = tx.QueryRow(`SELECT group_id FROM scheduled_operation_restorations WHERE operation_id=?`, id).Scan(&groupID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM operations WHERE id=?`, id); err != nil {
+		return err
+	}
+	if groupID != "" {
+		if _, err := tx.Exec(deleteEmptyUnstartedAdmissionGroups+` AND id=?`, groupID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
+}
+
+// stuckOperationLogsError reports every log pruning had to skip as one short
+// line: the count plus the first failure, which stays reachable through
+// errors.Is. The scheduler logs this on every one-minute tick, so a line per
+// log would let a stuck logs folder (one marked read-only, say) flood the
+// size-capped startup log within minutes.
+func stuckOperationLogsError(count int, firstID string, firstErr error) error {
+	if count == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d expired operation logs could not be removed; first (%s): %w", count, firstID, firstErr)
 }

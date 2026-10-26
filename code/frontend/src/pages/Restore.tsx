@@ -1,39 +1,49 @@
-import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatDisplayDate, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
-import { resticArchiveDisplayPath, resticNativeAddress } from "../nativePathDisplay";
+import { displayPath, resticArchiveDisplayPath, resticNativeAddress } from "../nativePathDisplay";
+import { jobSourceTooltip, managedSnapshotJob, pathWithinJob } from "../jobSourceDisplay";
+import { JobSourceLabel } from "../components/JobSourceLabel";
 import { DirectoryField } from "../components/DirectoryPicker";
 import { PaginationControls } from "../components/ListControls";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
 	APIError,
+	getActiveOperations,
 	getEngines,
+	getJobs,
 	getMetadataStatus,
-	getOperation,
 	getRepositories,
 	deleteSnapshot,
 	listCachedSnapshots,
 	listSnapshotFiles,
 	prepareMetadata,
 	refreshRestoreSnapshots,
-	observeSubmittedRestoreOperation,
-	isOperationNotFound,
-	requireExactOperation,
 	restoreSnapshot,
 } from "../services/api";
-import type { MetadataPreparationStatus } from "../services/api";
-import { defaultConflictMode, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
-import type { EngineDescriptor, Repository, Snapshot, SnapshotEntry } from "../types";
+import { activeSnapshotDeletions, followTrackedOperation, onTrackedOperationFinished, operationFailureReason } from "../services/trackedOperations";
+import type { MetadataPreparationStatus, SnapshotFilesPage } from "../services/api";
+import { defaultConflictMode, restorableContainingFolder, RESTORE_SELECTION_NAME_INVALID, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
+import type { BackupJob, EngineDescriptor, Repository, Snapshot, SnapshotEntry } from "../types";
 import type { MetadataIndexState } from "../types";
 
 const PAGE_SIZE = 6;
-const PAGE_SIZE_OPTIONS = [PAGE_SIZE, 9, 18, 36] as const;
+const PAGE_SIZE_OPTIONS = [PAGE_SIZE, 9, 18, 36, 1000] as const;
 const PAGE_SIZE_STORAGE_KEY = "replicaro.restore.snapshots.pageSize";
 const SNAPSHOT_HISTORY_TOOLTIP = () => t("ui.snapshotHistory.refreshHelp");
 
 type SnapshotRoot = NonNullable<Snapshot["sourceRoots"]>[number];
+type BrowseMoreState = { hasMore: boolean; nextOffset: number; loading: boolean };
+const noMoreBrowseEntries: BrowseMoreState = { hasMore: false, nextOffset: 0, loading: false };
+
+// Reads the paging fields of a snapshot folder response. A response without
+// them, or with an offset that doesn't move forward, counts as the last page.
+const browsePageState = (result: SnapshotFilesPage, offset: number, count: number): BrowseMoreState => {
+	const nextOffset = Number.isSafeInteger(result.nextOffset) ? Number(result.nextOffset) : offset + count;
+	return { hasMore: result.hasMore === true && nextOffset > offset, nextOffset, loading: false };
+};
 type RestoreChoice = { kind: "snapshot"; repositoryId: string; snapshot: Snapshot; path: string; nativeRootId?: string };
 
 function readPageSize() {
@@ -44,8 +54,6 @@ function readPageSize() {
 		return PAGE_SIZE;
 	}
 }
-
-function displayPath(value: string) { return /^[A-Za-z]:[\\/]/.test(value) ? value.replace(/\//g, "\\") : value; }
 
 function isWindowsPath(value: string) {
 	return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
@@ -77,11 +85,13 @@ function fullDate(value: string) {
 
 function snapshotTime(value: string) {
     const date = parseTime(value);
-    return date?.toLocaleTimeString(getEffectiveLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) ?? "—";
+    return date ? formatDisplayTime(date, { hour: "2-digit", minute: "2-digit" }) : "—";
 }
 
-function snapshotMeta(snapshot: Snapshot) {
-	const sources = snapshotSourceLabel(snapshot);
+// A managed snapshot's source is shown as its job's name (see
+// jobSourceDisplay.ts); unmanaged snapshots keep their recorded paths.
+function snapshotMeta(snapshot: Snapshot, job?: BackupJob) {
+	const sources = job ? job.name : snapshotSourceLabel(snapshot);
     return t("ui.restore.snapshotMeta", { date: fullDate(snapshot.timestamp), time: snapshotTime(snapshot.timestamp), size: snapshot.size || t("ui.restore.sizeUnknown"), sources });
 }
 
@@ -99,6 +109,51 @@ function snapshotRootLabel(root: SnapshotRoot) {
 	return displayPath(root.path);
 }
 
+// Each metadata status poll (every 250 ms while backup data is prepared)
+// returns the full list of ready snapshot IDs. Keep the current Set when it
+// holds the same IDs, so a poll that changed nothing doesn't count as a
+// change.
+function readySnapshotSet(current: Set<string>, ids: readonly string[] | undefined): Set<string> {
+	const next = ids ?? [];
+	if (next.length === current.size && next.every((id) => current.has(id))) return current;
+	return new Set(next);
+}
+
+interface SnapshotRowActions {
+	browse(snapshot: Snapshot, root: SnapshotRoot): void;
+	restore(snapshot: Snapshot): void;
+	remove(snapshot: Snapshot): void;
+}
+
+interface SnapshotRowProps {
+	snapshot: Snapshot;
+	// The managed snapshot's job; unmanaged snapshots (and managed ones whose
+	// job isn't known here) show their recorded paths instead.
+	job?: BackupJob;
+	ready: boolean;
+	actions: SnapshotRowActions;
+}
+
+// One row of the snapshot list. The page re-renders on every metadata status
+// poll while backup data is prepared, and with the 1,000-row page size
+// re-rendering every row each time kept the main thread busy. The row only
+// re-renders when what it shows changes. The snapshot list is fetched again
+// on each poll, so the snapshot is compared by value rather than by
+// reference. Everything the row shows must come from these props (or from
+// t(), which only changes with a page reload); anything else would go stale.
+const SnapshotRow = memo(function SnapshotRow({ snapshot, job, ready, actions }: SnapshotRowProps) {
+	return <article className="snapshot-row" data-snapshot-id={snapshot.id}>
+		<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span>
+		<time>{snapshotTime(snapshot.timestamp)}</time>
+		{job ? <JobSourceLabel job={job} className="snapshot-source" /> : <span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>}
+		<span className="snapshot-size">{snapshot.size || "—"}</span>
+		<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
+			? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
+			: <button key={root.nativeRootId} className="btn sm" disabled={!ready} onClick={() => actions.browse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => actions.restore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => actions.remove(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
+	</article>;
+}, (previous, next) => previous.ready === next.ready && previous.job === next.job && previous.actions === next.actions &&
+	(previous.snapshot === next.snapshot || JSON.stringify(previous.snapshot) === JSON.stringify(next.snapshot)));
+
 export default function Restore() {
     return <RestoreRoute />;
 }
@@ -109,6 +164,9 @@ function RestoreRoute() {
     const toast = useToast();
     const [repos, setRepos] = useState<Repository[] | null>(null);
     const [engines, setEngines] = useState<EngineDescriptor[]>([]);
+	// Jobs only supply names and current sources for managed-snapshot labels.
+	// A failed load falls back to recorded paths; it never blocks Restore.
+	const [jobs, setJobs] = useState<BackupJob[] | null>(null);
     const [selected, setSelected] = useState(repoId);
     const selectedRef = useRef(repoId);
     const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
@@ -125,6 +183,8 @@ function RestoreRoute() {
     const [browsePath, setBrowsePath] = useState("");
     const [entries, setEntries] = useState<SnapshotEntry[] | null>(null);
     const [browseRaw, setBrowseRaw] = useState("");
+	// Large folders arrive in pages, the way File History pages its browser.
+	const [browseMore, setBrowseMore] = useState<BrowseMoreState>(noMoreBrowseEntries);
 	const browseRequestRef = useRef<{ controller: AbortController; generation: number } | null>(null);
 	const browseGenerationRef = useRef(0);
 	const repositoryGenerationRef = useRef(0);
@@ -137,9 +197,11 @@ function RestoreRoute() {
     const [restoreTarget, setRestoreTarget] = useState("");
     const [conflictMode, setConflictMode] = useState("always");
     const [restoreBusy, setRestoreBusy] = useState(false);
+	// Set when the backend refused the selected item's name: the clean folder
+	// to offer instead, or "" when there is none to offer.
+	const [nameRefusalFolder, setNameRefusalFolder] = useState<string | null>(null);
 	const [deleting, setDeleting] = useState<{ readonly repositoryId: string; readonly snapshot: Snapshot; readonly session: number } | null>(null);
-	const deleteReviewOwner = useRef<{ review: NonNullable<typeof deleting>; pending: boolean } | null>(null);
-	const [deleteBusy, setDeleteBusy] = useState(false);
+	const deleteReviewOwner = useRef<{ review: NonNullable<typeof deleting> } | null>(null);
 	const [metadataState, setMetadataState] = useState<MetadataIndexState | null>(null);
 	const [readySnapshotIDs, setReadySnapshotIDs] = useState<Set<string>>(() => new Set());
 	const [metadataBusy, setMetadataBusy] = useState(false);
@@ -149,7 +211,16 @@ function RestoreRoute() {
 	const [forcingMetadata, setForcingMetadata] = useState(false);
 	const restoreReviewSession = useRef(0);
 	const restoreSubmissionGeneration = useRef(0);
-	const restoreSubmissionOwner = useRef<{ session: number; generation: number; requestPending: boolean; handedOff: boolean; observationController: AbortController; controller?: AbortController } | null>(null);
+	const restoreSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
+	// Snapshots of the selected vault whose deletion is queued or running. They
+	// are hidden from the list. The set is rebuilt from the backend's active
+	// operations, so a reload or another browser hides the same snapshots;
+	// pendingSnapshotDeletions covers a deletion this page sent, from the click
+	// until its operation finishes. It is kept past the 202 on purpose: an
+	// active-operations refresh sent before the backend queued the deletion can
+	// land after the 202 and would otherwise show the snapshot again.
+	const [deletingSnapshots, setDeletingSnapshots] = useState<{ repositoryId: string; ids: Set<string> }>(() => ({ repositoryId: "", ids: new Set() }));
+	const pendingSnapshotDeletions = useRef(new Set<string>());
 
 	const cancelBrowse = useCallback(() => {
 		browseGenerationRef.current += 1;
@@ -174,7 +245,6 @@ function RestoreRoute() {
 		restoreReviewSession.current++;
 		deleteReviewOwner.current = null;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 	}, [cancelSnapshotRequest]);
 
@@ -185,6 +255,11 @@ function RestoreRoute() {
     useEffect(() => {
 		const controller = new AbortController();
 		const generation = ++repositoryGenerationRef.current;
+		getJobs()
+			.then((nextJobs) => {
+				if (!controller.signal.aborted && repositoryGenerationRef.current === generation) setJobs(nextJobs);
+			})
+			.catch(() => undefined);
 		Promise.all([getRepositories(controller.signal), getEngines()])
             .then(([nextRepos, engineResponse]) => {
 				if (controller.signal.aborted || repositoryGenerationRef.current !== generation) return;
@@ -209,13 +284,11 @@ function RestoreRoute() {
         cancelBrowse();
         restoreReviewSession.current++;
         restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
         restoreSubmissionOwner.current = null;
         setRestoreBusy(false);
         setRestoring(null);
 		deleteReviewOwner.current = null;
 		setDeleting(null);
-		setDeleteBusy(false);
         setBrowsing(null);
         selectedRef.current = nextSelected;
         setSelected(nextSelected);
@@ -259,7 +332,7 @@ function RestoreRoute() {
 					let status = await prepareMetadata(repositoryID, action);
 					while (!activeController.signal.aborted && (status.running || status.pending)) {
 						setMetadataState(status.index);
-						setReadySnapshotIDs(new Set(status.readySnapshotIds ?? []));
+						setReadySnapshotIDs((current) => readySnapshotSet(current, status.readySnapshotIds));
 						setMetadataBusy(status.running || status.pending);
 						setMetadataPaused(Boolean(status.paused));
 						setMetadataStage(status.stage);
@@ -272,7 +345,7 @@ function RestoreRoute() {
 						if (activeController.signal.aborted || selectedRef.current !== repositoryID) return;
 						commitSnapshots(repositoryID, finalSnapshots);
 						setMetadataState(status.index);
-						setReadySnapshotIDs(new Set(status.readySnapshotIds ?? []));
+						setReadySnapshotIDs((current) => readySnapshotSet(current, status.readySnapshotIds));
 						setMetadataBusy(status.running || status.pending);
 						setMetadataPaused(Boolean(status.paused));
 						setMetadataStage(status.stage);
@@ -281,7 +354,7 @@ function RestoreRoute() {
 						else setError("");
 						if (action === "force") {
 							const succeeded = !status.index.repositoryFailed && status.index.complete;
-							toast(succeeded ? "ok" : "error", succeeded ? "Snapshot history refreshed." : "Backup data refresh failed.");
+							toast(succeeded ? "ok" : "error", succeeded ? t("ui.restore.snapshotHistoryRefreshed") : t("ui.restore.backupDataRefreshFailed"));
 						}
 					}
 				} catch (reason) {
@@ -315,7 +388,7 @@ function RestoreRoute() {
 			let status = await prepareMetadata(repositoryID, action);
 			if (!current()) return;
 			setMetadataState(status.index);
-			setReadySnapshotIDs(new Set(status.readySnapshotIds ?? []));
+			setReadySnapshotIDs((current) => readySnapshotSet(current, status.readySnapshotIds));
 			setMetadataBusy(status.running || status.pending);
 			setMetadataPaused(Boolean(status.paused));
 			setMetadataStage(status.stage);
@@ -326,7 +399,7 @@ function RestoreRoute() {
 				status = await getMetadataStatus(repositoryID, controller.signal);
 				if (!current()) return;
 				setMetadataState(status.index);
-				setReadySnapshotIDs(new Set(status.readySnapshotIds ?? []));
+				setReadySnapshotIDs((current) => readySnapshotSet(current, status.readySnapshotIds));
 				setMetadataBusy(status.running || status.pending);
 				setMetadataPaused(Boolean(status.paused));
 				setMetadataStage(status.stage);
@@ -342,7 +415,7 @@ function RestoreRoute() {
 			else setError("");
 			if (action === "force") {
 				const succeeded = !status.index.repositoryFailed && status.index.complete;
-				toast(succeeded ? "ok" : "error", succeeded ? "Snapshot history refreshed." : "Backup data refresh failed.");
+				toast(succeeded ? "ok" : "error", succeeded ? t("ui.restore.snapshotHistoryRefreshed") : t("ui.restore.backupDataRefreshFailed"));
 			}
 		} catch (reason) {
 			if (!current() || (reason as Error).name === "AbortError") return;
@@ -384,13 +457,11 @@ function RestoreRoute() {
 		cancelBrowse();
 		restoreReviewSession.current++;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
 		setRestoring(null);
 		deleteReviewOwner.current = null;
 		setDeleting(null);
-		setDeleteBusy(false);
 		setBrowsing(null);
         selectedRef.current = id;
         setSelected(id);
@@ -412,7 +483,8 @@ function RestoreRoute() {
 		if (selected) void loadSelectedVault(selected, "retry");
 	};
 
-    const displayedSnapshots = snapshotsFor === selected ? snapshots : null;
+	const hiddenSnapshotIDs = deletingSnapshots.repositoryId === selected ? deletingSnapshots.ids : null;
+    const displayedSnapshots = snapshotsFor === selected ? snapshots?.filter((snapshot) => !hiddenSnapshotIDs?.has(snapshot.id)) ?? null : null;
 	const selectedRepository = repos?.find((repository) => repository.id === selected);
 	const selectedEngineLabel = selectedRepository?.engine === "kopia" ? "Kopia" : selectedRepository?.engine === "restic" ? "Restic" : "native";
 	const unmanagedSnapshotsTooltip = t("ui.restore.unmanagedSnapshotsHelp", { engine: selectedEngineLabel });
@@ -483,11 +555,14 @@ function RestoreRoute() {
         setBrowsePath(path);
         setEntries(null);
         setBrowseRaw("");
+		setBrowseMore(noMoreBrowseEntries);
 		listSnapshotFiles(selected, snapshot.id, root.nativeRootId, path, controller.signal)
             .then((result) => {
 				if (browseGenerationRef.current !== generation || controller.signal.aborted) return;
-                setEntries(result.entries ?? []);
+				const page = result.entries ?? [];
+                setEntries(page);
                 setBrowseRaw(result.raw ?? "");
+				setBrowseMore(browsePageState(result, 0, page.length));
             })
 			.catch((reason: Error) => {
 				if (browseGenerationRef.current !== generation || controller.signal.aborted || reason.name === "AbortError") return;
@@ -499,6 +574,36 @@ function RestoreRoute() {
 			});
     };
 
+	// The next page belongs to the folder on screen: navigating or closing bumps
+	// the browse generation and aborts it, so a late page never lands in
+	// another folder.
+	const loadMoreBrowseEntries = () => {
+		if (!browsing || !browseMore.hasMore || browseMore.loading || browseRequestRef.current) return;
+		const controller = new AbortController();
+		const generation = browseGenerationRef.current;
+		const offset = browseMore.nextOffset;
+		browseRequestRef.current = { controller, generation };
+		setBrowseMore((current) => ({ ...current, loading: true }));
+		listSnapshotFiles(selected, browsing.snapshot.id, browsing.root.nativeRootId, browsePath, controller.signal, offset)
+			.then((result) => {
+				if (browseGenerationRef.current !== generation || controller.signal.aborted) return;
+				const page = result.entries ?? [];
+				setEntries((current) => {
+					const seen = new Set((current ?? []).map((entry) => entry.name));
+					return [...(current ?? []), ...page.filter((entry) => !seen.has(entry.name))];
+				});
+				setBrowseMore(browsePageState(result, offset, page.length));
+			})
+			.catch((reason: Error) => {
+				if (browseGenerationRef.current !== generation || controller.signal.aborted || reason.name === "AbortError") return;
+				setBrowseMore((current) => ({ ...current, loading: false }));
+				toast("error", reason.message);
+			})
+			.finally(() => {
+				if (browseRequestRef.current?.generation === generation && browseRequestRef.current.controller === controller) browseRequestRef.current = null;
+			});
+	};
+
 	const closeBrowse = () => {
 		cancelBrowse();
 		setBrowsing(null);
@@ -507,9 +612,9 @@ function RestoreRoute() {
 	const openRestore = (snapshot: Snapshot, path = "", nativeRootId?: string) => {
         if (!selected) return;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
+		setNameRefusalFolder(null);
 		setRestoring({ kind: "snapshot", repositoryId: selected, snapshot, path, nativeRootId });
         setRestoreTarget("");
         setConflictMode(defaultConflictMode(selectedRepository, engines));
@@ -518,21 +623,19 @@ function RestoreRoute() {
 	const dismissRestore = () => {
 		if (restoreSubmissionOwner.current?.session === restoreReviewSession.current) return false;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
+		setNameRefusalFolder(null);
 		setRestoring(null);
 		return true;
 	};
 
-	const cancelColdRestore = () => {
-		const owner = restoreSubmissionOwner.current;
-		if (!owner?.controller) return;
-		owner.controller.abort();
-	};
-
-    const doRestore = async () => {
-        if (!restoring) return;
+	// The restore runs in the background once the backend has queued it. The
+	// dialog closes and the dashboard opens the live log for the returned
+	// operation, where it is followed and, if needed, cancelled (cold storage
+	// included). Closing the browser does not stop it.
+    const doRestore = async (choice = restoring) => {
+        if (!choice) return;
 		if (restoreSubmissionOwner.current) return;
         // Whitespace belongs to the chosen filesystem route. Trimming here would
         // submit a different destination from the one reviewed in the dialog.
@@ -541,115 +644,32 @@ function RestoreRoute() {
             toast("error", t("ui.restore.chooseDestination"));
             return;
         }
-		const payload = {
-			operationId: window.crypto.randomUUID(),
-			repositoryId: restoring.repositoryId,
-			snapshotId: restoring.snapshot.id,
-			path: restoring.path,
-			nativeRootId: restoring.nativeRootId,
-			targetPath,
-			conflictMode,
-			originalLocation: false,
-		};
-		const coldStorage = Boolean(repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage);
-		const owner = {
-			session: restoreReviewSession.current,
-			generation: ++restoreSubmissionGeneration.current,
-			requestPending: false,
-			handedOff: false,
-			observationController: new AbortController(),
-			controller: coldStorage ? new AbortController() : undefined,
-		};
+		const owner = { session: restoreReviewSession.current, generation: ++restoreSubmissionGeneration.current };
 		restoreSubmissionOwner.current = owner;
 		const ownsSubmission = () => restoreReviewSession.current === owner.session &&
 			restoreSubmissionGeneration.current === owner.generation && restoreSubmissionOwner.current === owner;
         setRestoreBusy(true);
+		setNameRefusalFolder(null);
         try {
-			const preflightTimeout = window.setTimeout(() => owner.observationController.abort(), 5000);
-			let operationAbsent = false;
-			const existing = await getOperation(payload.operationId, owner.observationController.signal)
-				.catch((reason) => {
-					// Exact lookup reports ordinary absence as HTTP 404. Only that
-					// response proves this freshly generated identity is available.
-					if (isOperationNotFound(reason)) {
-						operationAbsent = true;
-						return [];
-					}
-					throw reason;
-				})
-				.finally(() => window.clearTimeout(preflightTimeout));
-			if (!ownsSubmission()) return;
-			if (!operationAbsent) {
-				requireExactOperation(payload.operationId, existing);
-				throw new Error("operation id already exists");
-			}
-			owner.requestPending = true;
-			const request = owner.controller
-				? restoreSnapshot(payload, owner.controller.signal)
-				: restoreSnapshot(payload);
-			const handoff = observeSubmittedRestoreOperation(payload.operationId, () =>
-				ownsSubmission() && owner.requestPending && !owner.handedOff,
-				owner.observationController.signal,
-			).then((operation) => {
-				if (!operation || !ownsSubmission() || owner.handedOff) return false;
-				owner.handedOff = true;
-				owner.requestPending = false;
-				owner.observationController.abort();
-				setRestoring(null);
-				navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-				return true;
+			const { operationId } = await restoreSnapshot({
+				repositoryId: choice.repositoryId,
+				snapshotId: choice.snapshot.id,
+				path: choice.path,
+				nativeRootId: choice.nativeRootId,
+				targetPath,
+				conflictMode,
+				originalLocation: false,
 			});
-			let requestError: unknown;
-			try {
-				await request;
-			} catch (reason) {
-				requestError = reason;
-			}
-			// Native execution can finish and make the durable row terminal before
-			// the POST reports its HTTP error. Keep exact handoff ownership until the
-			// separately bounded observer settles so that result truth is not lost.
-			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or this was a pre-row rejection. AbortError and
-			// transport failures are different because server work may still continue.
-			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
-			const handedOff = await handoff;
-			owner.observationController.abort();
-			if (!handedOff && ownsSubmission()) {
-				const finalController = new AbortController();
-				owner.observationController = finalController;
-				const finalTimeout = window.setTimeout(() => finalController.abort(), 5000);
-				let finalAbsent = false;
-				const finalMatches = await getOperation(payload.operationId, finalController.signal)
-					.catch((reason) => {
-						if (isOperationNotFound(reason)) {
-							finalAbsent = true;
-							return [];
-						}
-						throw reason;
-					})
-					.finally(() => window.clearTimeout(finalTimeout));
-				if (!ownsSubmission()) return;
-				if (!finalAbsent) {
-					requireExactOperation(payload.operationId, finalMatches);
-					owner.handedOff = true;
-					finalController.abort();
-					setRestoring(null);
-					navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-					return;
-				}
-				if (requestError) throw requestError;
-				owner.requestPending = false;
-				toast("ok", `Restore completed into ${targetPath}`);
-				setRestoring(null);
-			}
+			if (!ownsSubmission()) return;
+			setRestoring(null);
+			navigate(`/?operation=${encodeURIComponent(operationId)}`);
         } catch (reason) {
-			const requestWasPending = owner.requestPending;
-			owner.requestPending = false;
-			owner.observationController.abort();
-			if (ownsSubmission() && !owner.handedOff) {
-				if (requestWasPending && coldStorage && (reason as Error).name === "AbortError") toast("info", "Cold storage restore was interrupted locally. Provider restore requests may continue.");
-				else toast("error", (reason as Error).message);
+			if (!ownsSubmission()) return;
+			if (reason instanceof APIError && reason.code === RESTORE_SELECTION_NAME_INVALID) {
+				setNameRefusalFolder(restorableContainingFolder(choice.path));
+				return;
 			}
+			toast("error", (reason as Error).message);
         } finally {
 			if (ownsSubmission()) {
 				restoreSubmissionOwner.current = null;
@@ -661,48 +681,138 @@ function RestoreRoute() {
 	const openDelete = (snapshot: Snapshot) => {
 		if (!selected) return;
 		const review = { repositoryId: selected, snapshot, session: restoreReviewSession.current };
-		deleteReviewOwner.current = { review, pending: false };
+		deleteReviewOwner.current = { review };
 		setDeleting(review);
-		setDeleteBusy(false);
 	};
+
+	// The snapshot rows are memoized (see SnapshotRow), so they get one
+	// action object that never changes and always calls the current handlers.
+	const snapshotRowHandlers = useRef<SnapshotRowActions | null>(null);
+	useLayoutEffect(() => {
+		snapshotRowHandlers.current = { browse: openBrowse, restore: openRestore, remove: openDelete };
+	});
+	const snapshotRowActions = useMemo<SnapshotRowActions>(() => ({
+		browse: (snapshot, root) => snapshotRowHandlers.current?.browse(snapshot, root),
+		restore: (snapshot) => snapshotRowHandlers.current?.restore(snapshot),
+		remove: (snapshot) => snapshotRowHandlers.current?.remove(snapshot),
+	}), []);
 	const dismissDelete = () => {
-		if (deleteReviewOwner.current?.pending) return;
 		deleteReviewOwner.current = null;
 		setDeleting(null);
 	};
+	const removeDeletedSnapshot = useCallback((repositoryId: string, snapshotId: string) => {
+		if (selectedRef.current === repositoryId) setSnapshots((current) => current?.filter((snapshot) => snapshot.id !== snapshotId) ?? current);
+		snapshotSessionCacheRef.current.set(repositoryId,
+			(snapshotSessionCacheRef.current.get(repositoryId) ?? []).filter((snapshot) => snapshot.id !== snapshotId));
+	}, []);
+
+	// followSnapshotDeletion reports a queued snapshot deletion once it
+	// finishes: the success toast, or the reason it failed (the snapshot then
+	// shows again because its deletion is no longer active). Completed with
+	// issues means the native deletion itself succeeded, so it reads as deleted;
+	// the dashboard carries the issue.
+	const followSnapshotDeletion = useCallback((operationId: string) => {
+		followTrackedOperation(operationId, async (operation) => {
+			// Before anything awaits: the finished listeners run right after this
+			// and recompute the hidden snapshots from the active operations.
+			pendingSnapshotDeletions.current.delete(`${operation.repositoryId}\u0000${operation.title.replace(/^Delete snapshot: /, "")}`);
+			if (operation.status === "success" || operation.status === "completed_with_issues") {
+				toast("ok", t("ui.restore.snapshotDeleted"));
+			} else {
+				toast("error", await operationFailureReason(operation));
+			}
+		});
+	}, [toast]);
+
+	const refreshSnapshotDeletions = useCallback(async (repositoryId: string) => {
+		if (!repositoryId) return;
+		try {
+			const operations = await getActiveOperations();
+			if (selectedRef.current !== repositoryId) return;
+			const active = activeSnapshotDeletions(operations, repositoryId);
+			const pending = [...pendingSnapshotDeletions.current]
+				.filter((key) => key.startsWith(`${repositoryId}\u0000`))
+				.map((key) => key.slice(repositoryId.length + 1));
+			setDeletingSnapshots({ repositoryId, ids: new Set([...active, ...pending]) });
+			for (const operation of operations) {
+				if (operation.kind === "delete" && operation.repositoryId === repositoryId &&
+					(operation.status === "queued" || operation.status === "running")) followSnapshotDeletion(operation.id);
+			}
+		} catch {
+			// Keep what is hidden now; the next refresh or finished operation corrects it.
+		}
+	}, [followSnapshotDeletion]);
+
+	useEffect(() => {
+		void refreshSnapshotDeletions(selected);
+	}, [refreshSnapshotDeletions, selected]);
+
+	useEffect(() => onTrackedOperationFinished((operation) => {
+		if (operation.kind !== "delete") return;
+		if (operation.status === "success" || operation.status === "completed_with_issues") {
+			removeDeletedSnapshot(operation.repositoryId, operation.title.replace(/^Delete snapshot: /, ""));
+		}
+		void refreshSnapshotDeletions(selectedRef.current);
+	}), [refreshSnapshotDeletions, removeDeletedSnapshot]);
+
+	// Confirming closes the dialog at once and hides the snapshot. The deletion
+	// itself waits for a busy vault in the background; a refused request shows
+	// the snapshot again with the reason, unless the refusal is that a deletion
+	// of it is already active.
 	const confirmDelete = async () => {
 		const owner = deleteReviewOwner.current;
-		if (!owner || owner.pending) return;
+		if (!owner) return;
 		const review = owner.review;
-		// A copied vault can share snapshot IDs. Bind confirmation and completion
-		// to this reviewed vault and view session, including browser-history moves
-		// away and back. Navigation cannot undo a native deletion already started.
-		const ownsReview = () => deleteReviewOwner.current === owner &&
-			restoreReviewSession.current === review.session && selectedRef.current === review.repositoryId;
-		if (!ownsReview()) return;
-		owner.pending = true;
-		setDeleteBusy(true);
+		if (deleteReviewOwner.current !== owner || restoreReviewSession.current !== review.session ||
+			selectedRef.current !== review.repositoryId) return;
+		deleteReviewOwner.current = null;
+		setDeleting(null);
+		const key = `${review.repositoryId}\u0000${review.snapshot.id}`;
+		pendingSnapshotDeletions.current.add(key);
+		setDeletingSnapshots((current) => ({
+			repositoryId: review.repositoryId,
+			ids: new Set(current.repositoryId === review.repositoryId ? current.ids : []).add(review.snapshot.id),
+		}));
+		toast("info", t("ui.restore.snapshotBeingSentForDeletion"));
 		try {
-			await deleteSnapshot(review.repositoryId, review.snapshot.id);
-			if (!ownsReview()) return;
-			setSnapshots((current) => current?.filter((snapshot) => snapshot.id !== review.snapshot.id) ?? current);
-			snapshotSessionCacheRef.current.set(review.repositoryId,
-				(snapshotSessionCacheRef.current.get(review.repositoryId) ?? []).filter((snapshot) => snapshot.id !== review.snapshot.id));
-			setDeleting(null);
-			toast("ok", "Snapshot deleted. Physical space is reclaimed only by later vault maintenance.");
+			const { operationId } = await deleteSnapshot(review.repositoryId, review.snapshot.id);
+			// The snapshot stays in pendingSnapshotDeletions until this operation finishes.
+			followSnapshotDeletion(operationId);
 		} catch (reason) {
-			if (ownsReview()) toast("error", (reason as Error).message);
-		} finally {
-			if (ownsReview()) {
-				owner.pending = false;
-				setDeleteBusy(false);
+			pendingSnapshotDeletions.current.delete(key);
+			// A deletion of this snapshot is already queued or running (another tab
+			// or a stale page). Keep it hidden and follow that deletion by reading
+			// the active deletions again, rather than showing the snapshot.
+			if (reason instanceof APIError && reason.status === 409 && reason.code === "snapshot_deletion_active") {
+				toast("error", reason.message);
+				void refreshSnapshotDeletions(review.repositoryId);
+				return;
 			}
+			setDeletingSnapshots((current) => {
+				if (current.repositoryId !== review.repositoryId) return current;
+				const ids = new Set(current.ids);
+				ids.delete(review.snapshot.id);
+				return { repositoryId: current.repositoryId, ids };
+			});
+			toast("error", (reason as Error).message);
 		}
+	};
+	// The refused item's folder is restored instead, with the same destination
+	// and overwrite choice.
+	const restoreContainingFolder = () => {
+		if (!restoring || !nameRefusalFolder) return;
+		const folderChoice = { ...restoring, path: nameRefusalFolder };
+		setRestoring(folderChoice);
+		void doRestore(folderChoice);
 	};
 	// Whole file-root Kopia restore addresses the target itself. The native root
 	// header is a UI hint here; backend fresh discovery remains authoritative.
 	const restoringFileRoot = restoring?.path === "" && restoring.snapshot.nativeRootType === "f" &&
 		repos?.find((repo) => repo.id === restoring.repositoryId)?.engine === "kopia";
+	// Browse offers Restore file only for files. Kopia can restore a selected
+	// file only into a folder that already exists, so the hint says so.
+	const restoringKopiaSelectedFile = Boolean(restoring?.path) &&
+		repos?.find((repo) => repo.id === restoring?.repositoryId)?.engine === "kopia";
 
 	const crumbs = browsePath.split("/").filter(Boolean);
 	// Only the native source association can make an archive breadcrumb Windows-like.
@@ -713,6 +823,15 @@ function RestoreRoute() {
 	const associatedWindowsBreadcrumb = breadcrumbDisplayPath !== breadcrumbNativePath;
 	const browseSeparator = associatedWindowsBreadcrumb || browsing && isWindowsPath(browsing.root.path) ? "\\" : "/";
     const selectedDate = dateFilter ? new Date(`${dateFilter}T12:00:00`) : null;
+	// Presentation only: breadcrumbs, navigation, and restore requests below
+	// keep the native root and paths.
+	const browsingJob = browsing ? managedSnapshotJob(browsing.snapshot, jobs) : undefined;
+	// Names the folder on screen the way its last breadcrumb shows it.
+	const lastCrumb = crumbs[crumbs.length - 1];
+	const browseFolderLabel = !browsing ? ""
+		: lastCrumb === undefined ? browsingJob ? browsingJob.name : displayPath(browsing.root.path) || "/"
+		: associatedWindowsBreadcrumb && crumbs.length === 1 && !browsingJob ? `${lastCrumb}:` : lastCrumb;
+	const restoringJob = restoring ? managedSnapshotJob(restoring.snapshot, jobs) : undefined;
 
     return (
         <div className="page restore-page">
@@ -808,15 +927,7 @@ function RestoreRoute() {
                                             <span className="snapshot-header-spacer" />
                                         </div>
                                         {group.items.map((snapshot) => (
-											<article key={snapshot.id} className="snapshot-row" data-snapshot-id={snapshot.id}>
-												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span>
-                                                <time>{snapshotTime(snapshot.timestamp)}</time>
-												<span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>
-                                                <span className="snapshot-size">{snapshot.size || "—"}</span>
-											<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
-                                                        ? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
-                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
-                                            </article>
+											<SnapshotRow key={snapshot.id} snapshot={snapshot} job={managedSnapshotJob(snapshot, jobs)} ready={readySnapshotIDs.has(snapshot.id)} actions={snapshotRowActions} />
                                         ))}
                                     </div>
                                 </section>
@@ -841,12 +952,7 @@ function RestoreRoute() {
 										<header><strong>{friendlyDate(group.snapshot.timestamp)}</strong><span>{fullDate(group.snapshot.timestamp)}</span></header>
 										<div>
 											<div className="snapshot-table-header"><span>{t("ui.pages.restore.computer")}</span><span>{t("ui.pages.restore.time")}</span><span>{t("ui.pages.restore.source")}</span><span>{t("ui.pages.restore.size")}</span><span className="snapshot-header-spacer" /></div>
-											{group.items.map((snapshot) => <article key={snapshot.id} className="snapshot-row" data-snapshot-id={snapshot.id}>
-												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span><time>{snapshotTime(snapshot.timestamp)}</time><span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span><span className="snapshot-size">{snapshot.size || "—"}</span>
-												<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
-                                                        ? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
-                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
-											</article>)}
+											{group.items.map((snapshot) => <SnapshotRow key={snapshot.id} snapshot={snapshot} ready={readySnapshotIDs.has(snapshot.id)} actions={snapshotRowActions} />)}
 										</div>
 									</section>
 								</div>))}
@@ -859,15 +965,19 @@ function RestoreRoute() {
 			{deleting && <Modal title={t("ui.pages.restore.delete.snapshot")} onClose={dismissDelete}>
 				<p>{t("ui.pages.restore.delete.this.snapshot.from.the.vault.deletion.cannot.be.undone")}</p>
 				<p>{t("ui.pages.restore.physical.space.is.reclaimed.only.by.later.vault.maintenance")}</p>
-				<div className="modal-footer"><button className="btn" disabled={deleteBusy} onClick={dismissDelete}>{t("ui.pages.restore.cancel")}</button><button className="btn danger" disabled={deleteBusy} onClick={() => void confirmDelete()}>{deleteBusy && <span className="spinner" />}{t("ui.pages.restore.delete")}</button></div>
+				<div className="modal-footer"><button className="btn" onClick={dismissDelete}>{t("ui.pages.restore.cancel")}</button><button className="btn danger" onClick={() => void confirmDelete()}>{t("ui.pages.restore.delete")}</button></div>
 			</Modal>}
 
             {browsing && (
                 <Modal title={t("ui.pages.restore.snapshot")} wide onClose={closeBrowse}>
-					<div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>
+					{browsingJob
+						? <Tooltip content={jobSourceTooltip(browsingJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(browsing.snapshot, browsingJob)}>{snapshotMeta(browsing.snapshot, browsingJob)} · {browsing.snapshot.id.slice(0, 12)}</div></Tooltip>
+						: <div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>}
                     <div className="browse-crumbs">
-						<button onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}>{displayPath(browsing.root.path) || "/"}</button>
-						{crumbs.map((crumb, index) => <span key={`${crumb}-${index}`}>{associatedWindowsBreadcrumb && index === 0 ? "" : browseSeparator}<button onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, index + 1).join("/"))}>{associatedWindowsBreadcrumb && index === 0 ? `${crumb}:` : crumb}</button></span>)}
+						{browsingJob
+							? <Tooltip content={jobSourceTooltip(browsingJob)}><button aria-label={browsingJob.name} onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}><span className="job-source-name">{browsingJob.name}</span></button></Tooltip>
+							: <button onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}>{displayPath(browsing.root.path) || "/"}</button>}
+						{crumbs.map((crumb, index) => <span key={`${crumb}-${index}`}>{associatedWindowsBreadcrumb && index === 0 && !browsingJob ? "" : browseSeparator}<button onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, index + 1).join("/"))}>{associatedWindowsBreadcrumb && index === 0 && !browsingJob ? `${crumb}:` : crumb}</button></span>)}
                     </div>
                     <div className="file-list">
 						{browsePath && <button className="file-up" onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, -1).join("/"))}><Icon name="arrowUp" size={16} /><span>{t("ui.pages.restore.up.one.directory")}</span></button>}
@@ -880,7 +990,7 @@ function RestoreRoute() {
 								? resticArchiveDisplayPath(nativePath, browsing.snapshot.source) : nativePath;
 							const displayName = displayNative !== nativePath && !childPath.includes("/") ? displayNative : entry.name;
                             return (
-                                <div key={childPath} title={`${displayNative}\nNative source: ${browsing.root.path}\nNative path: ${nativePath}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
+                                <div key={childPath} title={browsingJob ? pathWithinJob(childPath, browsing.root.path) : `${displayNative}\n${t("ui.restore.backupSourceTooltip", { source: browsing.root.path })}\n${t("ui.restore.snapshotPathTooltip", { path: nativePath })}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
                                     <Icon name={entry.isDir ? "folder" : "file"} size={15} />
 								{entry.isDir ? <button onClick={() => openBrowse(browsing.snapshot, browsing.root, childPath)}>{displayName}</button> : <span>{displayName}</span>}
 								{!entry.isDir && <span>{entry.size}</span>}
@@ -888,9 +998,11 @@ function RestoreRoute() {
                                 </div>
                             );
                         })}
+						{browseMore.hasMore && <button type="button" className="btn browse-load-more" disabled={browseMore.loading} onClick={loadMoreBrowseEntries}>{browseMore.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: browseFolderLabel })}</button>}
                     </div>
                     <div className="modal-footer browse-footer">
-                        <span className="mono">{browseRaw ? t("ui.restore.itemCountListingLoaded", { count: entries?.length ?? 0 }) : t("ui.restore.itemCount", { count: entries?.length ?? 0 })}</span>
+						{/* While more pages remain, the loaded count isn't the folder total; the Load more button says more exist. */}
+                        <span className="mono">{browseMore.hasMore ? "" : browseRaw ? t("ui.restore.itemCountListingLoaded", { count: entries?.length ?? 0 }) : t("ui.restore.itemCount", { count: entries?.length ?? 0 })}</span>
 						<button className="btn primary" onClick={() => { openRestore(browsing.snapshot); closeBrowse(); }}>{t("ui.pages.restore.restore.entire.snapshot")}</button>
                     </div>
                 </Modal>
@@ -899,20 +1011,22 @@ function RestoreRoute() {
             {restoring && (
                 <Modal title={t("ui.pages.restore.restore.snapshot")} onClose={dismissRestore}>
 					<fieldset className="modal-workflow-fields" disabled={restoreBusy}>
-                    <><div className="snapshot-modal-id">{restoring.snapshot.id.slice(0, 12)}</div><div className="snapshot-modal-meta mono">{snapshotMeta(restoring.snapshot)}</div></>
+                    <><div className="snapshot-modal-id">{restoring.snapshot.id.slice(0, 12)}</div>{restoringJob
+						? <Tooltip content={jobSourceTooltip(restoringJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(restoring.snapshot, restoringJob)}>{snapshotMeta(restoring.snapshot, restoringJob)}</div></Tooltip>
+						: <div className="snapshot-modal-meta mono">{snapshotMeta(restoring.snapshot)}</div>}</>
                     <div className="modal-section-label">{t("ui.pages.restore.restore.to")}</div>
 					<label className="field">
 						<span>{restoringFileRoot ? t("ui.pages.restore.destination.file") : t("ui.pages.restore.destination.folder")}</span>
 						{restoringFileRoot
 							? <input value={restoreTarget} onChange={(event) => setRestoreTarget(event.target.value)} aria-label={t("ui.pages.restore.destination.file")} />
-							: <DirectoryField value={restoreTarget} onChange={setRestoreTarget} ariaLabel={t("ui.pages.restore.destination.folder")} />}
+							: <DirectoryField value={restoreTarget} onChange={setRestoreTarget} ariaLabel={t("ui.pages.restore.destination.folder")} placeholder={restoringKopiaSelectedFile ? t("ui.restore.chooseExistingFolder") : undefined} />}
 						{restoringFileRoot && <small>{t("ui.pages.restore.enter.the.full.destination.path.including.the.filename")}</small>}
                     </label>
                     {(restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.length ?? 0) > 1 &&
 						<label className="field restore-conflict-field"><span>{t("ui.pages.restore.should.existing.files.in.destination.be.overwritten")}</span><select value={conflictMode} onChange={(event) => setConflictMode(event.target.value)}>{restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-					{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage && <p className="recovery-warning">{t("ui.pages.restore.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 					</fieldset>
-					<div className="modal-footer"><button className="btn" disabled={restoreBusy && !repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage} onClick={restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? cancelColdRestore : dismissRestore}>{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? t("ui.pages.restore.cancel.restore") : t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
+					{nameRefusalFolder !== null && <div className="inline-error" role="alert">{t("ui.restore.selectionNameInvalid")}{nameRefusalFolder && <> <button type="button" className="btn" disabled={restoreBusy} onClick={restoreContainingFolder}>{t("ui.restore.restoreContainingFolder")}</button> <strong className="mono">/{nameRefusalFolder}</strong></>}</div>}
+					<div className="modal-footer"><button className="btn" disabled={restoreBusy} onClick={dismissRestore}>{t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
                 </Modal>
             )}
         </div>

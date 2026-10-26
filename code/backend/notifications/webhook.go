@@ -3,6 +3,7 @@ package notifications
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,28 +13,39 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/desktop"
 	"github.com/local/replicaro/locale"
+	"github.com/local/replicaro/models"
 )
 
 type Event struct {
-	Locale                string `json:"-"`
-	TaskKey               string `json:"-"`
-	TaskName              string `json:"-"`
-	TaskTarget            string `json:"-"`
-	Event                 string `json:"event"`
-	Status                string `json:"status,omitempty"`
-	Success               bool   `json:"success"`
-	NativeBackupSucceeded bool   `json:"nativeBackupSucceeded,omitempty"`
-	Title                 string `json:"title"`
-	Message               string `json:"message"`
-	OperationID           string `json:"operationId,omitempty"`
-	TimelineURL           string `json:"timelineUrl,omitempty"`
-	Severity              string `json:"severity"`
-	Color                 string `json:"color"`
-	Icon                  string `json:"icon"`
-	Timestamp             string `json:"timestamp"`
+	Locale     string `json:"-"`
+	TaskKey    string `json:"-"`
+	TaskName   string `json:"-"`
+	TaskTarget string `json:"-"`
+	// MessageKey optionally replaces the generic status message with one
+	// specific catalog message (the 30-day unavailable-storage notices, the
+	// vault reconnect message, the Kopia out-of-space notice, and the locked
+	// files message). MessageValues fills its placeholders; {taskName} is
+	// filled with the localized task name unless MessageValues sets it.
+	MessageKey            string            `json:"-"`
+	MessageValues         map[string]string `json:"-"`
+	Event                 string            `json:"event"`
+	Status                string            `json:"status,omitempty"`
+	IssueKind             string            `json:"issueKind,omitempty"` // only with status completed_with_issues; see models.OperationIssueLockedFiles
+	Success               bool              `json:"success"`
+	NativeBackupSucceeded bool              `json:"nativeBackupSucceeded,omitempty"`
+	Title                 string            `json:"title"`
+	Message               string            `json:"message"`
+	OperationID           string            `json:"operationId,omitempty"`
+	TimelineURL           string            `json:"timelineUrl,omitempty"`
+	Severity              string            `json:"severity"`
+	Color                 string            `json:"color"`
+	Icon                  string            `json:"icon"`
+	Timestamp             string            `json:"timestamp"`
 }
 
 var dispatchWG sync.WaitGroup
@@ -86,6 +98,51 @@ func Wait(ctx context.Context) error {
 	}
 }
 
+// PrepareOperation registers the notification step of a finished operation
+// and returns the function that sends its notification, or nil when there is
+// nothing to send. The step is registered before the operation is shown as
+// finished, and the caller runs the returned function only after it has saved
+// the operation's final state, so the running step is the whole handoff and no
+// other durable state is needed.
+//
+// event builds the notification from the saved settings. It runs only when a
+// channel is on for status, so any lookups it does are skipped otherwise.
+func PrepareOperation(
+	db *sql.DB,
+	operationID, status string,
+	loadSettings func(*sql.DB) (models.Settings, error),
+	event func(settings models.Settings) Event,
+) func() {
+	settings, err := loadSettings(db)
+	if err != nil {
+		_ = database.SkipOperationStep(db, operationID, "application", "notification",
+			"notification settings unavailable: "+err.Error(), time.Now())
+		return nil
+	}
+	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
+	if !nativeEnabled && !webhookEnabled {
+		return nil
+	}
+	notification := event(settings)
+	if !ShouldNotify(notification) {
+		return nil
+	}
+	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
+		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
+		return nil
+	}
+	return func() {
+		Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, notification, func(err error) {
+			stepStatus, result := "succeeded", "notification delivery completed"
+			if err != nil {
+				stepStatus, result = "warning", err.Error()
+				_ = database.LogError(db, "Notification failed: "+err.Error())
+			}
+			_ = database.FinishOperationStep(db, operationID, "notification", stepStatus, result, time.Now())
+		})
+	}
+}
+
 // ShouldNotify keeps successful notifications focused on the user-visible
 // operation types while still reporting every failed operation shown as an
 // Issue on the dashboard.
@@ -131,6 +188,10 @@ func prepare(event *Event) {
 	}
 	if status == "completed_with_issues" {
 		event.Severity, event.Color, event.Icon = "warning", "#f2c063", "replicaro-warning"
+	} else {
+		// The qualifier only narrows completed_with_issues. Webhook consumers
+		// never see it next to any other status.
+		event.IssueKind = ""
 	}
 	if event.Timestamp == "" {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
@@ -147,8 +208,21 @@ func prepare(event *Event) {
 		})
 	}
 	event.Message = localizedNotificationMessage(taskName, *event)
+	if event.MessageKey != "" {
+		values := map[string]string{"taskName": taskName}
+		for name, value := range event.MessageValues {
+			values[name] = value
+		}
+		event.Message = locale.Text(event.Locale, event.MessageKey, values)
+	}
 	if len(event.Message) > maxWebhookMessageBytes {
-		event.Message = event.Message[:maxWebhookMessageBytes] + "…"
+		// Cut at the start of a character so a multi-byte character is never
+		// split into invalid UTF-8.
+		cut := maxWebhookMessageBytes
+		for cut > 0 && !utf8.RuneStart(event.Message[cut]) {
+			cut--
+		}
+		event.Message = event.Message[:cut] + "…"
 	}
 	event.Title = localizedNotificationTitle(*event)
 }
@@ -160,6 +234,9 @@ func localizedNotificationTitle(event Event) string {
 		key = "notifications.title.success"
 	case "completed_with_issues":
 		key = "notifications.title.completedWithIssues"
+		if event.IssueKind == models.OperationIssueLockedFiles {
+			key = "notifications.title.completedLockedFilesSkipped"
+		}
 	}
 	return locale.Text(event.Locale, key, nil)
 }

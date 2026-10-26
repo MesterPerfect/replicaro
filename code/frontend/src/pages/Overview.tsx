@@ -1,5 +1,6 @@
-import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
+import { formatDisplayDate, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 import {
@@ -7,15 +8,16 @@ import {
 	getDashboardIssues,
 	getActiveOperations,
 	getOperationLive,
+	getOperationLockedFiles,
 	getOperationLog,
 	cancelOperation,
-	getOperations,
+	getDashboardTimeline,
+	getLatestVaultOperations,
 	getOperation,
 	isOperationNotFound,
 	requireExactOperation,
 	getJobs,
 	markDashboardIssuesReviewed,
-    getLogs,
     getRepositories,
 } from "../services/api";
 import { EmptyState, Loading, Modal, Tooltip, duration, parseTime, timeAgo, useToast } from "../components/ui";
@@ -23,15 +25,19 @@ import type {
 	ActivityEntry,
 	BackupJob,
 	DashboardStats,
+	DashboardTimeline,
+	DashboardTimelineFilter,
+	DashboardTimelineItem,
 	OperationEntry,
 	OperationLogResponse,
 	OperationLiveResponse,
     Repository,
 } from "../types";
-import { dashboardIssueEvent, logTag } from "./dashboardIssue";
+import { completedWithIssuesTag, dashboardIssueEvent, lockedFilesSkipped, logTag, logTagLabel } from "./dashboardIssue";
 import type { TimelineEvent } from "./dashboardIssue";
-import { formatReadableLog } from "./nativeLogFormat";
+import { formatReadableLog, noSummaryDiagnosticsLine } from "./nativeLogFormat";
 import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
+import { VAULT_PASSWORD_CHANGE_KIND, passwordChangeStillBlocksVault } from "../services/trackedOperations";
 
 type TimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other" | "issues";
 
@@ -50,16 +56,99 @@ const TIMELINE_LOAD_MORE_SIZE = 50;
 const MAX_RETAINED_TERMINAL_OPERATIONS = 200;
 const CANONICAL_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-const logPresentation = (kind?: string) => ({concise: true, operationKind: kind, maintenanceOnly: kind === "prune" || kind === "maintenance"});
+// Issues has a feed of its own, so no timeline feed is loaded while it is
+// shown.
+const timelineFeedFilter = (filter: TimelineFilter): DashboardTimelineFilter | null => filter === "issues" ? null : filter;
 
-async function loadDashboardSnapshot(operationID: string, requiredOperationIDs: string[] = []) {
+// The loaded part of one timeline tab: the server's batches of up to 200
+// entries, newest first, and the cursor of the next older batch.
+interface TimelineFeed {
+	filter: DashboardTimelineFilter | null;
+	items: DashboardTimelineItem[];
+	cursor: string;
+	hasMore: boolean;
+	loading: boolean;
+}
+
+const emptyTimelineFeed = (filter: DashboardTimelineFilter | null): TimelineFeed =>
+	({ filter, items: [], cursor: "", hasMore: false, loading: filter !== null });
+
+// joinNewestTimelineBatch puts a refreshed newest batch in front of the older
+// batches already loaded, joined at the oldest entry of the batch that was
+// already loaded, so a refresh keeps what "Load older" brought in. When they
+// share nothing (more than a batch of new entries since the last refresh, or
+// nothing loaded yet) the tab starts over from the newest batch.
+function joinNewestTimelineBatch(feed: TimelineFeed, batch: DashboardTimeline): TimelineFeed {
+	const newest = { ...feed, items: batch.items, cursor: batch.nextCursor ?? "", hasMore: batch.hasMore, loading: false };
+	if (!batch.hasMore) return newest;
+	const loaded = new Map(feed.items.map((item, index) => [item.id, index]));
+	for (let index = batch.items.length - 1; index >= 0; index--) {
+		const overlap = loaded.get(batch.items[index].id);
+		if (overlap === undefined) continue;
+		const fresh = new Set(batch.items.map((item) => item.id));
+		const older = feed.items.slice(overlap + 1).filter((item) => !fresh.has(item.id));
+		return { ...feed, items: [...batch.items, ...older], loading: false };
+	}
+	return newest;
+}
+
+function appendOlderTimelineBatch(feed: TimelineFeed, batch: DashboardTimeline): TimelineFeed {
+	const loaded = new Set(feed.items.map((item) => item.id));
+	return {
+		...feed, items: [...feed.items, ...batch.items.filter((item) => !loaded.has(item.id))],
+		cursor: batch.nextCursor ?? "", hasMore: batch.hasMore,
+	};
+}
+
+const logPresentation = (kind?: string, lockedFiles = false) => ({concise: true, operationKind: kind, maintenanceOnly: kind === "prune" || kind === "maintenance", lockedFilesSkipped: lockedFiles});
+
+// Backup, restore, integrity check, and maintenance results get one fixed line
+// of advice under the errors / warnings summary heading, but only when that
+// summary actually lists at least one error or warning; a clean result gets
+// no advice. Many native errors and warnings for these operations are
+// transient (a share that briefly dropped, a file changing mid-read, a lock
+// held by another client), so the advice is not guessed from the error text.
+// It is not attached to live output or to other kinds such as snapshot
+// deletion ("delete"). "prune" counts as maintenance, as in logPresentation.
+// It is rendered as markup inside the <pre> (bold italic) and is never part
+// of the formatted readable string, the diagnostics, or Raw, so log
+// formatting and paging are unaffected.
+const retryAdviceOperationKinds = new Set(["backup", "restore", "check", "maintenance", "prune"]);
+// Text inside the log output is never translated, so the advice is English in
+// every language, like the engine output around it.
+const retryAdvice = "Retrying this backup/restore/integrity check/maintenance will often automatically fix errors and warnings.";
+
+function withRetryAdvice(readable: string, kind?: string): ReactNode {
+    if (!kind || !retryAdviceOperationKinds.has(kind)) return readable;
+    const headingEnd = readable.indexOf("\n");
+    const heading = headingEnd < 0 ? readable : readable.slice(0, headingEnd);
+    const rest = headingEnd < 0 ? "" : readable.slice(headingEnd);
+    const firstSummaryLine = rest.slice(1).split("\n", 1)[0];
+    if (headingEnd < 0 || !firstSummaryLine || firstSummaryLine === noSummaryDiagnosticsLine) return readable;
+    return <>{heading}{"\n"}<strong><em>{retryAdvice}</em></strong>{rest}</>;
+}
+
+// A response that is not a feed batch fails the request like any other error,
+// so the page keeps what it has and says so.
+function requireTimelineBatch(batch: DashboardTimeline) {
+	if (!Array.isArray(batch?.items)) throw new Error(t("ui.app.pageErrorBody"));
+	return batch;
+}
+
+async function loadDashboardSnapshot(timelineFilter: DashboardTimelineFilter | null, operationID: string, requiredOperationIDs: string[] = []) {
 	const exactIDs = [...new Set([...requiredOperationIDs, ...(operationID ? [operationID] : [])])];
-	const [stats, jobs, repos, operations, logs, exactOperationGroups] = await Promise.all([
+	const [stats, jobs, repos, timeline, passwordChanges, exactOperationGroups] = await Promise.all([
 		getDashboard(),
 		getJobs(),
 		getRepositories(),
-		getOperations(),
-		getLogs(),
+		timelineFilter === null ? null : getDashboardTimeline(timelineFilter).then(requireTimelineBatch),
+		// Each vault's newest password change decides the blocked-vault link on
+		// timeline and issue rows. Without it the links are hidden and the rest
+		// of the page still loads.
+		getLatestVaultOperations(VAULT_PASSWORD_CHANGE_KIND).then(
+			(operations) => Array.isArray(operations) ? operations : null,
+			() => null,
+		),
 		Promise.all(exactIDs.map(async (id) => {
 			const required = requiredOperationIDs.includes(id);
 			let absent = false;
@@ -73,22 +162,19 @@ async function loadDashboardSnapshot(operationID: string, requiredOperationIDs: 
 			if (absent) return [];
 			const exact = requireExactOperation(id, matches);
 			if (required && operationIsActive(exact)) {
-				throw new Error("A completed operation could not be loaded.");
+				throw new Error(t("ui.overview.completedOperationLoadFailed"));
 			}
 			return [exact];
 		})),
 	]);
-	const operationByID = new Map(
-		[...operations, ...exactOperationGroups.flat()].map((operation) => [operation.id, operation]),
-	);
-	return { stats, jobs, repos, operations: [...operationByID.values()], logs };
+	return { stats, jobs, repos, timelineFilter, timeline, passwordChanges, exactOperations: exactOperationGroups.flat() };
 }
 
 async function loadRequiredTerminalOperations(ids: string[]) {
 	return Promise.all(ids.map(async (id) => {
 		const matches = await getOperation(id);
 		const exact = matches.find((operation) => operation.id === id);
-		if (!exact || operationIsActive(exact)) throw new Error("A completed operation could not be loaded.");
+		if (!exact || operationIsActive(exact)) throw new Error(t("ui.overview.completedOperationLoadFailed"));
 		return exact;
 	}));
 }
@@ -120,17 +206,31 @@ function operationLogPageLabel(page: OperationLogResponse) {
 	return t("ui.overview.logUnitRange", { start: format(page.offset + 1), end: format(page.nextOffset), size: format(page.size), unit });
 }
 
-function eventTime(value: string) {
-    const date = parseTime(value);
-    if (!date) return "—";
+// A damaged record can have a time the page can't read, or no title, message
+// or log level. The timeline still lists it and shows the missing value as "?",
+// with what it stands for in the tooltip. The "?" is an image named by that
+// label, so a screen reader reads "Unknown date" or "Unknown" rather than a
+// question mark.
+function UnknownValue({ label }: { label: string }) {
+    return <Tooltip content={label}><span role="img">?</span></Tooltip>;
+}
+
+// The server places a dashboard time only when SQLite reads it and it starts
+// with a full YYYY-MM-DD date, as every format Replicaro writes does. The page
+// uses the same rule for showing "?" and for sorting, because the browser also
+// reads values such as "2026", "2026-07" or "12345" as dates, which would give
+// such a row a made-up date and move it out of the unknown group.
+function dashboardTime(value: string): Date | null {
+    return /^\d{4}-\d{2}-\d{2}(?:[T ]|$)/.test(value) ? parseTime(value) : null;
+}
+
+function eventTime(value: string): ReactNode {
+    const date = dashboardTime(value);
+    if (!date) return <UnknownValue label={t("ui.date.unknownDate")} />;
 
     const today = new Date();
     if (date.toDateString() === today.toDateString()) {
-        return date.toLocaleTimeString(getEffectiveLocale(), {
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: true,
-        });
+        return formatDisplayTime(date, { hour: "2-digit", minute: "2-digit" });
     }
     return formatDisplayDate(date, { month: "short", day: "numeric" });
 }
@@ -141,10 +241,95 @@ function operationTag(entry: OperationEntry) {
     if (entry.status === "interrupted") return t("ui.operation.stopped");
     if (entry.status === "failed") return t("ui.operation.failed");
 	if (entry.status === "reconnect_required") return t("ui.operation.reconnectRequired");
-    if (entry.status === "completed_with_issues") return t("ui.operation.completedWithIssues");
+    if (entry.status === "completed_with_issues") return completedWithIssuesTag(entry.issueKind);
     if (entry.status === "partial") return t("ui.operation.partial");
     if (entry.status === "success" && (entry.kind === "backup" || entry.kind === "restore")) return t("ui.operation.success");
-    return entry.kind;
+    return operationKindLabel(entry.kind);
+}
+
+// Unknown kinds (for example from a newer backend) keep their internal name.
+function operationKindLabel(kind: string) {
+    switch (kind) {
+        case "backup": return t("ui.operation.kind.backup");
+        case "restore": return t("ui.operation.kind.restore");
+        case "check": return t("ui.operation.kind.check");
+        case "maintenance": return t("ui.operation.kind.maintenance");
+        case "delete": return t("ui.operation.kind.delete");
+        case "delete_job": return t("ui.operation.kind.deleteJob");
+        case "vault_password": return t("ui.operation.kind.vaultPassword");
+        case "vault_settings": return t("ui.operation.kind.vaultSettings");
+        case "remove_vault": return t("ui.operation.kind.removeVault");
+        default: return kind;
+    }
+}
+
+// The tone of a finished operation, shared by the dashboard timeline and the
+// live log header. A skipped or unfamiliar persisted result is not proof of
+// failure, so only known failure outcomes use red and the rest get the
+// warning color.
+function operationOutcomeTone(status: OperationEntry["status"]): "ok" | "danger" | "warn" {
+    return status === "success" ? "ok" : ["failed", "interrupted", "partial", "reconnect_required"].includes(status) ? "danger" : "warn";
+}
+
+// The live log header is colored by the operation's status, not by its label:
+// a successful check shows its own name, in green. Queued and running work
+// has no outcome yet, so it keeps the normal text color.
+function operationHeaderTone(status: OperationEntry["status"]) {
+    return status === "queued" || status === "running" ? undefined : operationOutcomeTone(status);
+}
+
+type OperationStep = NonNullable<OperationEntry["steps"]>[number];
+
+// Step kinds are internal names; show a plain name instead. An unknown kind
+// keeps its internal name with spaces for underscores. The names are nouns
+// ("Vault storage check", not "Checking the vault's storage") because each one
+// sits next to its status, which may already be finished or failed.
+function operationStepLabel(kind: string) {
+    switch (kind) {
+        case "backup": return t("ui.operation.kind.backup");
+        case "restore": return t("ui.operation.kind.restore");
+        case "repository_integrity_check": return t("ui.operation.kind.check");
+        case "maintenance": return t("ui.operation.kind.maintenance");
+        case "snapshot_deletion": return t("ui.operation.kind.delete");
+        case "retention": return t("ui.operation.step.retention");
+        case "integrity_cache_prepare": return t("ui.operation.step.prepareIntegrityCheck");
+        case "integrity_cache_cleanup": return t("ui.operation.step.cleanUpIntegrityCheck");
+        case "kopia_policy_reconciliation": return t("ui.operation.step.kopiaPolicies");
+        // The writer validation confirms the vault's owner (and, for Kopia,
+        // its maintenance owner) before anything writes; it checks ownership,
+        // not write access.
+        case "repository_writer_storage_validation":
+        case "integrity_owner_admission": return t("ui.operation.step.vaultOwnership");
+        case "repository_storage_admission": return t("ui.operation.step.vaultStorage");
+        case "integrity_owner_revalidation":
+        case "maintenance_owner_revalidation": return t("ui.operation.step.vaultOwnershipRecheck");
+        case "integrity_owner_final_admission": return t("ui.operation.step.vaultOwnershipFinal");
+        case "native_process_admission": return t("ui.operation.step.engineStartCheck");
+        case "output_processing": return t("ui.operation.step.engineOutput");
+        case "backup_output_processing": return t("ui.operation.step.backupOutput");
+        case "retention_output_processing": return t("ui.operation.step.retentionOutput");
+        case "backup_admission": return t("ui.operation.step.backupPreparation");
+        case "before_script": return t("ui.operation.step.beforeScript");
+        case "after_script": return t("ui.operation.step.afterScript");
+        case "metadata_cache":
+        case "metadata_cache_invalidation": return t("ui.operation.step.snapshotList");
+        case "notification": return t("ui.operation.step.notification");
+        case "vault_password_blocked": return t("ui.operation.step.passwordChangeBlocked");
+        case "recovery_profile_publication": return t("ui.operation.step.recoveryProfile");
+        default: return kind.replaceAll("_", " ");
+    }
+}
+
+function operationStepStatus(status: OperationStep["status"]): { label: string; tone?: string } {
+    switch (status) {
+        case "running": return { label: t("ui.operation.running"), tone: "running" };
+        case "succeeded": return { label: t("ui.operation.step.status.succeeded"), tone: "ok" };
+        case "failed": return { label: t("ui.operation.failed"), tone: "danger" };
+        case "interrupted": return { label: t("ui.operation.stopped"), tone: "danger" };
+        case "warning": return { label: t("ui.operation.step.status.warning"), tone: "warn" };
+        case "skipped": return { label: t("ui.operation.step.status.skipped") };
+        default: return { label: status };
+    }
 }
 
 function operationTitle(entry: OperationEntry) {
@@ -152,9 +337,23 @@ function operationTitle(entry: OperationEntry) {
     return `${entry.title}${elapsed !== "—" ? ` · ${elapsed}` : ""}`;
 }
 
+// activeOperationSummary is the "kind · engine · progress" line of an active
+// operation. A job deletion has no engine of its own (a job can target Restic
+// and Kopia vaults at once), so empty parts are left out: it shows
+// "Job deletion · Waiting for the vault" rather than
+// "Job deletion ·  · Waiting for the vault".
+function activeOperationSummary(entry: OperationEntry) {
+    return [operationKindLabel(entry.kind), entry.engine, activeOperationProgress(entry)].filter(Boolean).join(" · ");
+}
+
 function activeOperationProgress(entry: OperationEntry) {
     if (entry.kind !== "backup") {
-        return entry.status === "queued" ? t("ui.overview.operationQueuedAt", { time: timeAgo(entry.startedAt) }) : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
+        // A restore, manual check or maintenance, snapshot or job deletion, or
+        // vault password change, settings save or removal is queued only while
+        // it waits for a busy vault (a job deletion or vault removal also waits
+        // for the job's or vault's other work first). Backups keep their queued wording: they
+        // also wait for a free run slot.
+        return entry.status === "queued" ? t("ui.overview.waitingForVault") : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
     }
     const backup = entry.steps?.find((step) =>
         step.domain === "native" && step.kind === "backup" && step.status === "succeeded"
@@ -171,14 +370,55 @@ function activeOperationProgress(entry: OperationEntry) {
 
 function backupCompletedWithIssues(operation?: OperationEntry, event?: TimelineEvent) {
     return (operation?.kind ?? event?.operationKind) === "backup" &&
-        (operation ? operation.status === "completed_with_issues" : event?.tag === "completed with issues");
+        (operation?.status ?? event?.operationStatus) === "completed_with_issues";
+}
+
+function backupLockedFilesSkipped(operation?: OperationEntry, event?: TimelineEvent) {
+    return backupCompletedWithIssues(operation, event) &&
+        lockedFilesSkipped("completed_with_issues", operation ? operation.issueKind : event?.operationIssueKind);
+}
+
+// The files a "locked files skipped" backup left out, listed in its details.
+// They are fetched each time the details are shown rather than kept with the
+// run, since the backend reads them from the saved log. The paths are the
+// engine's own and are shown as given. While loading, or when there are none,
+// nothing is shown; a failed read gets one quiet line.
+function SkippedLockedFiles({ operationID }: { operationID: string }) {
+    const [result, setResult] = useState<{ operationID: string; files?: string[]; failed?: boolean } | null>(null);
+    useEffect(() => {
+        const controller = new AbortController();
+        getOperationLockedFiles(operationID, controller.signal)
+            .then((response) => setResult({ operationID, files: Array.isArray(response?.files) ? response.files : [] }))
+            .catch((reason) => {
+                if (!(reason instanceof DOMException && reason.name === "AbortError")) setResult({ operationID, failed: true });
+            });
+        return () => controller.abort();
+    }, [operationID]);
+    if (result?.operationID !== operationID) return null;
+    if (result.failed) return <p className="muted">{t("ui.overview.skippedLockedFilesLoadFailed")}</p>;
+    if (!result.files?.length) return null;
+    return (
+        <div className="skipped-locked-files">
+            <div className="modal-section-label">{t("ui.overview.skippedLockedFiles")}</div>
+            <ul aria-label={t("ui.overview.skippedLockedFiles")}>
+                {result.files.map((file, index) => <li key={`${index}:${file}`}><bdi dir="ltr" translate="no">{file}</bdi></li>)}
+            </ul>
+        </div>
+    );
 }
 
 export default function Overview() {
     const [stats, setStats] = useState<DashboardStats | null>(null);
     const [jobs, setJobs] = useState<BackupJob[]>([]);
     const [repos, setRepos] = useState<Repository[]>([]);
-    const [operations, setOperations] = useState<OperationEntry[]>([]);
+    const [timelineFeed, setTimelineFeed] = useState<TimelineFeed>(() => emptyTimelineFeed("all"));
+    const [timelineOlderLoading, setTimelineOlderLoading] = useState(false);
+    const [timelineReloadKey, setTimelineReloadKey] = useState(0);
+    // Operations fetched by ID: runs that finished while the page was open and
+    // the run a notification link names.
+    const [pinnedOperations, setPinnedOperations] = useState<OperationEntry[]>([]);
+    // Each vault's newest password change, of any status; null when unknown.
+    const [passwordChanges, setPasswordChanges] = useState<OperationEntry[] | null>(null);
     const [activeOperations, setActiveOperations] = useState<OperationEntry[]>([]);
     const [activeOperationsLoaded, setActiveOperationsLoaded] = useState(false);
 	const [selectedActiveOperation, setSelectedActiveOperation] = useState<OperationEntry | null>(null);
@@ -188,7 +428,6 @@ export default function Overview() {
 	const [cancelError, setCancelError] = useState("");
 	const [cancelSubmitting, setCancelSubmitting] = useState(false);
 	const [cancelNeedsFreshSnapshot, setCancelNeedsFreshSnapshot] = useState(false);
-    const [logs, setLogs] = useState<ActivityEntry[]>([]);
     const [issueEvents, setIssueEvents] = useState<TimelineEvent[]>([]);
     const [issuesHasMore, setIssuesHasMore] = useState(false);
     const [issuesCursor, setIssuesCursor] = useState("");
@@ -222,6 +461,9 @@ export default function Overview() {
     const timelineLogPager = useRef(new NativeLogPager());
     const completedLogPager = useRef(new NativeLogPager());
 	const dashboardRequestSequence = useRef(0);
+	const timelineFilterRef = useRef<DashboardTimelineFilter | null>("all");
+	const timelineGeneration = useRef(0);
+	const timelineOlderRequestSequence = useRef(0);
 	const priorActiveOperationIDs = useRef<Set<string> | null>(null);
 	const pendingActiveCommit = useRef<OperationEntry[] | null>(null);
 	const terminalRefreshInFlight = useRef(false);
@@ -235,6 +477,23 @@ export default function Overview() {
 	const dashboardOperationID = validOperationTargetID || timelineOperationID;
 	const dashboardOperationIDRef = useRef(dashboardOperationID);
     const toast = useToast();
+
+	// Runs fetched by ID are shown even when they are not in the loaded batches;
+	// the tab filter below still decides where they appear.
+	const operations = useMemo(() => {
+		const operationByID = new Map<string, OperationEntry>();
+		for (const item of timelineFeed.items) {
+			if (item.kind === "operation") operationByID.set(item.operation.id, item.operation);
+		}
+		for (const operation of pinnedOperations) {
+			if (!operationByID.has(operation.id)) operationByID.set(operation.id, operation);
+		}
+		return [...operationByID.values()];
+	}, [pinnedOperations, timelineFeed.items]);
+	const logs = useMemo<ActivityEntry[]>(
+		() => timelineFeed.items.flatMap((item) => item.kind === "log" ? [item.log] : []),
+		[timelineFeed.items],
+	);
 
     useEffect(() => () => {
         completedLogRequestSequence.current++;
@@ -277,16 +536,22 @@ export default function Overview() {
 		setCancelNeedsFreshSnapshot(false);
 	}, []);
 
-	const commitDashboardSnapshot = useCallback((snapshot: Awaited<ReturnType<typeof loadDashboardSnapshot>>) => {
+	const commitDashboardSnapshot = useCallback((snapshot: Awaited<ReturnType<typeof loadDashboardSnapshot>>, timelineRequestGeneration: number) => {
 		setStats(snapshot.stats);
 		setJobs(snapshot.jobs);
 		setRepos(snapshot.repos);
-		// Only exact terminal rows learned by this run-local disappearance
-		// coordinator survive the server's ordinary newest-200 snapshot.
+		// Terminal rows that this run's disappearance tracking fetched by ID are
+		// kept, as they may fall inside older batches loaded before they finished.
 		const operationByID = new Map(retainedTerminalOperations.current);
-		snapshot.operations.forEach((operation) => operationByID.set(operation.id, operation));
-		setOperations([...operationByID.values()]);
-		setLogs(snapshot.logs);
+		snapshot.exactOperations.forEach((operation) => operationByID.set(operation.id, operation));
+		setPinnedOperations([...operationByID.values()]);
+		setPasswordChanges(snapshot.passwordChanges);
+		// A batch requested for a tab that has since been left is not used, nor
+		// one requested for a tab that a refresh captured before a switch.
+		const timeline = snapshot.timeline;
+		if (timeline && timelineRequestGeneration === timelineGeneration.current && snapshot.timelineFilter === timelineFilterRef.current) {
+			setTimelineFeed((current) => joinNewestTimelineBatch(current, timeline));
+		}
 		const pendingActive = pendingActiveCommit.current;
 		if (pendingActive) {
 			setActiveOperations(pendingActive);
@@ -297,13 +562,34 @@ export default function Overview() {
 		setError("");
 	}, []);
 
+	// A failed request stops the spinner of a tab still waiting for its first
+	// batch; the error banner says why.
+	const stopTimelineLoading = useCallback((timelineRequestGeneration: number) => {
+		if (timelineRequestGeneration !== timelineGeneration.current) return;
+		setTimelineFeed((current) => current.loading ? { ...current, loading: false } : current);
+	}, []);
+
+	// A tab with a different feed starts again from its newest batch, and
+	// responses still on their way for the previous one are ignored.
+	const switchTimelineFeed = useCallback((nextFilter: TimelineFilter) => {
+		timelineOlderRequestSequence.current++;
+		setTimelineOlderLoading(false);
+		const feedFilter = timelineFeedFilter(nextFilter);
+		if (feedFilter === timelineFilterRef.current) return;
+		timelineFilterRef.current = feedFilter;
+		timelineGeneration.current++;
+		setTimelineFeed(emptyTimelineFeed(feedFilter));
+	}, []);
+
     useEffect(() => {
         let active = true;
+        const timelineFilter = timelineFeedFilter(filter);
         const load = () => {
 			if (terminalRefreshInFlight.current) return;
 			const dashboardGeneration = ++dashboardRequestSequence.current;
 			const reviewGeneration = issueReviewGeneration.current;
             const feedGeneration = issueFeedGeneration.current;
+			const timelineRequestGeneration = timelineGeneration.current;
             if (filter === "issues") {
                 const responseGeneration = ++issueResponseGeneration.current;
                 getDashboardIssues()
@@ -327,12 +613,12 @@ export default function Overview() {
                         }
                     });
             }
-            loadDashboardSnapshot(dashboardOperationID)
+            loadDashboardSnapshot(timelineFilter, dashboardOperationID)
                 .then((snapshot) => {
                     if (!active ||
 						dashboardGeneration !== dashboardRequestSequence.current ||
                         reviewGeneration !== issueReviewGeneration.current) return;
-					commitDashboardSnapshot(snapshot);
+					commitDashboardSnapshot(snapshot, timelineRequestGeneration);
                 })
                 .catch((reason: Error) => {
                     if (active &&
@@ -345,6 +631,7 @@ export default function Overview() {
 							priorActiveOperationIDs.current = new Set(pendingActive.map((operation) => operation.id));
 							pendingActiveCommit.current = null;
 						}
+						stopTimelineLoading(timelineRequestGeneration);
 						setError(reason.message);
 					}
                 });
@@ -356,7 +643,7 @@ export default function Overview() {
             active = false;
             window.clearInterval(timer);
         };
-    }, [commitDashboardSnapshot, dashboardOperationID, filter, issueRequestKey]);
+    }, [commitDashboardSnapshot, dashboardOperationID, filter, issueRequestKey, stopTimelineLoading, timelineReloadKey]);
 
     useEffect(() => {
 		let active = true;
@@ -367,24 +654,29 @@ export default function Overview() {
 			const refreshOwner = ++terminalRefreshOwner.current;
 			dashboardRequestSequence.current++;
 			const refreshIDs = new Set<string>();
+			const timelineRequestGeneration = timelineGeneration.current;
+			const timelineFilter = timelineFilterRef.current;
 			try {
 				const requiredIDs = [...pendingTerminalIDs.current];
 				pendingTerminalIDs.current.clear();
 				requiredIDs.forEach((id) => refreshIDs.add(id));
-				let snapshot = await loadDashboardSnapshot(dashboardOperationIDRef.current, requiredIDs);
+				let snapshot = await loadDashboardSnapshot(timelineFilter, dashboardOperationIDRef.current, requiredIDs);
 				if (!active) return;
 
-				// A later disappearance means the first full snapshot can no longer be
-				// paired with the newest jobs/logs/dashboard truth. Coalesce all such
-				// IDs into one full rerun; later arrivals need only their exact rows.
+				// A later disappearance means the first full snapshot no longer lines up
+				// with the newest jobs/logs/dashboard data. Coalesce all such IDs into
+				// one full rerun; later arrivals only need their own rows.
 				if (pendingTerminalIDs.current.size > 0) {
 					const additionalIDs = [...pendingTerminalIDs.current];
 					pendingTerminalIDs.current.clear();
 					additionalIDs.forEach((id) => refreshIDs.add(id));
-					snapshot = await loadDashboardSnapshot(dashboardOperationIDRef.current, [...refreshIDs]);
+					snapshot = await loadDashboardSnapshot(timelineFilter, dashboardOperationIDRef.current, [...refreshIDs]);
 					if (!active) return;
 				}
-				const operationByID = new Map(snapshot.operations.map((operation) => [operation.id, operation]));
+				const operationByID = new Map([
+					...(snapshot.timeline?.items ?? []).flatMap((item) => item.kind === "operation" ? [item.operation] : []),
+					...snapshot.exactOperations,
+				].map((operation) => [operation.id, operation]));
 				// Active polls can discover more completions while an exact batch is
 				// loading. Drain until a synchronous empty check so no UUID is stranded
 				// after its prior-active membership has already advanced.
@@ -406,7 +698,9 @@ export default function Overview() {
 					if (!oldestID) break;
 					retainedTerminalOperations.current.delete(oldestID);
 				}
-				commitDashboardSnapshot({ ...snapshot, operations: [...operationByID.values()] });
+				// Every refreshed ID that ended up here is terminal and now retained, so
+				// the commit shows it whatever batch it belongs to.
+				commitDashboardSnapshot(snapshot, timelineRequestGeneration);
 			} catch (reason) {
 				if (!active) return;
 				const pendingActive = pendingActiveCommit.current;
@@ -415,16 +709,21 @@ export default function Overview() {
 					setActiveOperationsLoaded(true);
 					pendingActiveCommit.current = null;
 				}
-				// Keep failed exact identities in the transition detector so the next
-				// ordinary active poll can retry without showing them as still active.
+				// Keep the failed IDs in the transition detector so the next active
+				// poll can retry them without showing them as still active.
 				const retryIDs = new Set((pendingActive ?? []).map((operation) => operation.id));
 				refreshIDs.forEach((id) => retryIDs.add(id));
 				pendingTerminalIDs.current.forEach((id) => retryIDs.add(id));
 				priorActiveOperationIDs.current = retryIDs;
+				stopTimelineLoading(timelineRequestGeneration);
 				setError((reason as Error).message);
 				pendingTerminalIDs.current.clear();
 			} finally {
-				if (terminalRefreshOwner.current === refreshOwner) terminalRefreshInFlight.current = false;
+				if (terminalRefreshOwner.current === refreshOwner) {
+					terminalRefreshInFlight.current = false;
+					// A tab chosen while this refresh ran skipped its own first load.
+					if (active && timelineRequestGeneration !== timelineGeneration.current) setTimelineReloadKey((key) => key + 1);
+				}
 			}
 		};
         const loadActive = () => {
@@ -465,7 +764,7 @@ export default function Overview() {
 			requestGeneration++;
             window.clearInterval(timer);
 		};
-	}, [commitDashboardSnapshot]);
+	}, [commitDashboardSnapshot, stopTimelineLoading]);
 
 	useEffect(() => {
 		if (!validOperationTargetID) {
@@ -517,7 +816,7 @@ export default function Overview() {
 					try {
 						const completed = await completedLogPager.current.read(
                             offset => getOperationLog(response.operation.id, controller!.signal, offset),
-                            () => active && generation === activeDetailGeneration.current, response.operation.engine, backupCompletedWithIssues(response.operation), logPresentation(response.operation.kind));
+                            () => active && generation === activeDetailGeneration.current, response.operation.engine, backupCompletedWithIssues(response.operation), logPresentation(response.operation.kind, backupLockedFilesSkipped(response.operation)));
 						if (active && generation === activeDetailGeneration.current) {
 							setCompletedOperationLog(completed.available ? completed.output : "");
 							setCompletedOperationLogPage(completed);
@@ -555,11 +854,16 @@ export default function Overview() {
     const readableLog = (text: string, operation?: OperationEntry, event?: TimelineEvent,
         page?: OperationLogResponse | null, live = false) => {
         return formatReadableLog(text, {
-            operationStatus: operation?.status ?? (event?.tag === "completed with issues" ? "completed_with_issues" : undefined),
+            operationStatus: operation?.status ?? event?.operationStatus,
+            operationIssueKind: operation ? operation.issueKind : event?.operationIssueKind,
             operationKind: operation?.kind ?? event?.operationKind,
             engine: operation?.engine ?? event?.engine ?? openOutputEngine,
         }, live, page?.readableBody, page?.readableDiagnostics);
     };
+
+    const completedReadableLog = (text: string, operation?: OperationEntry, event?: TimelineEvent,
+        page?: OperationLogResponse | null) =>
+        withRetryAdvice(readableLog(text, operation, event, page), operation?.kind ?? event?.operationKind);
 
     const timeline = useMemo<TimelineEvent[]>(() => {
         const repoById = new Map(repos.map((repo) => [repo.id, repo]));
@@ -580,12 +884,14 @@ export default function Overview() {
                 kind: "operation",
                 operationKind: operation.kind,
                 operationID: operation.id,
+                operationStatus: operation.status,
+                operationIssueKind: operation.issueKind,
 				engine: operation.engine,
-                // A skipped or unfamiliar persisted result is not proof of failure.
-                // Keep the warning fallback; only known failure outcomes use red.
-                tone: operation.status === "success" ? "ok" : ["failed", "interrupted", "partial", "reconnect_required"].includes(operation.status) ? "danger" : "warn",
+                tone: operationOutcomeTone(operation.status),
                 tag: operationTag(operation),
-                title: operationTitle({ ...operation, title }),
+                // An empty title is shown as unknown, without the vault and
+                // duration that would otherwise follow it.
+                title: operation.title.trim() ? operationTitle({ ...operation, title }) : "",
                 outputAvailable: true,
                 issue: operation.status === "failed" || operation.status === "interrupted" || operation.status === "partial" || operation.status === "completed_with_issues" || operation.status === "reconnect_required",
             };
@@ -593,22 +899,29 @@ export default function Overview() {
 
         const logEvents = logs.map((entry): TimelineEvent => {
             const issue = entry.level === "ERROR" || entry.level === "WARN";
+            const tag = logTag(entry);
             return {
                 id: `log-${entry.id}`,
                 timestamp: entry.timestamp,
                 kind: "log",
                 tone: entry.level === "ERROR" ? "danger" : entry.level === "WARN" ? "warn" : "faint",
-                tag: logTag(entry),
+                // An entry without a level has no level tag to fall back on and
+                // shows it as unknown; a tag its message gives still applies.
+                tag: !entry.level && tag === "info" ? "" : logTagLabel(tag),
                 title: entry.message,
                 outputAvailable: false,
                 issue,
             };
         });
 
+        // Newest first, with unknown times at the top as the server lists them.
+        // The sort is stable, so entries with equal times keep the order they
+        // were loaded in, operations before log entries.
+        const time = (event: TimelineEvent) => dashboardTime(event.timestamp)?.getTime() ?? Infinity;
         return [...operationEvents, ...logEvents].sort((a, b) => {
-            const aTime = parseTime(a.timestamp)?.getTime() ?? 0;
-            const bTime = parseTime(b.timestamp)?.getTime() ?? 0;
-            return bTime - aTime;
+            const aTime = time(a);
+            const bTime = time(b);
+            return aTime === bTime ? 0 : bTime > aTime ? 1 : -1;
         });
     }, [jobs, logs, operations, repos]);
 
@@ -617,6 +930,16 @@ export default function Overview() {
         if (!operationID || focusedOperationRef.current === operationID) return;
         const index = timeline.findIndex((event) => event.operationID === operationID);
         if (index < 0) return;
+        // The run is shown on the All tab, so its place has to come from that
+        // tab's entries; another tab first switches over and waits for them.
+        if (timelineFeed.filter !== "all") {
+            const timer = window.setTimeout(() => {
+                switchTimelineFeed("all");
+                setFilter("all");
+            }, 0);
+            return () => window.clearTimeout(timer);
+        }
+        if (timelineFeed.loading) return;
 
         focusedOperationRef.current = operationID;
         const timer = window.setTimeout(() => {
@@ -640,7 +963,7 @@ export default function Overview() {
             window.clearTimeout(timer);
             window.clearTimeout(clearFocusTimer);
         };
-    }, [searchParams, setSearchParams, timeline]);
+    }, [searchParams, setSearchParams, switchTimelineFeed, timeline, timelineFeed.filter, timelineFeed.loading]);
 
     const filtered = filter === "issues" ? issueEvents : timeline.filter((event) => {
         if (filter === "backups") return event.operationKind === "backup";
@@ -674,6 +997,7 @@ export default function Overview() {
     const issueTone = issueCount > (stats?.warningRuns ?? 0) ? "danger" : "warn";
     const ringTone = hasIssues ? issueTone : percent === 100 ? "ok" : percent === 0 ? "danger" : "warn";
     const failing = enabledTargets.filter((target) => target.lastStatus === "failed" || target.lastStatus === "interrupted" || target.lastStatus === "reconnect_required");
+    const loadOlderBusy = filter === "issues" ? issuesLoading : timelineOlderLoading;
     const selectFilter = (nextFilter: TimelineFilter) => {
         timelineLogPager.current.clear();
         issueFeedGeneration.current++;
@@ -693,6 +1017,7 @@ export default function Overview() {
             setIssuesLoading(true);
             setIssueRequestKey((key) => key + 1);
         }
+        switchTimelineFeed(nextFilter);
         setFilter(nextFilter);
         setVisible(TIMELINE_PAGE_SIZE);
     };
@@ -704,7 +1029,35 @@ export default function Overview() {
     };
     const loadOlder = () => {
         if (filter !== "issues") {
-            setVisible((count) => count + TIMELINE_LOAD_MORE_SIZE);
+            if (visible < filtered.length) {
+                setVisible((count) => count + TIMELINE_LOAD_MORE_SIZE);
+                return;
+            }
+            // Everything loaded is shown: fetch the next older batch and show the
+            // first entries of it the same way.
+            const { filter: feedFilter, cursor } = timelineFeed;
+            if (timelineOlderLoading || timelineFeed.loading || !timelineFeed.hasMore || feedFilter === null) return;
+            const timelineRequestGeneration = timelineGeneration.current;
+            const requestSequence = ++timelineOlderRequestSequence.current;
+            const shown = filtered.length;
+            setTimelineOlderLoading(true);
+            getDashboardTimeline(feedFilter, cursor)
+                .then(requireTimelineBatch)
+                .then((batch) => {
+                    if (requestSequence !== timelineOlderRequestSequence.current ||
+                        timelineRequestGeneration !== timelineGeneration.current) return;
+                    // A refresh that started the tab over has moved the cursor on;
+                    // this batch would then leave a gap.
+                    setTimelineFeed((current) => current.cursor === cursor ? appendOlderTimelineBatch(current, batch) : current);
+                    setVisible((count) => Math.min(count, shown) + TIMELINE_LOAD_MORE_SIZE);
+                })
+                .catch((reason: Error) => {
+                    if (requestSequence === timelineOlderRequestSequence.current &&
+                        timelineRequestGeneration === timelineGeneration.current) setError(reason.message);
+                })
+                .finally(() => {
+                    if (requestSequence === timelineOlderRequestSequence.current) setTimelineOlderLoading(false);
+                });
             return;
         }
 		if (issuesLoading || !issuesHasMore) return;
@@ -760,7 +1113,7 @@ export default function Overview() {
 					: getOperation(event.operationID).then((matches) => matches[0]?.engine).catch(() => undefined);
 				const [log, engine] = await Promise.all([timelineLogPager.current.read(
                     offset => offset === 0 ? getOperationLog(event.operationID!) : getOperationLog(event.operationID!, undefined, offset),
-                    () => requestSequence === timelineOutputRequestSequence.current, event.engine, backupCompletedWithIssues(operations.find(operation => operation.id === event.operationID), event), logPresentation(event.operationKind)), operationEngine]);
+                    () => requestSequence === timelineOutputRequestSequence.current, event.engine, backupCompletedWithIssues(operations.find(operation => operation.id === event.operationID), event), logPresentation(event.operationKind, backupLockedFilesSkipped(operations.find(operation => operation.id === event.operationID), event))), operationEngine]);
 				if (requestSequence !== timelineOutputRequestSequence.current) return;
 				setOpenOutputText(log.available ? log.output : "");
 				setOpenOutputPage(log);
@@ -1017,7 +1370,7 @@ export default function Overview() {
                                     ) : (
                                         <strong>{operation.title}</strong>
                                     )}
-                                    <span>{operation.kind} · {operation.engine} · {activeOperationProgress(operation)}</span>
+                                    <span className="active-operation-summary">{activeOperationSummary(operation)}</span>
 									{activeRepositoryByID.get(operation.repositoryId || "")?.coldStorage && ["restore", "check", "maintenance"].includes(operation.kind) && <span>{t("ui.pages.overview.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</span>}
                                 </div>
 							</button></Tooltip>
@@ -1034,36 +1387,41 @@ export default function Overview() {
 				>
 					<div className="operation-detail">
 						<div className="operation-detail-state">
-							<strong>{operationTag(detailedOperation)}</strong>
-							<span>{detailedOperation.kind} · {detailedOperation.engine} · {activeOperationProgress(detailedOperation)}</span>
+							<strong className={operationHeaderTone(detailedOperation.status)}>{operationTag(detailedOperation)}</strong>
+							<span>{activeOperationSummary(detailedOperation)}</span>
 						</div>
 						{(detailedOperation.steps ?? []).length > 0 && (
 							<div className="operation-detail-steps" aria-label={t("ui.pages.overview.operation.steps")}>
-								{detailedOperation.steps?.map((step) => (
-									<div key={step.id}><strong>{step.kind.replaceAll("_", " ")}</strong><span>{step.status}</span></div>
-								))}
+								{detailedOperation.steps?.map((step) => {
+									const status = operationStepStatus(step.status);
+									return <div key={step.id}><strong>{operationStepLabel(step.kind)}</strong><span className={status.tone}>{status.label}</span></div>;
+								})}
 							</div>
 						)}
+						{backupLockedFilesSkipped(detailedOperation) && <SkippedLockedFiles operationID={detailedOperation.id} />}
 						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
                         {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>}
 						{detailedOperationActive ? !operationDetail ? (
-							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
 						) : !operationDetail.live.available ? (
 							<p className="muted">{t("ui.pages.overview.live.output.is.unavailable.for.this.operation")}</p>
 						) : operationDetail.live.entries.length === 0 ? (
-							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
 						) : (
 							<pre className="output operation-live-log" aria-live="polite">{[
+								// The live log is never translated, including this marker;
+								// the engine output after it is shown exactly as written.
 								...(operationDetail.live.truncated ? ["[Earlier live output omitted]"] : []),
 								readableLog(operationDetail.live.entries.map((entry) => entry.text).join("\n"), detailedOperation, undefined, undefined, true),
 							].join("\n")}</pre>
 						) : (
 							<>
+								{/* Nothing inside the log output is translated, including these load states. */}
 								<pre className="output operation-live-log">{completedOperationLogLoadState === "failed"
-									? t("ui.pages.overview.log.could.not.be.loaded")
+									? "Log could not be loaded."
 									: completedOperationLogLoadState === "pending"
-										? t("ui.pages.overview.loading.log")
-										: completedOperationLog ? showRawLog ? completedOperationLog : readableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+										? "Loading log…"
+										: completedOperationLog ? showRawLog ? completedOperationLog : completedReadableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : "(no output recorded)"}</pre>
 								{showRawLog && operationLogHasMultiplePages(completedOperationLogPage) && completedOperationLogPage && (
 									<div className="log-page-controls">
 										<button type="button" className="btn" disabled={completedOperationLogPage.offset === 0 || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
@@ -1111,7 +1469,7 @@ export default function Overview() {
                     </div>
                 </div>
 
-                {issuesLoading && filtered.length === 0 ? (
+                {(filter === "issues" ? issuesLoading && filtered.length === 0 : timelineFeed.loading) ? (
                     <Loading />
                 ) : filtered.length === 0 ? (
                     <EmptyState icon="history" title={t("ui.pages.overview.nothing.in.this.view")}>
@@ -1128,9 +1486,9 @@ export default function Overview() {
                                 <span className="timeline-dot" />
                                 <div className="timeline-line">
                                     <time>{eventTime(event.timestamp)}</time>
-                                    <span className="timeline-tag">{event.tag}</span>
+                                    <span className="timeline-tag">{event.tag || <UnknownValue label={t("ui.date.unknown")} />}</span>
                                     {event.isNew && <span className="new-issue-badge">{t("ui.pages.overview.new")}</span>}
-                                    <span className="timeline-title">{event.title}</span>
+                                    <span className="timeline-title">{event.title.trim() ? event.title : <UnknownValue label={t("ui.date.unknown")} />}</span>
                                     {event.outputAvailable && (
                                         <button
                                             className="text-button"
@@ -1140,12 +1498,23 @@ export default function Overview() {
                                         </button>
                                     )}
                                 </div>
+								{/* A password change that stopped before commit blocks every
+								    operation on the vault until it is retried; its issue says
+								    so and leads to the vault card's Continue password change.
+								    Only while it is the vault's newest password change of any
+								    status: after a later change, or while a Retry is queued or
+								    running, the old issue no longer describes the vault. */}
+								{event.operationKind === VAULT_PASSWORD_CHANGE_KIND && passwordChanges && passwordChangeStillBlocksVault(passwordChanges.find((operation) => operation.id === event.operationID), passwordChanges) && (
+									<Link className="text-button" to="/protect#vaults">{t("ui.protect.vaultPasswordChangeBlocking")}</Link>
+								)}
 								{openOutput === event.id && (
 									<div>
+										{event.operationID && backupLockedFilesSkipped(operations.find(operation => operation.id === event.operationID), event) && <SkippedLockedFiles operationID={event.operationID} />}
 										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>
+										{/* Nothing inside the log output is translated, including these load states. */}
                                         <pre className="output timeline-output">{openOutputLoadFailed
-											? t("ui.pages.overview.log.could.not.be.loaded")
-											: openOutputLoading ? t("ui.pages.overview.loading.log") : openOutputText ? showRawLog ? openOutputText : readableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+											? "Log could not be loaded."
+											: openOutputLoading ? "Loading log…" : openOutputText ? showRawLog ? openOutputText : completedReadableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : "(no output recorded)"}</pre>
 										{showRawLog && event.operationID && operationLogHasMultiplePages(openOutputPage) && openOutputPage && (
 											<div className="log-page-controls">
 												<button type="button" className="btn" disabled={openOutputPage.offset === 0} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
@@ -1160,9 +1529,11 @@ export default function Overview() {
                     </div>
                 )}
 
-                {!issuesLoading && ((filter === "issues" && issuesHasMore) || (filter !== "issues" && visible < filtered.length)) && (
-                    <button className="btn load-older" disabled={issuesLoading} onClick={loadOlder}>
-                        {issuesLoading && <span className="spinner" />}
+                {(filter === "issues"
+                    ? !issuesLoading && issuesHasMore
+                    : !timelineFeed.loading && (visible < filtered.length || timelineFeed.hasMore)) && (
+                    <button className="btn load-older" disabled={loadOlderBusy} onClick={loadOlder}>
+                        {loadOlderBusy && <span className="spinner" />}
                         {t("ui.overview.loadOlderEvents")}
                     </button>
                 )}

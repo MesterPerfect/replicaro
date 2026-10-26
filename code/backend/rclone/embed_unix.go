@@ -2,11 +2,15 @@
 
 package rclone
 
-import "embed"
+import (
+	"embed"
+
+	"github.com/local/replicaro/appdata"
+)
 
 var embeddedUnixAssets embed.FS
 
-func embeddedBinary() ([]byte, error) {
-	return embeddedUnixAssets.ReadFile("assets/" + embeddedTarget + "/rclone")
+func embeddedExecutable() (appdata.Executable, error) {
+	return appdata.ExecutableFromFS(embeddedUnixAssets, "assets/"+embeddedTarget+"/rclone", BinarySHA256), nil
 }
 func embeddedBinaryName() string { return "rclone" }

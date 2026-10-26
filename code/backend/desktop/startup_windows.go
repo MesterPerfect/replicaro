@@ -37,11 +37,20 @@ func RegisterStartup() error {
 	}
 	defer key.Close()
 
-	if err := key.SetStringValue(startupValue, `"`+executable+`"`); err != nil {
+	// Writing the value every time also updates an entry from an older
+	// version that started Replicaro without the option.
+	if err := key.SetStringValue(startupValue, startupCommand(executable)); err != nil {
 		return err
 	}
 	_ = key.DeleteValue(legacyValue)
 	return nil
+}
+
+// startupCommand is the Run value: the quoted executable followed by
+// --no-startup-browser, so a start at sign-in doesn't open a browser window.
+// The notification-area icon still opens the web interface.
+func startupCommand(executable string) string {
+	return `"` + executable + `" ` + noStartupBrowserOption
 }
 
 func UnregisterStartup() error {

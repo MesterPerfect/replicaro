@@ -1,6 +1,7 @@
 package engines
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -18,37 +19,76 @@ import (
 )
 
 // DetectRepositorySignatures inspects only exact-root, engine-owned marker
-// structures and does not authenticate or execute an engine.
-func DetectRepositorySignatures(repo models.Repository) ([]string, error) {
-	repo = repo.RuntimeView()
+// structures and does not authenticate or execute an engine. The listing of
+// the vault folder is bounded by ctx (see ReadWithin).
+func DetectRepositorySignatures(ctx context.Context, repo models.Repository) ([]string, error) {
 	if repo.Connector != "fs" {
 		return nil, fmt.Errorf("remote repository signatures require connector-backed root inspection")
 	}
-	entries, err := os.ReadDir(repo.Location)
+	entries, err := ReadWithin(ctx, func() ([]os.DirEntry, error) { return os.ReadDir(repo.Location) })
 	if err != nil {
 		return nil, err
 	}
-	names := map[string]bool{}
+	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		names[strings.ToLower(entry.Name())] = true
+		names = append(names, entry.Name())
+	}
+	return RepositorySignatures(names), nil
+}
+
+// RepositorySignatures returns the engines whose repository markers appear
+// among the names listed at a vault root, sorted. Kopia is recognized by its
+// format blob, which is "kopia.repository" on object storage and
+// "kopia.repository.f" where Kopia stores blobs as files. Restic is recognized
+// by "config" together with "keys": on object storage a Restic repository
+// without snapshots has nothing else, because empty folders do not exist
+// there. Both engines are returned when both are present.
+func RepositorySignatures(names []string) []string {
+	present := map[string]bool{}
+	for _, name := range names {
+		present[strings.ToLower(strings.TrimSpace(name))] = true
 	}
 	candidates := []string{}
-	if names["kopia.repository.f"] || names["kopia.blobcfg.f"] || names["kopia.maintenance.f"] {
+	if present["kopia.repository"] || present["kopia.repository.f"] {
 		candidates = append(candidates, KopiaID)
 	}
-	resticStructure := names["config"] && names["data"] && names["index"] && names["keys"] && names["snapshots"]
-	if resticStructure {
+	if present["config"] && present["keys"] {
 		candidates = append(candidates, ResticID)
 	}
 	sort.Strings(candidates)
-	return candidates, nil
+	return candidates
+}
+
+// RepositoryFingerprintContext is RepositoryFingerprint for callers that hold
+// a vault lock or the Kopia initialization lock, or that are connecting a
+// vault: the filesystem marker read is bounded by ctx (see ReadWithin). Other
+// connectors read nothing locally and are computed directly.
+func RepositoryFingerprintContext(ctx context.Context, repo models.Repository, validationOutput string) (string, error) {
+	if repo.Connector != "fs" {
+		return RepositoryFingerprint(repo, validationOutput)
+	}
+	return ReadWithin(ctx, func() (string, error) { return RepositoryFingerprint(repo, validationOutput) })
+}
+
+// RepositoryMissingContext is RepositoryMissing for the same callers. For a
+// filesystem vault the check stats and lists the vault folder, so it is
+// bounded by ctx; an error means ctx ended before the check finished and
+// nothing is known about whether the repository is missing.
+func RepositoryMissingContext(ctx context.Context, repo models.Repository, validationOutput string) (bool, error) {
+	if repo.Connector != "fs" {
+		return RepositoryMissing(repo, validationOutput), nil
+	}
+	return ReadWithin(ctx, func() (bool, error) { return RepositoryMissing(repo, validationOutput), nil })
 }
 
 // RepositoryFingerprint binds a recovery preview to native repository material.
 // Exact-root configuration bytes are preferred; normalized validation output
 // is the remote-repository fallback.
+//
+// For a filesystem vault it reads the vault path directly and can block
+// indefinitely on a hung share, so code that holds a vault lock or serves a
+// request should call RepositoryFingerprintContext instead.
 func RepositoryFingerprint(repo models.Repository, validationOutput string) (string, error) {
-	repo = repo.RuntimeView()
 	if repo.Connector == "fs" {
 		markers := []string{}
 		switch repo.Engine {
@@ -78,17 +118,7 @@ func RepositoryFingerprint(repo models.Repository, validationOutput string) (str
 				return "", fmt.Errorf("native repository identity marker exceeds the size limit")
 			}
 			if repo.Engine == KopiaID {
-				var format struct {
-					UniqueID string `json:"uniqueID"`
-				}
-				if err := json.Unmarshal(data, &format); err != nil || strings.TrimSpace(format.UniqueID) == "" {
-					return "", fmt.Errorf("kopia native repository identity is invalid")
-				}
-				decoded, err := base64.StdEncoding.DecodeString(format.UniqueID)
-				if err != nil || len(decoded) != sha256.Size {
-					return "", fmt.Errorf("kopia native repository identity is invalid")
-				}
-				return hex.EncodeToString(decoded), nil
+				return KopiaFormatUniqueID(data)
 			}
 			hash := sha256.New()
 			_, _ = hash.Write(data)
@@ -122,6 +152,24 @@ func RepositoryFingerprint(repo models.Repository, validationOutput string) (str
 	}
 	hash := sha256.Sum256([]byte(repo.Engine + "\x00" + normalized))
 	return fmt.Sprintf("%x", hash[:]), nil
+}
+
+// KopiaFormatUniqueID returns the repository's stable ID, as lowercase hex,
+// from kopia.repository bytes. It is the same value Kopia reports as
+// uniqueIDHex and Replicaro stores as the native repository ID, and a
+// password change leaves it unchanged.
+func KopiaFormatUniqueID(data []byte) (string, error) {
+	var format struct {
+		UniqueID string `json:"uniqueID"`
+	}
+	if err := json.Unmarshal(data, &format); err != nil || strings.TrimSpace(format.UniqueID) == "" {
+		return "", fmt.Errorf("kopia native repository identity is invalid")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(format.UniqueID)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", fmt.Errorf("kopia native repository identity is invalid")
+	}
+	return hex.EncodeToString(decoded), nil
 }
 
 func CleanupRepositoryArtifacts(repo models.Repository) error {
@@ -161,6 +209,15 @@ type RepositoryArtifactManifest struct {
 	Action           RepositoryArtifactAction `json:"action"`
 	Quarantine       string                   `json:"quarantine"`
 	OldOptionsSHA256 string                   `json:"oldOptionsSha256"`
+	// Committed is set by Finalize, which only runs once the vault change is
+	// saved. A manifest kept because the old copy couldn't be removed outlives
+	// the database state that showed the change was saved: the same vault can
+	// be added back under the same ID, or its credentials changed back to the
+	// old values, and reading the database again would then call the change
+	// unsaved and move the old copy back over the current one. Manifests
+	// written before this field existed lack it and are still classified from
+	// the database; older versions ignore it.
+	Committed bool `json:"committed,omitempty"`
 }
 
 // RepositoryOptionsDigest is the narrow state comparison used by startup
@@ -267,13 +324,32 @@ func (s *RepositoryArtifactStage) Restore() error {
 	return nil
 }
 
+// Finalize discards the quarantined old copy. Callers run it only after the
+// change is saved, so it first records that in the manifest; if the removal
+// then fails, the next start finishes it without consulting the database.
 func (s *RepositoryArtifactStage) Finalize() error {
 	if s == nil || s.parent == "" {
 		return nil
 	}
+	var markErr error
+	if !s.manifest.Committed {
+		committed := s.manifest
+		committed.Committed = true
+		// The temporary file is only left behind by a crash during an
+		// earlier write of this manifest, and the write refuses to reuse it.
+		_ = os.Remove(s.manifestPath() + ".tmp")
+		if err := writeRepositoryArtifactManifest(s.manifestPath(), committed); err != nil {
+			// Still try the removal: if it succeeds the manifest goes too and
+			// the flag no longer matters. Only if both fail does the next
+			// start fall back to classifying the stage from the database.
+			markErr = fmt.Errorf("record saved local engine artifact change: %w", err)
+		} else {
+			s.manifest = committed
+		}
+	}
 	_, quarantine := s.paths()
 	if err := os.RemoveAll(quarantine); err != nil {
-		return fmt.Errorf("remove quarantined local engine artifacts: %w", err)
+		return errors.Join(fmt.Errorf("remove quarantined local engine artifacts: %w", err), markErr)
 	}
 	if err := syncDirectory(s.parent); err != nil {
 		return fmt.Errorf("sync quarantined local engine artifacts: %w", err)
@@ -403,7 +479,7 @@ func writeRepositoryArtifactManifest(path string, manifest RepositoryArtifactMan
 		return err
 	}
 	cleanup = false
-	if err := appdata.SecurePath(path, false); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(path))
@@ -427,6 +503,65 @@ func removeAndSync(path, parent string) error {
 	return syncDirectory(parent)
 }
 
+// CleanupPreviewArtifacts removes everything a preview or credential check
+// left under its throwaway vault ID: the local engine configuration and the
+// engine cache. Callers only pass an ID they generated for that one check,
+// never a saved vault's ID, because this also deletes the cache.
 func CleanupPreviewArtifacts(repo models.Repository) {
 	_ = CleanupRepositoryArtifacts(repo)
+	_ = RemoveRepositoryCaches(repo)
+}
+
+// RemoveRepositoryCaches deletes the engine cache folder Replicaro gives one
+// vault ID: cache/engines/restic/<id>, which Restic gets as RESTIC_CACHE_DIR,
+// or cache/engines/kopia/<id>, which holds Kopia's cache and log folders
+// (KOPIA_CACHE_DIRECTORY and KOPIA_LOG_DIR). On macOS that folder is under
+// ~/Library/Caches/Replicaro instead (see appdata.CacheDirectory). The engines
+// rebuild a cache on their own, so this only frees space; it's called once the
+// ID belongs to no saved vault, and must not be called for a vault that is
+// still in use. Vault and preview IDs are canonical UUIDs, so anything else is
+// ignored, which also keeps the removal inside the engine's cache folder.
+func RemoveRepositoryCaches(repo models.Repository) error {
+	if (repo.Engine != KopiaID && repo.Engine != ResticID) || !validRepositoryUUID(repo.ID) {
+		return nil
+	}
+	parent, err := appdata.CacheDirectory(filepath.Join("engines", repo.Engine))
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Join(parent, repo.ID))
+}
+
+// ReconcileRepositoryCaches removes the engine cache folders that belong to
+// no vault ID in ownerIDs: caches older versions left behind when a vault was
+// removed or a creation cancelled, and a cache whose removal a crash cut
+// short. It runs once at startup, before any worker or request can open a
+// vault, so no engine is using a folder it removes. Only canonical-UUID
+// folder names are considered, which leaves anything else in the cache
+// folder alone. It returns how many folders it removed.
+func ReconcileRepositoryCaches(ownerIDs map[string]bool) (int, error) {
+	var result error
+	removed := 0
+	for _, engine := range []string{ResticID, KopiaID} {
+		parent, err := appdata.CacheDirectory(filepath.Join("engines", engine))
+		if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		for _, entry := range entries {
+			if id := entry.Name(); validRepositoryUUID(id) && !ownerIDs[id] {
+				if err := RemoveRepositoryCaches(models.Repository{ID: id, Engine: engine}); err != nil {
+					result = errors.Join(result, err)
+				} else {
+					removed++
+				}
+			}
+		}
+	}
+	return removed, result
 }

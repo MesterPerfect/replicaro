@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +26,7 @@ import (
 	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
+	"github.com/local/replicaro/vaultreconnect"
 )
 
 var ErrAlreadyRunning = errors.New("this backup target already has a queued or running operation; wait for it to finish before running it again")
@@ -41,8 +42,10 @@ type targetTask struct {
 	unlock              func()
 	resumeMetadata      func()
 	sourcePath          string
+	fullSourceRead      bool
 	sourceFailureReason string
 	targetFailureReason string
+	lockedFiles         []string // see lockedFilesSkipped; selects the issue kind and notification text
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	quarantined         bool
@@ -82,15 +85,12 @@ var (
 	executorMu              sync.RWMutex
 	executor                contextTargetExecutor = defaultExecutorContext
 	finisherMu              sync.RWMutex
-	finisher                OperationFinisher = database.FinishBackupOperation
+	finisher                OperationFinisher = database.FinishBackupOperationWithIssueKind
 	resolveBackupEngine                       = func(repo models.Repository) (engines.Engine, error) {
-		return engines.ResolveWithRepositoryAvailabilityCheck(
-			repo, storageavailability.RequireRepositoryAvailable,
-		)
+		return engines.Resolve(repo)
 	}
 	assertVaultWriter = func(ctx context.Context, repo models.Repository) error {
-		store := (vaultprofile.Store{Repository: repo}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+		store := (vaultprofile.Store{Repository: repo})
 		if err := store.AssertRootIdentity(ctx); err != nil {
 			return err
 		}
@@ -124,37 +124,19 @@ func closeCancelGateFromContext(ctx context.Context) {
 }
 
 type frozenSourcePathContextKey struct{}
-type runtimeRepositoryViewContextKey struct{}
-
-type runtimeRepositoryView struct {
-	mu   sync.RWMutex
-	repo models.Repository
-}
-
-func setRuntimeRepositoryView(ctx context.Context, repo models.Repository) {
-	view, _ := ctx.Value(runtimeRepositoryViewContextKey{}).(*runtimeRepositoryView)
-	if view == nil {
-		return
-	}
-	view.mu.Lock()
-	view.repo = repo
-	view.mu.Unlock()
-}
-
-func getRuntimeRepositoryView(ctx context.Context) (models.Repository, bool) {
-	view, _ := ctx.Value(runtimeRepositoryViewContextKey{}).(*runtimeRepositoryView)
-	if view == nil {
-		return models.Repository{}, false
-	}
-	view.mu.RLock()
-	defer view.mu.RUnlock()
-	return view.repo, view.repo.ID != ""
-}
+type frozenFullSourceReadContextKey struct{}
 
 type followupFailure struct{ err error }
 type applicationWarning struct{ err error }
 type afterScriptFailure struct{ err error }
 type afterScriptSuppressed struct{ err error }
+
+// optionalScriptFailure is a before or after script that is not marked "must
+// succeed" and failed. Its step is already recorded as a warning; this value
+// carries the fact to the final classification so a backup that otherwise
+// completed ends as completed_with_issues instead of success. It never makes
+// a backup failed and never stops the native launch.
+type optionalScriptFailure struct{ err error }
 
 func (value followupFailure) Error() string       { return value.err.Error() }
 func (value followupFailure) Unwrap() error       { return value.err }
@@ -164,13 +146,121 @@ func (value afterScriptFailure) Error() string    { return value.err.Error() }
 func (value afterScriptFailure) Unwrap() error    { return value.err }
 func (value afterScriptSuppressed) Error() string { return value.err.Error() }
 func (value afterScriptSuppressed) Unwrap() error { return value.err }
+func (value optionalScriptFailure) Error() string { return value.err.Error() }
+func (value optionalScriptFailure) Unwrap() error { return value.err }
 
 func taskCanceledStage(taskErr, stageErr error) bool {
 	return (errors.Is(taskErr, context.Canceled) || errors.Is(taskErr, context.DeadlineExceeded)) &&
 		(errors.Is(stageErr, context.Canceled) || errors.Is(stageErr, context.DeadlineExceeded))
 }
 
+// classifyBackupRunStatus applies the backup outcome precedence:
+//
+//  1. a stage whose own result is the cancellation (the engine reports it
+//     interrupted, or it returned the context error) while taskErr shows
+//     that this run's cancel or shutdown ended it, or a suppressed or
+//     cancelled after script: interrupted. taskErr alone is not enough: a
+//     stage that failed for an unrelated reason before a late cancel
+//     arrived stays failed;
+//  2. native backup failed without saved-snapshot evidence, or a "must
+//     succeed" script failed: failed;
+//  3. saved snapshot with source-read failures, a retention or other
+//     follow-up failure after success, or a failed optional script:
+//     completed_with_issues;
+//  4. otherwise success.
+//
+// lockedFilesSkipped then narrows step 3 without changing the status.
+//
+// The engine reports any context error as interrupted, internal time limits
+// included (for example a sidecar read in the final writer check). Such a
+// result is interrupted only when taskErr shows that this task's own context
+// ended; otherwise it is a failure (or, for a follow-up, a follow-up failure)
+// and is notified like one.
+//
+// Optional script failures are taken out first and only ever lift a success
+// to completed_with_issues, so they cannot hide or outrank anything above.
 func classifyBackupRunStatus(runErr, taskErr error) string {
+	remaining, optionalFailed := withoutOptionalScriptFailures(runErr)
+	status := classifyBackupResult(remaining, taskErr)
+	if status == "success" && optionalFailed {
+		return "completed_with_issues"
+	}
+	return status
+}
+
+// lockedFilesSkipped returns the skipped files when a completed_with_issues
+// backup has nothing but recognized lock errors behind it: the run error
+// consists only of saved-partial source-read failures and the engine reader
+// found every one of their errors to be a lock held by another program (see
+// engines.BackupLockedFiles). A failed optional script, a follow-up or
+// bookkeeping failure, or any other error keeps the plain result, and nothing
+// that isn't completed_with_issues is touched.
+//
+// This is a qualifier on completed_with_issues, not a status of its own: the
+// snapshot is just as incomplete, so retention, health and statistics, the
+// dashboard ordering and everything else that matches the status treat it
+// exactly the same.
+func lockedFilesSkipped(runErr error, status string) []string {
+	if status != "completed_with_issues" {
+		return nil
+	}
+	if _, optionalFailed := withoutOptionalScriptFailures(runErr); optionalFailed {
+		return nil
+	}
+	return engines.BackupLockedFiles(runErr)
+}
+
+// withoutOptionalScriptFailures removes optionalScriptFailure values from the
+// joined run error and reports whether there were any. errors.Join trees are
+// walked; the original error is returned untouched when none is found.
+func withoutOptionalScriptFailures(err error) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		if wrapsOnlyOptionalScriptFailure(err) {
+			return nil, true
+		}
+		return err, false
+	}
+	var kept []error
+	found := false
+	for _, cause := range joined.Unwrap() {
+		rest, optional := withoutOptionalScriptFailures(cause)
+		found = found || optional
+		if rest != nil {
+			kept = append(kept, rest)
+		}
+	}
+	if !found {
+		return err, false
+	}
+	return errors.Join(kept...), true
+}
+
+// wrapsOnlyOptionalScriptFailure reports whether err is an
+// optionalScriptFailure, directly or behind single-cause wrappers such as
+// fmt.Errorf("...: %w", ...). It is errors.As with one deliberate limit: it
+// stops at a join. errors.As would look inside a join too, and dropping the
+// whole value then would also drop every other failure joined next to the
+// script, turning a failed backup into completed_with_issues. Joins are
+// handled by withoutOptionalScriptFailures, which removes only the script
+// failures and keeps the rest.
+func wrapsOnlyOptionalScriptFailure(err error) bool {
+	for err != nil {
+		if _, ok := err.(optionalScriptFailure); ok {
+			return true
+		}
+		if _, joined := err.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+func classifyBackupResult(runErr, taskErr error) string {
 	if runErr == nil {
 		// A cancellation accepted after every eligible child returned did not
 		// interrupt or suppress work and cannot rewrite established success.
@@ -190,7 +280,7 @@ func classifyBackupRunStatus(runErr, taskErr error) string {
 	var followup followupFailure
 	if errors.As(runErr, &followup) {
 		followupStatus, _, followupPreparationErr, _, _, followupKnown := engines.RequestedOperationOutcome(followup.err)
-		if followupKnown && followupStatus == engines.RequestedOperationInterrupted {
+		if followupKnown && followupStatus == engines.RequestedOperationInterrupted && taskErr != nil {
 			return "interrupted"
 		}
 		if followupKnown && followupStatus == engines.RequestedOperationNotStarted &&
@@ -206,12 +296,16 @@ func classifyBackupRunStatus(runErr, taskErr error) string {
 	if requestedKnown {
 		switch requestedStatus {
 		case engines.RequestedOperationInterrupted:
-			return "interrupted"
+			if taskErr != nil {
+				return "interrupted"
+			}
+			// An internal time limit stopped it, not a cancel or shutdown.
+			return "failed"
 		case engines.RequestedOperationNotStarted:
-			// Repository admission can preserve a cancellation cause while the
-			// requested native child truth remains correctly not-started. Require
-			// both causes so an unrelated preparation failure still wins a late
-			// cancellation race.
+			// Repository admission can keep a cancellation as the preparation cause
+			// while the requested native child is correctly reported as not started.
+			// Require both the task and the preparation error to show cancellation so
+			// an unrelated preparation failure still wins a late cancellation race.
 			if taskCanceledStage(taskErr, preparationErr) {
 				return "interrupted"
 			}
@@ -238,7 +332,6 @@ var startOperationStep = database.StartOperationStep
 var startMetadataMutationStep = database.StartMetadataMutationStep
 var finishOperationStep = database.FinishOperationStep
 var skipOperationStep = database.SkipOperationStep
-var closeOperationSessionScope = engines.CloseOperationSessionScope
 var getNotificationSettings = database.GetSettings
 
 func finishStep(ctx context.Context, db *sql.DB, kind, status, output string) error {
@@ -271,7 +364,7 @@ func runJobScriptStep(ctx context.Context, db *sql.DB, kind, path string, requir
 		result = "script was interrupted; output was discarded"
 	} else if err != nil {
 		status = "warning"
-		result = err.Error() + "; output was discarded; failure is result-neutral"
+		result = err.Error() + "; output was discarded; this script is optional"
 		if required {
 			status = "failed"
 			result = err.Error() + "; output was discarded; this script is required"
@@ -286,6 +379,12 @@ func runJobScriptStep(ctx context.Context, db *sql.DB, kind, path string, requir
 	if err != nil && required {
 		return fmt.Errorf("required %s failed", strings.ReplaceAll(kind, "_", " "))
 	}
+	if err != nil {
+		// An optional script failure does not stop the backup, but it is not
+		// ignored either: callers carry it to the final classification, which
+		// makes an otherwise completed backup completed_with_issues.
+		return optionalScriptFailure{fmt.Errorf("optional %s failed: %w", strings.ReplaceAll(kind, "_", " "), err)}
+	}
 	return nil
 }
 
@@ -299,7 +398,9 @@ func combinedRunnerOutput(output string, err error) string {
 	return output + "\n" + err.Error()
 }
 
-type OperationFinisher func(*sql.DB, string, string, string, string, string, time.Time) error
+// OperationFinisher persists a backup's terminal state: db, operation ID, job
+// ID, repository ID, status, issue kind, output and finish time.
+type OperationFinisher func(*sql.DB, string, string, string, string, string, string, time.Time) error
 
 func NewCoordinator(db *sql.DB, limit int) *Coordinator {
 	return NewCoordinatorWithRuntime(db, limit, operationruntime.New())
@@ -316,10 +417,6 @@ func NewCoordinatorWithRuntime(db *sql.DB, limit int, runtimeManager *operationr
 	c := &Coordinator{db: db, limit: limit, active: map[string]*targetTask{}, vaultActive: map[string]bool{}, vaultWaiting: map[string]bool{}, vaultReady: map[string]func(){}, wake: make(chan struct{}, 1), stop: make(chan struct{}), dispatchDone: make(chan struct{}), queuedDone: make(chan struct{}), ctx: ctx, cancel: cancel, runtime: runtimeManager}
 	go c.dispatch()
 	return c
-}
-
-func Configure(db *sql.DB, limit int) {
-	ConfigureWithRuntime(db, limit, operationruntime.New())
 }
 
 func ConfigureWithRuntime(db *sql.DB, limit int, runtimeManager *operationruntime.Manager) {
@@ -361,64 +458,21 @@ func ConfigureWithRuntime(db *sql.DB, limit int, runtimeManager *operationruntim
 	coordinatorMu.Unlock()
 }
 
-// CurrentLimit reports the live process-wide admission limit.
-func CurrentLimit(db *sql.DB) int {
-	return ensureCoordinator(db).Limit()
-}
-
-// AcquireBackgroundNativeAdmission lets bounded UI-triggered native helper
-// work share the existing process-wide backup admission authority. It creates
-// no independent limit or queue and is released before runner shutdown.
-func AcquireBackgroundNativeAdmission(ctx context.Context, db *sql.DB) (func(), error) {
+// LimitForTests reports the backup concurrency limit of the running
+// coordinator for db, so tests outside this package can check that a settings
+// change reached it.
+func LimitForTests(db *sql.DB) (int, error) {
 	c, err := coordinatorForAdmission(db)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, ErrAdmissionClosed
-		}
-		// Give every backup that can run now the first claim on available
-		// capacity. A vault-blocked backup remains queued, so background work
-		// holding that vault can finish instead of deadlocking with it.
-		c.dispatchRunnableLocked()
-		if !c.admitting && c.running < c.limit && !c.hasUnresolvedVaultLocked() {
-			c.running++
-			c.workWG.Add(1)
-			released := false
-			c.mu.Unlock()
-			return func() {
-				c.mu.Lock()
-				if !released {
-					released = true
-					c.running--
-					c.workWG.Done()
-				}
-				c.mu.Unlock()
-				c.signal()
-			}, nil
-		}
-		c.mu.Unlock()
-		timer := time.NewTimer(25 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.limit, nil
 }
 
-// Shutdown stops admission for the configured database and drains all owned
-// runner and notification work before the database is closed.
-func Shutdown(db *sql.DB) error {
-	return ShutdownContext(context.Background(), db)
-}
-
+// ShutdownContext stops admission for the configured database and drains all
+// owned runner and notification work before the database is closed.
 func ShutdownContext(ctx context.Context, db *sql.DB) error {
 	coordinatorTransitionMu.Lock()
 	defer coordinatorTransitionMu.Unlock()
@@ -434,12 +488,6 @@ func ShutdownContext(ctx context.Context, db *sql.DB) error {
 		return nil
 	}
 	return current.Shutdown(ctx)
-}
-
-func ensureCoordinator(db *sql.DB) *Coordinator {
-	coordinatorTransitionMu.Lock()
-	defer coordinatorTransitionMu.Unlock()
-	return ensureCoordinatorLocked(db)
 }
 
 func ensureCoordinatorLocked(db *sql.DB) *Coordinator {
@@ -505,12 +553,6 @@ func (c *Coordinator) SetLimit(limit int) {
 	c.limit = limit
 	c.mu.Unlock()
 	c.signal()
-}
-
-func (c *Coordinator) Limit() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.limit
 }
 
 func (c *Coordinator) signal() {
@@ -719,25 +761,25 @@ func (c *Coordinator) finalizeQueued(queued []*targetTask) {
 
 func targetKey(jobID, repositoryID string) string { return jobID + "\x00" + repositoryID }
 
-func (c *Coordinator) prepareTaskRuntime(task *targetTask) error {
+func (c *Coordinator) prepareTaskRuntime(task *targetTask) {
 	task.ctx, task.cancel = context.WithCancel(c.ctx)
-	return nil
 }
 
 func (c *Coordinator) registerTaskRuntimeLocked(task *targetTask) error {
 	if err := c.runtime.Register(task.operationID, func() error {
-		// Publish cancellation intent before waiting for the coordinator mutex.
-		// Dispatch can therefore quarantine a request that arrived at the narrow
-		// registration/publication release boundary even if it wins the mutex.
+		// Record the cancel request before waiting for the coordinator mutex, so
+		// dispatch can quarantine a task canceled between runtime registration and
+		// queue publication even if dispatch takes the mutex first.
 		task.cancelRequested.Store(true)
 		return c.cancelTask(task)
 	}); err != nil {
 		task.cancel()
 		return err
 	}
-	// Test synchronization at this exact release-order boundary is intentionally
-	// narrow: the coordinator mutex is still held, so cancellation cannot
-	// mistake an unpublished queued task for an activated one.
+	// Deliberately narrow test hook between runtime registration and queue
+	// publication. The
+	// coordinator mutex is still held, so a cancel issued here cannot mistake
+	// the not-yet-queued task for an activated one.
 	afterTaskRuntimeRegistration(task)
 	return nil
 }
@@ -752,8 +794,9 @@ func (c *Coordinator) cancelTask(task *targetTask) error {
 		}
 	}
 	if queuedIndex < 0 {
-		// Activation already owns the operation. The same pre-dispatch context
-		// now closes final launch admission or terminates the running process tree.
+		// The task has left the queue, so activation owns the operation. Canceling
+		// the same pre-dispatch context either makes the final pre-launch check
+		// refuse the launch or terminates the running process tree.
 		task.cancel()
 		c.mu.Unlock()
 		return nil
@@ -804,81 +847,6 @@ func (c *Coordinator) cancelTask(task *targetTask) error {
 	return nil
 }
 
-func (c *Coordinator) enqueue(db *sql.DB, job models.BackupJob, target models.BackupJobTarget) (string, error) {
-	c.admitMu.Lock()
-	defer c.admitMu.Unlock()
-	return c.enqueueLocked(db, job, target)
-}
-
-func (c *Coordinator) enqueueLocked(db *sql.DB, job models.BackupJob, target models.BackupJobTarget) (string, error) {
-	key := targetKey(job.ID, target.RepositoryID)
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return "", ErrAdmissionClosed
-	}
-	if _, busy := c.active[key]; busy {
-		c.mu.Unlock()
-		return "", ErrAlreadyRunning
-	}
-	c.mu.Unlock()
-	repo, repoErr := database.GetRepository(db, target.RepositoryID)
-	if repoErr != nil {
-		return "", repoErr
-	}
-	operationID, err := database.QueueBackupOperation(db,
-		"Backup: "+job.Name+" → "+target.RepositoryName, job.ID, target.RepositoryID, time.Now())
-	if err != nil {
-		if errors.Is(err, database.ErrTargetRunActive) {
-			return "", ErrAlreadyRunning
-		}
-		return "", err
-	}
-	// The managed vault UUID is the one process-local serialization identity.
-	// Physical storage facts remain admission and availability evidence only;
-	// using them here would split one vault after an explicit path reconnect.
-	vaultID := repo.ID
-	task := &targetTask{
-		db: db, job: job, target: target, repository: repo,
-		operationID: operationID, vaultID: vaultID,
-	}
-	if err := c.prepareTaskRuntime(task); err != nil {
-		_ = persistTerminalState(task, "interrupted", "Backup runtime registration failed before dispatch.", time.Now())
-		return "", err
-	}
-	task.resumeMetadata = metadata.DeferRepositorySyncForBackup(db, repo)
-	c.mu.Lock()
-	// Registration and queue publication share the coordinator mutex. A cancel
-	// callback that becomes visible here cannot observe the task as neither
-	// queued nor activated and incorrectly accept cancellation without the
-	// durable queued-interruption transaction.
-	if err := c.registerTaskRuntimeLocked(task); err != nil {
-		c.mu.Unlock()
-		task.resumeMetadata()
-		task.resumeMetadata = nil
-		_ = persistTerminalState(task, "interrupted", "Backup runtime registration failed before dispatch.", time.Now())
-		return "", err
-	}
-	// The database transaction is the final duplicate guard. This second
-	// check protects against a concurrent enqueue in this process.
-	if _, busy := c.active[key]; busy {
-		c.mu.Unlock()
-		task.resumeMetadata()
-		task.resumeMetadata = nil
-		if finishErr := persistTerminalState(task, "interrupted", "Duplicate target admission was rejected.", time.Now()); finishErr != nil {
-			log.Printf("duplicate backup marker requires startup reconciliation: %v", finishErr)
-		}
-		c.runtime.CloseCancel(task.operationID)
-		c.runtime.Remove(task.operationID)
-		return "", ErrAlreadyRunning
-	}
-	c.active[key] = task
-	c.queue = append(c.queue, task)
-	c.mu.Unlock()
-	c.signal()
-	return operationID, nil
-}
-
 // AdmitPersistedOperations runs one atomic database admission while runner
 // admission is open, then activates the already-created queued operations in
 // memory without inserting a second database operation.
@@ -893,6 +861,13 @@ func AdmitPersistedOperations(
 	if err != nil {
 		return nil, err
 	}
+	return c.admitPersisted(db, admit)
+}
+
+func (c *Coordinator) admitPersisted(
+	db *sql.DB,
+	admit func() ([]database.TargetAdmissionResult, error),
+) ([]database.TargetAdmissionResult, error) {
 	c.admitMu.Lock()
 	defer c.admitMu.Unlock()
 	c.mu.Lock()
@@ -994,18 +969,25 @@ func (c *Coordinator) activatePersistedLocked(
 		if err != nil {
 			return err
 		}
+		// Frozen with the source location: an admitted run keeps the re-read
+		// decision it was admitted with. Update job source is refused while any
+		// target of the job is queued or running, so the flag cannot change
+		// underneath this run.
+		fullSourceRead, err := database.JobTargetFullSourceReadPending(db, job.ID, target.RepositoryID)
+		if err != nil {
+			return err
+		}
 		vaultID := repo.ID
 		tasks = append(tasks, &targetTask{
 			db: db, job: job, target: target, repository: repo,
 			operationID: operation.ID, vaultID: vaultID, sourcePath: sourcePath,
+			fullSourceRead:      fullSourceRead,
 			sourceFailureReason: sourceFailures[operation.ID],
 			targetFailureReason: targetFailures[operation.ID],
 		})
 	}
 	for _, task := range tasks {
-		if err := c.prepareTaskRuntime(task); err != nil {
-			return err
-		}
+		c.prepareTaskRuntime(task)
 	}
 
 	c.mu.Lock()
@@ -1098,12 +1080,15 @@ func (c *Coordinator) run(task *targetTask) {
 	operationCtx = command.ContextWithLiveOutput(operationCtx, func(stream, text string) {
 		c.runtime.Append(task.operationID, stream, text)
 	})
-	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic string, stdout, stderr io.Reader) bool {
-		return operationlog.StageNativeOutput(task.operationID, engine, kind, status, diagnostic, stdout, stderr) == nil
+	operationCtx = command.ContextWithCapturedOutputPublisher(operationCtx, func(engine, kind, status, diagnostic, stdoutPath, stderrPath string) bool {
+		return operationlog.StageNativeOutput(task.operationID, engine, kind, status, diagnostic, stdoutPath, stderrPath) == nil
 	})
-	operationCtx = context.WithValue(operationCtx, runtimeRepositoryViewContextKey{}, &runtimeRepositoryView{})
 	if task.sourcePath != "" {
+		// The re-read flag travels with the frozen location, so a run without a
+		// location reads both at execution time instead of receiving a zero
+		// value that looks frozen.
 		operationCtx = context.WithValue(operationCtx, frozenSourcePathContextKey{}, task.sourcePath)
+		operationCtx = context.WithValue(operationCtx, frozenFullSourceReadContextKey{}, task.fullSourceRead)
 	}
 	if task.sourceFailureReason != "" {
 		operationCtx = context.WithValue(operationCtx, sourceFailureReasonContextKey{}, task.sourceFailureReason)
@@ -1111,12 +1096,18 @@ func (c *Coordinator) run(task *targetTask) {
 	if task.targetFailureReason != "" {
 		operationCtx = context.WithValue(operationCtx, targetFailureReasonContextKey{}, task.targetFailureReason)
 	}
+	operationCtx, storageFull := engines.ContextWithStorageFullReport(operationCtx)
 	executorMu.RLock()
 	currentExecutor := executor
 	executorMu.RUnlock()
 	var output string
 	var runErr error
 	output, runErr = currentExecutor(operationCtx, task.db, task.job, task.target)
+	// Whether this task's own context had ended is read once, as the executor
+	// returns. A cancel or shutdown that lands later, during the bookkeeping
+	// below, stopped nothing, so it must not turn the reported result into
+	// interrupted, and both classifications below must see the same answer.
+	taskErr := task.ctx.Err()
 	afterTargetExecutorReturn(task)
 	requestedStatus, requestedStarted, _, _, _, requestedKnown := engines.RequestedOperationOutcome(runErr)
 	preNative := !requestedKnown || requestedStatus == engines.RequestedOperationNotStarted || !requestedStarted
@@ -1124,9 +1115,10 @@ func (c *Coordinator) run(task *targetTask) {
 	var repositoryUnavailable *storageavailability.RepositoryStorageUnavailableError
 	sourceMissing := preNative && errors.As(runErr, &sourceUnavailable)
 	destinationMissing := preNative && errors.As(runErr, &repositoryUnavailable)
+	pausedOccurrence := false
 	if sourceMissing || destinationMissing {
-		// Only typed, conclusively pre-native availability outcomes restore a
-		// scheduled occurrence. Source and destination observations retain their
+		// Only typed availability errors raised before native work started restore
+		// a scheduled occurrence. Source and destination observations keep their
 		// own persisted reason/timestamp columns; native failures never replay.
 		reason := database.AvailabilityReasonStorageMissing
 		if sourceMissing && sourceUnavailable.ReasonCode != "" {
@@ -1134,14 +1126,51 @@ func (c *Coordinator) run(task *targetTask) {
 		} else if destinationMissing && repositoryUnavailable.ReasonCode != "" {
 			reason = repositoryUnavailable.ReasonCode
 		}
-		var restoreErr error
-		if sourceMissing {
-			restoreErr = database.RestorePreNativeSourceUnavailable(task.db, task.operationID, reason, time.Now().UTC())
-		} else {
-			restoreErr = database.RestorePreNativeUnavailable(task.db, task.operationID, reason, time.Now().UTC())
+		// Only filesystem storage pauses silently. Sources are always
+		// filesystem paths; when a cloud vault is unavailable at admission
+		// (a timeout or missing repository reported by native validation),
+		// the occurrence is restored for catch-up and the failure is still
+		// notified. Do not widen silent pausing to every connector: cloud
+		// outages are deliberately outside the storage pause rules.
+		filesystemPause := sourceMissing || task.repository.Connector == "fs"
+		escalated := false
+		if filesystemPause {
+			// A filesystem pause found only here (the preliminary probe passed)
+			// never reaches the scheduler's 30-day check, so the same 30-day
+			// rule is applied to it directly. See
+			// database.ConsumeOverdueUnavailableOccurrence.
+			var escalateErr error
+			escalated, escalateErr = database.ConsumeOverdueUnavailableOccurrence(
+				task.db, task.operationID, reason, time.Now().UTC(), sourceMissing)
+			if escalateErr != nil {
+				escalated = false
+				runErr = errors.Join(runErr, fmt.Errorf("check unavailable catch-up occurrence age: %w", escalateErr))
+			}
 		}
-		if restoreErr != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("restore unavailable catch-up occurrence: %w", restoreErr))
+		if escalated {
+			// This attempt becomes the one 30-day issue: it keeps its failed
+			// status, and the result text and notification use the 30-day
+			// notice (prepareBackupNotification reads these reasons).
+			if sourceMissing {
+				task.sourceFailureReason = database.AvailabilityReasonUnavailableTooLong
+			} else {
+				task.targetFailureReason = database.AvailabilityReasonUnavailableTooLong
+			}
+			output = strings.TrimSpace(unavailableTooLongMessage(task.db, sourceMissing, task.job.Name,
+				task.target.RepositoryName) + "\n" + output)
+		} else {
+			scheduledOccurrence, eligibleErr := database.ScheduledOccurrenceEligible(task.db, task.operationID)
+			var restoreErr error
+			if sourceMissing {
+				restoreErr = database.RestorePreNativeSourceUnavailable(task.db, task.operationID, reason, time.Now().UTC())
+			} else {
+				restoreErr = database.RestorePreNativeUnavailable(task.db, task.operationID, reason, time.Now().UTC())
+			}
+			if restoreErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("restore unavailable catch-up occurrence: %w", restoreErr))
+			} else if filesystemPause && eligibleErr == nil && scheduledOccurrence {
+				pausedOccurrence = true
+			}
 		}
 	} else if consumeErr := database.ConsumeScheduledBackupOccurrence(task.db, task.operationID); consumeErr != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("close scheduled occurrence restoration: %w", consumeErr))
@@ -1149,53 +1178,66 @@ func (c *Coordinator) run(task *targetTask) {
 	// No cancelable child may launch after the executor returns. Cleanup and
 	// final persistence below intentionally do not use the user-canceled context.
 	c.runtime.CloseCancel(task.operationID)
-	// The durable terminal value records this operation's conclusive blocked
-	// result; it is not a persisted vault-health flag.
-	reconnectBlocked := (vaultprofile.IsReconnectRequired(runErr) || engines.IsReconnectRequired(runErr))
-	if requestedStatus, _, _, _, _, known := engines.RequestedOperationOutcome(runErr); known &&
-		requestedStatus != engines.RequestedOperationNotStarted {
-		reconnectBlocked = false
-	}
-	reconnectBlocked = reconnectBlocked && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded)
+	// A conclusive reconnect error found before native work started makes this
+	// backup reconnect_required. The vault's saved reconnect state is updated
+	// from that status below (vaultreconnect.RecordOperationResult).
+	reconnectBlocked := vaultreconnect.Conclusive(runErr)
+	// The status comes from what the executor reported, never from whether
+	// the coordinator is shutting down now. Shutdown cancels task.ctx, so any
+	// child it stopped or after script it suppressed is already in runErr as
+	// a cancellation and classifies as interrupted. A shutdown that arrives
+	// after the native work returned (during result and cache bookkeeping, or
+	// right here) has nothing left to interrupt: the backup keeps its native
+	// result, so a saved snapshot stays success and a native failure stays
+	// failed, and its notification says so. Don't reintroduce a c.ctx check
+	// here.
 	status := "success"
-	if c.ctx.Err() != nil {
-		status = "interrupted"
-		if runErr == nil {
-			runErr = c.ctx.Err()
-		}
-	}
 	if runErr != nil {
-		if status != "interrupted" {
-			status = classifyBackupRunStatus(runErr, task.ctx.Err())
-		}
+		status = classifyBackupRunStatus(runErr, taskErr)
 		if strings.TrimSpace(output) == "" {
 			output = runErr.Error()
 		} else {
 			output += "\n" + runErr.Error()
 		}
 	}
-	if closeErr := closeOperationSessionScope(operationCtx); closeErr != nil {
-		// A failed engine cleanup can be transient (for example, a short-lived
-		// Windows file handle). Retry once while preserving the first
-		// error in the durable operation result.
-		closeErr = errors.Join(closeErr, closeOperationSessionScope(operationCtx))
-		if c.ctx.Err() != nil {
-			status = "interrupted"
-		} else if status == "success" {
-			status = "completed_with_issues"
-		} else if engines.IsBackupSourceReadFailure(runErr) {
-			// Saved source-read failures qualify only in isolation. Cleanup is
-			// independent orchestration failure, not native backup success.
-			status = classifyBackupRunStatus(errors.Join(runErr, closeErr), task.ctx.Err())
-		}
-		runErr = errors.Join(runErr, closeErr)
-		output = strings.TrimSpace(output + "\nEngine operation cleanup failed: " + closeErr.Error())
-	}
 	if status == "failed" && reconnectBlocked {
 		status = "reconnect_required"
+		// Every run that finds the vault needs reconnecting says so in its own
+		// result and notification, in the same words as the vault card.
+		output = strings.TrimSpace(vaultreconnect.Message(task.db, task.target.RepositoryName) + "\n" + output)
 	}
+	if status == "failed" && (storageFull() || engines.BackupPreparationStorageFull(task.repository, runErr)) {
+		// The native backup, or the engine's own repository check before it,
+		// reported that the vault ran out of space (see
+		// engines.reportBackupStorageFull and BackupPreparationStorageFull for
+		// what is read). This only adds a plain explanation under the native
+		// output: the status, the notification, retries and the schedule stay
+		// exactly as they are, and the next scheduled run still tries again,
+		// because Replicaro can't know when space comes back. The note stays
+		// in English like the rest of the log.
+		output = strings.TrimSpace(output + "\n" + locale.Text(models.LanguageEnglish, engines.OutOfSpaceNoteKey, nil))
+	}
+	if status == "failed" && !pausedOccurrence {
+		// Only an Any Rclone Remote vault gets a line here: the result of
+		// checking its rclone settings once after the failure. A paused
+		// scheduled occurrence is left alone: for such a vault only a missing
+		// source pauses it, which says nothing about the vault, and pauses
+		// stay silent.
+		if note := vaultreconnect.CheckRcloneRemoteAfterFailure(task.db, task.target.RepositoryID, "backup"); note != "" {
+			output = strings.TrimSpace(output + "\n" + note)
+		}
+	}
+	task.lockedFiles = lockedFilesSkipped(runErr, status)
 	finished := time.Now()
-	dispatchNotification := prepareBackupNotification(task, status)
+	var dispatchNotification func()
+	if !pausedOccurrence {
+		// A scheduled occurrence that was put back because filesystem storage
+		// became unavailable after it was queued (for example the vault
+		// admission deadline on a hung share) is a pause, and pauses send no
+		// warning or error notification. The operation row still records the
+		// attempt. Manual runs and cloud vaults always notify.
+		dispatchNotification = prepareBackupNotification(task, status)
+	}
 	terminalPersisted := true
 	if persistErr := persistTerminalState(task, status, output, finished); persistErr != nil {
 		terminalPersisted = false
@@ -1204,6 +1246,13 @@ func (c *Coordinator) run(task *targetTask) {
 		output = strings.TrimSpace(output + "\n" + warning)
 		log.Printf("backup terminal-state reconciliation required: %v", persistErr)
 		_ = database.LogError(task.db, "Backup terminal-state reconciliation required: "+persistErr.Error())
+	}
+	if terminalPersisted {
+		// Still under the vault lock (released by c.release below), so a
+		// reconnect cannot commit between this result and its bookkeeping.
+		// When this backup is what sets the state it sends no second
+		// notification; its own one above carries the same message.
+		vaultreconnect.RecordOperationResult(task.db, task.target.RepositoryID, "backup", status, runErr)
 	}
 	switch status {
 	case "success":
@@ -1230,37 +1279,25 @@ func (c *Coordinator) run(task *targetTask) {
 // SQLite contention; persistent storage failures retry at a slower cadence.
 // A restart remains the final recovery path and marks the row interrupted.
 func persistTerminalState(task *targetTask, status, output string, finished time.Time) error {
-	return persistTerminalStateContext(context.Background(), task, status, output, finished)
-}
-
-func persistTerminalStateContext(ctx context.Context, task *targetTask, status, output string, finished time.Time) error {
-	const maxAttempts = 6
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	attempt := 0
+	return operationruntime.RetryWrite(context.Background(), 6, 50*time.Millisecond, func() error {
+		attempt++
 		finisherMu.RLock()
 		currentFinisher := finisher
 		finisherMu.RUnlock()
-		err := currentFinisher(task.db, task.operationID, task.job.ID, task.target.RepositoryID, status, output, finished)
-		if err == nil {
-			return nil
+		err := currentFinisher(task.db, task.operationID, task.job.ID, task.target.RepositoryID, status, backupIssueKind(task, status), output, finished)
+		if err != nil {
+			log.Printf("could not persist terminal backup state (attempt %d): %v", attempt, err)
 		}
-		log.Printf("could not persist terminal backup state (attempt %d): %v", attempt, err)
-		if attempt == maxAttempts {
-			return err
-		}
-		timer := time.NewTimer(time.Duration(attempt) * 50 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return err
+	}, nil)
+}
+
+func backupIssueKind(task *targetTask, status string) string {
+	if status == "completed_with_issues" && len(task.lockedFiles) > 0 {
+		return models.OperationIssueLockedFiles
 	}
-	return nil
+	return ""
 }
 
 func (c *Coordinator) release(task *targetTask) {
@@ -1283,226 +1320,65 @@ func (c *Coordinator) release(task *targetTask) {
 }
 
 func prepareBackupNotification(task *targetTask, status string) func() {
-	settings, err := getNotificationSettings(task.db)
-	if err != nil {
-		_ = database.SkipOperationStep(task.db, task.operationID, "application", "notification",
-			"notification settings unavailable: "+err.Error(), time.Now())
-		return nil
-	}
-	success := status == "success"
-	native, webhook := settings.NotificationChannels(success)
-	title := "Backup: " + task.job.Name + " → " + task.target.RepositoryName
-	if !native && !webhook {
-		return nil
-	}
-	nativeBackupSucceeded := status == "success"
-	if steps, stepsErr := database.ListOperationSteps(task.db, task.operationID); stepsErr == nil {
-		for _, step := range steps {
-			if step.Domain == "native" && step.Kind == "backup" {
-				nativeBackupSucceeded = step.Status == "succeeded"
-				break
-			}
-		}
-	}
-	event := notifications.Event{
-		Event: "backup", Status: status, Success: success,
-		NativeBackupSucceeded: nativeBackupSucceeded,
-		Title:                 title, OperationID: task.operationID,
-		TaskKey: "notifications.task.backupTarget", TaskName: task.job.Name, TaskTarget: task.target.RepositoryName,
-		Locale: locale.Effective(settings.Language),
-	}
-	if !notifications.ShouldNotify(event) {
-		return nil
-	}
-	if err := database.StartOperationStep(task.db, task.operationID, "application", "notification", time.Now()); err != nil {
-		_ = database.LogError(task.db, "Notification step could not be registered: "+err.Error())
-		return nil
-	}
-	return func() {
-		notifications.Dispatch(settings.WebhookURL, native, webhook, event, func(err error) {
-			stepStatus, result := "succeeded", "notification delivery completed"
-			if err != nil {
-				stepStatus, result = "warning", err.Error()
-				_ = database.LogError(task.db, "Notification failed: "+err.Error())
-			}
-			_ = database.FinishOperationStep(task.db, task.operationID, "notification", stepStatus, result, time.Now())
-		})
-	}
-}
-
-func WaitForNotifications() { _ = notifications.Wait(context.Background()) }
-
-func EnqueueTarget(db *sql.DB, jobID, repositoryID string) (string, error) {
-	job, err := database.GetJob(db, jobID)
-	if err != nil {
-		return "", err
-	}
-	c, err := coordinatorForAdmission(db)
-	if err != nil {
-		return "", err
-	}
-	for _, target := range job.Targets {
-		if target.RepositoryID == repositoryID {
-			return c.enqueue(db, job, target)
-		}
-	}
-	return "", sql.ErrNoRows
-}
-
-// EnqueueAll admits every target from one settings snapshot. A duplicate in
-// any pair returns ErrAlreadyRunning so the API can report a conflict.
-func EnqueueAll(db *sql.DB, jobID string) (int, error) {
-	job, err := database.GetJob(db, jobID)
-	if err != nil {
-		return 0, err
-	}
-	c, err := coordinatorForAdmission(db)
-	if err != nil {
-		return 0, err
-	}
-	return enqueueAllSnapshot(c, db, job, false)
-}
-
-type ScheduledResult struct {
-	Accepted int
-	Blocked  int
-	Error    error
-}
-
-func EnqueueScheduled(db *sql.DB, job models.BackupJob) ScheduledResult {
-	current, err := database.GetJob(db, job.ID)
-	if err != nil {
-		return ScheduledResult{Error: err}
-	}
-	c, err := coordinatorForAdmission(db)
-	if err != nil {
-		return ScheduledResult{Error: err}
-	}
-	accepted, err := enqueueAllSnapshot(c, db, current, true)
-	result := ScheduledResult{Accepted: accepted}
-	if errors.Is(err, ErrAlreadyRunning) {
-		result.Blocked = len(current.Targets) - accepted
-	} else {
-		result.Error = err
-	}
-	return result
-}
-
-func enqueueAllSnapshot(c *Coordinator, db *sql.DB, job models.BackupJob, requireDue bool) (int, error) {
-	if len(job.Targets) == 0 {
-		return 0, database.ErrInvalidTargets
-	}
-	c.admitMu.Lock()
-	c.mu.Lock()
-	c.admitting = true
-	defer func() {
-		c.mu.Lock()
-		c.admitting = false
-		c.mu.Unlock()
-		c.admitMu.Unlock()
-		c.signal()
-	}()
-	for _, target := range job.Targets {
-		if _, busy := c.active[targetKey(job.ID, target.RepositoryID)]; busy {
-			c.mu.Unlock()
-			return 0, ErrAlreadyRunning
-		}
-	}
-	c.mu.Unlock()
-	vaultIDs := make([]string, 0, len(job.Targets))
-	repositories := make([]models.Repository, 0, len(job.Targets))
-	for _, target := range job.Targets {
-		repo, repoErr := database.GetRepository(db, target.RepositoryID)
-		if repoErr != nil {
-			return 0, repoErr
-		}
-		vaultID := repo.ID
-		vaultIDs = append(vaultIDs, vaultID)
-		repositories = append(repositories, repo)
-	}
-	queuedAt := time.Now()
-	requests := make([]database.BackupOperationRequest, 0, len(job.Targets))
-	for _, target := range job.Targets {
-		requests = append(requests, database.BackupOperationRequest{
-			Title: "Backup: " + job.Name + " → " + target.RepositoryName,
-			JobID: job.ID, RepositoryID: target.RepositoryID, Engine: target.Engine,
-		})
-	}
-	operationIDs, err := database.QueueBackupOperations(db, requests, queuedAt, job.Schedule, true,
-		&database.BackupTriggerExpectation{Job: job, RequireDue: requireDue})
-	if errors.Is(err, database.ErrTargetRunActive) {
-		return 0, ErrAlreadyRunning
-	}
-	if err != nil {
-		return 0, err
-	}
-	tasks := make([]*targetTask, 0, len(job.Targets))
-	for index, target := range job.Targets {
-		task := &targetTask{
-			db: db, job: job, target: target, repository: repositories[index],
-			operationID: operationIDs[index], vaultID: vaultIDs[index],
-			resumeMetadata: metadata.DeferRepositorySyncForBackup(db, repositories[index]),
-		}
-		if err := c.prepareTaskRuntime(task); err != nil {
-			for _, prepared := range tasks {
-				prepared.cancel()
-				if prepared.resumeMetadata != nil {
-					prepared.resumeMetadata()
-					prepared.resumeMetadata = nil
-				}
-				c.runtime.CloseCancel(prepared.operationID)
-				c.runtime.Remove(prepared.operationID)
-			}
-			if task.resumeMetadata != nil {
-				task.resumeMetadata()
-				task.resumeMetadata = nil
-			}
-			return 0, err
-		}
-		tasks = append(tasks, task)
-	}
-	c.mu.Lock()
-	registered := make([]*targetTask, 0, len(tasks))
-	for _, task := range tasks {
-		if err := c.registerTaskRuntimeLocked(task); err != nil {
-			for _, prepared := range registered {
-				prepared.cancel()
-				c.runtime.CloseCancel(prepared.operationID)
-				c.runtime.Remove(prepared.operationID)
-			}
-			c.mu.Unlock()
-			for _, prepared := range tasks {
-				prepared.cancel()
-				if prepared.resumeMetadata != nil {
-					prepared.resumeMetadata()
-					prepared.resumeMetadata = nil
+	return notifications.PrepareOperation(task.db, task.operationID, status, getNotificationSettings, func(settings models.Settings) notifications.Event {
+		success := status == "success"
+		title := "Backup: " + task.job.Name + " → " + task.target.RepositoryName
+		nativeBackupSucceeded := status == "success"
+		if steps, stepsErr := database.ListOperationSteps(task.db, task.operationID); stepsErr == nil {
+			for _, step := range steps {
+				if step.Domain == "native" && step.Kind == "backup" {
+					nativeBackupSucceeded = step.Status == "succeeded"
+					break
 				}
 			}
-			return 0, err
 		}
-		registered = append(registered, task)
-	}
-	for _, task := range tasks {
-		c.active[targetKey(job.ID, task.target.RepositoryID)] = task
-		c.queue = append(c.queue, task)
-	}
-	c.mu.Unlock()
-	return len(job.Targets), nil
+		event := notifications.Event{
+			Event: "backup", Status: status, Success: success,
+			NativeBackupSucceeded: nativeBackupSucceeded,
+			Title:                 title, OperationID: task.operationID,
+			TaskKey: "notifications.task.backupTarget", TaskName: task.job.Name, TaskTarget: task.target.RepositoryName,
+			Locale: locale.Effective(settings.Language),
+		}
+		if status == "failed" && (task.sourceFailureReason == database.AvailabilityReasonUnavailableTooLong ||
+			task.targetFailureReason == database.AvailabilityReasonUnavailableTooLong) {
+			event.MessageKey, event.MessageValues = unavailableTooLongText(
+				task.sourceFailureReason != "", task.job.Name, task.target.RepositoryName)
+		}
+		if issueKind := backupIssueKind(task, status); issueKind != "" {
+			// Same status, channels and switches as completed with issues, with
+			// its own title (chosen from IssueKind) and this message.
+			event.IssueKind = issueKind
+			event.MessageKey = "notifications.message.backupLockedFilesSkipped"
+			event.MessageValues = map[string]string{"count": strconv.Itoa(len(task.lockedFiles))}
+		}
+		if status == "reconnect_required" {
+			event.MessageKey = vaultreconnect.MessageKey
+			event.MessageValues = map[string]string{"vaultName": task.target.RepositoryName}
+		}
+		return event
+	})
 }
 
-// Start is retained as the API-facing name for Run All.
-func Start(db *sql.DB, jobID string) error {
-	_, err := EnqueueAll(db, jobID)
-	return err
+// unavailableTooLongError is the localized 30-day notice used as the
+// failed operation's result text.
+type unavailableTooLongError struct{ message string }
+
+func (err unavailableTooLongError) Error() string { return err.message }
+
+func unavailableTooLongText(source bool, jobName, vaultName string) (string, map[string]string) {
+	if source {
+		return "notifications.message.sourceUnavailable30Days", map[string]string{"jobName": jobName}
+	}
+	return "notifications.message.vaultUnavailable30Days", map[string]string{"jobName": jobName, "vaultName": vaultName}
 }
 
-// RunSync now means scheduler submission. Scheduling never waits for a target
-// to finish, which keeps the scheduler ticker responsive.
-func RunSync(db *sql.DB, job models.BackupJob) {
-	result := EnqueueScheduled(db, job)
-	if result.Error != nil {
-		log.Println("scheduled backup enqueue:", result.Error)
+func unavailableTooLongMessage(db *sql.DB, source bool, jobName, vaultName string) string {
+	language := ""
+	if settings, err := getNotificationSettings(db); err == nil {
+		language = settings.Language
 	}
+	key, values := unavailableTooLongText(source, jobName, vaultName)
+	return locale.Text(locale.Effective(language), key, values)
 }
 
 func RunningJobs() map[string]string {
@@ -1519,15 +1395,6 @@ func RunningJobs() map[string]string {
 		out[key] = task.operationID
 	}
 	return out
-}
-
-func IsRunning(jobID string) bool {
-	for key := range RunningJobs() {
-		if strings.HasPrefix(key, jobID+"\x00") {
-			return true
-		}
-	}
-	return false
 }
 
 func ActiveTargetStatuses(db *sql.DB) ([]models.BackupTargetStatus, error) {
@@ -1574,7 +1441,7 @@ func SetOperationFinisherForTests(next OperationFinisher) func() {
 	finisherMu.Lock()
 	previous := finisher
 	if next == nil {
-		finisher = database.FinishBackupOperation
+		finisher = database.FinishBackupOperationWithIssueKind
 	} else {
 		finisher = next
 	}
@@ -1620,18 +1487,31 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 	if err != nil {
 		return failAdmission(err)
 	}
-	if reason, _ := ctx.Value(sourceFailureReasonContextKey{}).(string); reason != "" {
-		// The shared preliminary source resolution already conclusively failed.
-		// Report it through the ordinary operation before destination admission,
-		// hooks, or any native process can mask or follow that source failure.
+	sourceReason, _ := ctx.Value(sourceFailureReasonContextKey{}).(string)
+	targetReason, _ := ctx.Value(targetFailureReasonContextKey{}).(string)
+	if sourceReason == database.AvailabilityReasonUnavailableTooLong || targetReason == database.AvailabilityReasonUnavailableTooLong {
+		// The one failed operation for storage that stayed unavailable for
+		// database.UnavailableIssueAfter. It goes through the ordinary operation
+		// path on purpose (operation log, Issues list, failure notification)
+		// and stops here, before destination admission, hooks, or native work.
+		return failAdmission(&engines.RequestedOperationFailure{
+			Engine: repo.Engine, Status: engines.RequestedOperationNotStarted,
+			PreparationError: unavailableTooLongError{message: unavailableTooLongMessage(
+				db, sourceReason != "", job.Name, repo.Name)},
+		})
+	}
+	if reason := sourceReason; reason != "" {
+		// The shared preliminary source check already failed. Record it as a normal
+		// failed operation before destination admission, hooks, or any native
+		// process can hide or follow that source failure.
 		return failAdmission(&engines.RequestedOperationFailure{
 			Engine: repo.Engine, Status: engines.RequestedOperationNotStarted,
 			PreparationError: &storageavailability.SourceStorageFailureError{ReasonCode: reason},
 		})
 	}
-	if reason, _ := ctx.Value(targetFailureReasonContextKey{}).(string); reason != "" {
-		// As with source failures, inconsistent preliminary destination evidence is
-		// conclusive for this attempt and must fail before scripts or native work.
+	if reason := targetReason; reason != "" {
+		// Likewise, an inconsistent preliminary destination observation must fail
+		// this attempt before scripts or native work.
 		return failAdmission(&engines.RequestedOperationFailure{
 			Engine: repo.Engine, Status: engines.RequestedOperationNotStarted,
 			PreparationError: &storageavailability.RepositoryStorageFailureError{ReasonCode: reason},
@@ -1653,14 +1533,21 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 	if err != nil {
 		return failAdmission(err)
 	}
-	setRuntimeRepositoryView(ctx, repo)
 	if err := finishStep(ctx, db, "backup_admission", "succeeded", "backup admitted to the native engine boundary"); err != nil {
 		return "", fmt.Errorf("persist successful backup admission: %w", err)
 	}
 
 	activeResticRetention := repo.Engine == engines.ResticID && job.Retention > 0
 	afterConfigured := job.AfterScriptPath != "" || job.AfterScriptMustSucceed
-	if err := runJobScriptStep(ctx, db, "before_script", job.BeforeScriptPath, job.BeforeScriptMustSucceed); err != nil {
+	// A failed optional before script does not stop the backup. It is kept in
+	// beforeScriptIssue and joined to the final result after the native
+	// backup, where it makes a completed backup completed_with_issues.
+	var beforeScriptIssue error
+	beforeErr := runJobScriptStep(ctx, db, "before_script", job.BeforeScriptPath, job.BeforeScriptMustSucceed)
+	if optional, ok := beforeErr.(optionalScriptFailure); ok {
+		beforeScriptIssue, beforeErr = optional, nil
+	}
+	if err := beforeErr; err != nil {
 		closeCancelGateFromContext(ctx)
 		reason := "before script prevented native backup launch"
 		if operationID := operationIDFromContext(ctx); operationID != "" {
@@ -1691,6 +1578,7 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 		}
 		return errors.Join(cacheErr, finishStep(ctx, db, "metadata_cache", status, output))
 	}
+
 	finishNoLaunch := func(reason string, cause error) error {
 		stepErr := finishStep(ctx, db, "backup", "skipped", reason)
 		if activeResticRetention {
@@ -1701,18 +1589,28 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 
 	sourcePath, _ := ctx.Value(frozenSourcePathContextKey{}).(string)
 	if sourcePath == "" {
-		resolved, resolveErr := storageavailability.ResolveSourcePath(ctx, job)
-		if resolveErr != nil {
-			_ = database.SetResolvedSourcePath(db, job.ID, job.Source, job.Source, time.Now().UTC())
+		// Only direct executor calls arrive without a frozen location (queued
+		// runs always carry one from their preliminary observation). The alias
+		// (resolved_source_path) is user-owned and never written here; nothing
+		// relocates a source automatically. The location in use is the alias
+		// when set, otherwise the immutable source, and it gets the same
+		// run/pause/error decision before any native child is prepared.
+		sourcePath = storageavailability.SourceLocation(job)
+		if err := storageavailability.RequireSourcePathAvailable(ctx, job, sourcePath); err != nil {
 			closeCancelGateFromContext(ctx)
-			return "", finishNoLaunch("source resolution failed before native backup launch",
-				storageavailability.ClassifySourceResolutionError(resolveErr))
+			return "", finishNoLaunch("source check failed before native backup launch", err)
 		}
-		sourcePath = resolved.Path
-		if err := database.SetResolvedSourcePath(db, job.ID, job.Source, sourcePath, resolved.CheckedAt); err != nil {
+	}
+	fullSourceRead, frozenFullSourceRead := ctx.Value(frozenFullSourceReadContextKey{}).(bool)
+	if !frozenFullSourceRead {
+		// Direct executor calls carry no frozen facts, so they read the flag
+		// here at execution time, as they read the location above.
+		pending, err := database.JobTargetFullSourceReadPending(db, job.ID, repo.ID)
+		if err != nil {
 			closeCancelGateFromContext(ctx)
-			return "", finishNoLaunch("resolved source could not be persisted before native backup launch", err)
+			return "", finishNoLaunch("full source re-read state could not be read before native backup launch", err)
 		}
+		fullSourceRead = pending
 	}
 	// Writer identity is rechecked at the final child boundary, after native
 	// preparation, so a local attachment change cannot launch a stale writer.
@@ -1730,8 +1628,12 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 	snapshot, backupOutput, backupErr := engine.Backup(nativeContext, repo, sourcePath, engines.BackupOptions{
 		Tag: job.Tag, OwnerProfileID: repo.ProfileUUID, OwnerJobID: job.ID,
 		Excludes: strings.Split(job.Excludes, "\n"), LogicalSource: job.Source,
-		Settings: job.EngineSettings[repo.Engine],
+		Settings: job.EngineSettings[repo.Engine], FullSourceRead: fullSourceRead,
+		SkipNoBackupFolders: job.SkipNoBackupFolders, SkipCacheDirFolders: job.SkipsCacheDirFolders(),
+		SkipMarkerFileName: job.SkipMarkerFileName,
 	})
+	// Checked before later stage errors are joined into backupErr.
+	partialSnapshotSaved := snapshot.ID != "" && engines.IsBackupSourceReadFailure(backupErr)
 	if !activeResticRetention && !afterConfigured {
 		// With no later script or Restic retention child, process return is the
 		// last cancelable boundary. Result persistence and cache bookkeeping must
@@ -1755,9 +1657,9 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 		nativeErr = backupErr
 	}
 	if !backupStartedNative || (activeResticRetention && backupStatus != engines.RequestedOperationSucceeded && !afterConfigured) {
-		// A not-started requested child makes both retention and the after hook
-		// ineligible. Close immediately after parsing so a late request cannot
-		// rewrite that already-established primary truth.
+		// A requested child that never started makes both retention and the after
+		// hook ineligible. Close the cancel gate right after parsing so a late
+		// cancel request cannot change the already-decided backup result.
 		closeCancelGateFromContext(ctx)
 	}
 	stepStatus := "succeeded"
@@ -1767,7 +1669,14 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 		stepStatus = "skipped"
 		stepOutput = combinedRunnerOutput(backupOutput, preparationErr)
 	case engines.RequestedOperationInterrupted:
-		if backupStartedNative {
+		// The engine reports any context error as interrupted. The step
+		// follows the backup's own rule (classifyBackupResult): it is
+		// interrupted only once this backup's cancel or shutdown has ended
+		// ctx; an internal time limit fails it, as it fails the backup.
+		if backupStartedNative && ctx.Err() == nil {
+			stepStatus = "failed"
+			stepOutput = combinedRunnerOutput(backupOutput, nativeErr)
+		} else if backupStartedNative {
 			stepStatus = "interrupted"
 			stepOutput = combinedRunnerOutput(backupOutput, nativeErr)
 		} else {
@@ -1841,7 +1750,12 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 					retentionStepStatus = "skipped"
 					retentionStepOutput = combinedRunnerOutput(retentionOutput, retentionPreparationErr)
 				case engines.RequestedOperationInterrupted:
-					if retentionProcessStarted {
+					// As for the backup step: only this backup's own cancel or
+					// shutdown interrupts retention.
+					if retentionProcessStarted && ctx.Err() == nil {
+						retentionStepStatus = "failed"
+						retentionStepOutput = combinedRunnerOutput(retentionOutput, retentionNativeErr)
+					} else if retentionProcessStarted {
 						retentionStepStatus = "interrupted"
 						retentionStepOutput = combinedRunnerOutput(retentionOutput, retentionNativeErr)
 					} else {
@@ -1891,9 +1805,9 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 	// the next Restore/File History access; there is no retry loop or remote poller.
 	if backupStartedNative {
 		cacheStepErr := startStep(ctx, db, "application", "metadata_cache")
-		// Reconciliation is required by native-start truth, not by whether its
-		// diagnostic child row can be opened. Keep the submission independent so a
-		// control-plane logging failure cannot silently suppress cache repair.
+		// Reconciliation is needed because native backup started, whether or not
+		// its diagnostic step row can be opened. Submit it independently so a
+		// failure to log the step cannot silently skip cache repair.
 		queued := scheduleRepositorySync(db, repo, snapshot.ID, retentionApplied)
 		if cacheStepErr == nil {
 			if queued {
@@ -1908,13 +1822,29 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 			_ = database.LogWarning(db, "metadata cache pending-state result could not be recorded")
 		}
 	}
+	// A snapshot was committed when the native backup succeeded (even if our
+	// own follow-up work after it failed), or when it saved a partial snapshot
+	// and failed only because some source files could not be read. Files
+	// missing from a partial snapshot have no stored content that could be
+	// wrongly reused, so the next run reads them in full anyway.
+	if fullSourceRead && (backupSucceeded || partialSnapshotSaved) {
+		// The committed snapshot hashed every file, so from here on Kopia may
+		// again trust metadata matches against it. A failed, cancelled,
+		// interrupted or never-started run committed nothing and keeps the flag,
+		// so the next attempt still re-reads everything. If this write fails the
+		// flag stays set and the next backup re-reads once more, which costs time
+		// but never correctness.
+		if err := database.ClearJobTargetFullSourceRead(db, job.ID, repo.ID); err != nil {
+			_ = database.LogWarning(db, "Full source re-read flag could not be cleared after native backup; the next backup will re-read all files again")
+		}
+	}
 	if backupSucceeded && snapshot.LogicalSizeBytes != nil {
 		if err := database.RecordJobTargetLogicalSize(db, job.ID, repo.ID, *snapshot.LogicalSizeBytes, time.Now()); err != nil {
 			_ = database.LogWarning(db, "Job Size cache could not be updated after native backup")
 		}
 	} else if backupSucceeded && snapshot.LogicalSizeBytes == nil {
-		// Missing/malformed summary facts are application warnings. Native
-		// backup and job-tag-scoped retention truth remain conclusive.
+		// Missing or malformed summary fields are only an application warning. The
+		// native backup and job-tag-scoped retention results still stand.
 		_ = database.LogWarning(db, "Native backup succeeded but Job Size or snapshot summary fields were unavailable")
 	}
 
@@ -1925,7 +1855,10 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 				"after script was not launched because the operation is shutting down", time.Now()))}
 		} else {
 			afterErr = runJobScriptStep(ctx, db, "after_script", job.AfterScriptPath, job.AfterScriptMustSucceed)
-			if afterErr != nil {
+			// A failed optional after script stays an optionalScriptFailure
+			// (completed_with_issues at most). Only a required failure or a
+			// cancellation becomes afterScriptFailure (failed or interrupted).
+			if _, optional := afterErr.(optionalScriptFailure); afterErr != nil && !optional {
 				afterErr = afterScriptFailure{afterErr}
 			}
 		}
@@ -1948,8 +1881,9 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 		} else {
 			resultErr = nativeErr
 		}
-		// Failure to record skipped retention is independent of the saved
-		// partial snapshot and must prevent its amber-only qualification.
+		// A failure to record the skipped retention is separate from the saved
+		// partial snapshot, so it must stop the run from being classified as
+		// completed_with_issues.
 		resultErr = errors.Join(resultErr, retentionErr)
 	} else {
 		if backupResultPersistErr != nil {
@@ -1964,6 +1898,6 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 			resultErr = errors.Join(resultErr, followupFailure{retentionErr})
 		}
 	}
-	resultErr = errors.Join(resultErr, afterErr)
+	resultErr = errors.Join(resultErr, afterErr, beforeScriptIssue)
 	return backupOutput, resultErr
 }

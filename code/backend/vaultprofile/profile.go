@@ -41,6 +41,13 @@ type Root struct {
 	UpdatedAt      time.Time                  `json:"updatedAt"`
 }
 
+// Identifies reports whether the root belongs to repo: the same vault UUID,
+// engine and native repository ID.
+func (root Root) Identifies(repo models.Repository) bool {
+	return root.VaultUUID == repo.ID && root.Repository.Engine == repo.Engine &&
+		root.Repository.NativeRepositoryID == repo.NativeRepositoryID
+}
+
 type RootRepository struct {
 	Engine             string     `json:"engine"`
 	NativeRepositoryID string     `json:"native_repository_id"`
@@ -113,17 +120,24 @@ type VaultPreferences struct {
 }
 
 type BackupJob struct {
-	JobUUID                 string                `json:"job_uuid"`
-	Name                    string                `json:"name"`
-	Source                  string                `json:"source"`
-	Schedule                string                `json:"schedule"`
-	Retention               int                   `json:"retention"`
-	RetentionHourly         *int                  `json:"retentionHourly,omitempty"`
-	RetentionDaily          *int                  `json:"retentionDaily,omitempty"`
-	RetentionWeekly         *int                  `json:"retentionWeekly,omitempty"`
-	RetentionMonthly        *int                  `json:"retentionMonthly,omitempty"`
-	RetentionYearly         *int                  `json:"retentionYearly,omitempty"`
-	Exclusions              string                `json:"exclusions"`
+	JobUUID          string `json:"job_uuid"`
+	Name             string `json:"name"`
+	Source           string `json:"source"`
+	Schedule         string `json:"schedule"`
+	Retention        int    `json:"retention"`
+	RetentionHourly  *int   `json:"retentionHourly,omitempty"`
+	RetentionDaily   *int   `json:"retentionDaily,omitempty"`
+	RetentionWeekly  *int   `json:"retentionWeekly,omitempty"`
+	RetentionMonthly *int   `json:"retentionMonthly,omitempty"`
+	RetentionYearly  *int   `json:"retentionYearly,omitempty"`
+	Exclusions       string `json:"exclusions"`
+	// The marker-file choices are optional and written only when set, so a
+	// profile of a job that doesn't use them stays readable by versions that
+	// predate them (their parser refuses unknown fields). Don't drop the
+	// omitempty.
+	SkipNoBackupFolders     bool                  `json:"skipNoBackupFolders,omitempty"`
+	SkipCacheDirFolders     bool                  `json:"skipCacheDirFolders,omitempty"`
+	SkipMarkerFileName      string                `json:"skipMarkerFileName,omitempty"`
 	Tag                     string                `json:"tag"`
 	BeforeScriptPath        string                `json:"beforeScriptPath,omitempty"`
 	BeforeScriptMustSucceed bool                  `json:"beforeScriptMustSucceed,omitempty"`
@@ -210,6 +224,8 @@ func BuildProfile(repo models.Repository, jobs []models.BackupJob, dormant []Bac
 			Retention: job.Retention, RetentionHourly: job.RetentionHourly, RetentionDaily: job.RetentionDaily,
 			RetentionWeekly: job.RetentionWeekly, RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
 			Exclusions: job.Excludes, Tag: job.Tag, BeforeScriptPath: job.BeforeScriptPath,
+			SkipNoBackupFolders: job.SkipNoBackupFolders, SkipCacheDirFolders: job.SkipCacheDirFolders,
+			SkipMarkerFileName:      job.SkipMarkerFileName,
 			BeforeScriptMustSucceed: job.BeforeScriptMustSucceed, AfterScriptPath: job.AfterScriptPath,
 			AfterScriptMustSucceed: job.AfterScriptMustSucceed, EngineSettings: job.EngineSettings,
 			Enabled: job.Enabled, TargetVaultUUIDs: targets,
@@ -317,6 +333,9 @@ func (p Profile) Validate() error {
 		}
 		if models.ContainsReservedOwnershipTag(job.Tag) {
 			return fmt.Errorf("vault profile job %q uses a reserved Replicaro tag namespace", job.JobUUID)
+		}
+		if err := models.ValidateSkipMarkerFileName(job.SkipMarkerFileName); err != nil {
+			return fmt.Errorf("vault profile job %q has an invalid marker file name: %w", job.JobUUID, err)
 		}
 		if (job.BeforeScriptMustSucceed && job.BeforeScriptPath == "") || (job.AfterScriptMustSucceed && job.AfterScriptPath == "") {
 			return fmt.Errorf("vault profile job %q requires an absent script", job.JobUUID)

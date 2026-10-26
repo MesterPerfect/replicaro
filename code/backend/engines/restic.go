@@ -27,9 +27,9 @@ import (
 	"github.com/local/replicaro/models"
 )
 
-// ErrColdStorageArchivedObject identifies the exact pinned-Restic ordinary-S3
-// failure that has a Replicaro connection remedy. Native output remains
-// separate and available to callers for operation diagnostics.
+// ErrColdStorageArchivedObject marks the pinned Restic failure on a regular S3
+// connection that the user can fix by reconnecting the vault as Cold Storage.
+// Restic's own output is kept separately for operation diagnostics.
 var ErrColdStorageArchivedObject = errors.New(models.ColdStorageArchivedObjectHelp)
 
 type resticEngine struct {
@@ -75,9 +75,9 @@ func (e *resticEngine) descriptor(ctx context.Context) Descriptor {
 }
 
 func resticLiveOutputEnabled(_ models.Repository, args []string) bool {
-	// Investigation of the pinned engine commands found no evidence that ordinary
-	// output exposes stored passwords or keys. Restic therefore owns that output
-	// for every connector; Replicaro redacts only the public support export.
+	// We found no case where the pinned Restic commands print stored passwords or
+	// keys in their normal output, so live output is shown unchanged for every
+	// connector. Only the public support export is redacted.
 	return eligibleResticLiveCommand(args)
 }
 
@@ -102,9 +102,9 @@ func (e *resticEngine) Info(ctx context.Context, repo models.Repository) (output
 	return out, nil
 }
 func (e *resticEngine) Create(ctx context.Context, repo models.Repository) (output string, err error) {
-	// Vault creation is a requested ordinary native command. Its init output
-	// can reassure the user while the HTTP response is still pending; private
-	// config and identity probes retain their separate suppressed boundaries.
+	// Vault creation runs a user-requested restic init, so stream its output: it
+	// shows progress while the HTTP response is still pending. The private config
+	// and identity probes still keep their output hidden.
 	ctx = command.ContextWithLiveOutputEnabled(ctx)
 	out, err := e.runRepo(ctx, repo, []string{"init", "--repository-version", "2", "--compression", "auto"}, command.NoTotalDeadline)
 	return out, err
@@ -148,6 +148,21 @@ func (e *resticEngine) Backup(ctx context.Context, repo models.Repository, sourc
 			args = append(args, "--exclude", exclude)
 		}
 	}
+	// Restic skips a folder's contents when the file exists, whatever it
+	// contains, and keeps the folder and the marker file itself. A saved
+	// Advanced option --exclude-caches can repeat the CACHEDIR.TAG flag;
+	// Restic accepts it twice.
+	if options.SkipNoBackupFolders {
+		args = append(args, "--exclude-if-present", models.NoBackupMarkerFile)
+	}
+	if options.SkipCacheDirFolders {
+		args = append(args, "--exclude-caches")
+	}
+	if options.SkipMarkerFileName != "" {
+		// validated as one plain name without ":" (Restic would read
+		// "name:header" as a name plus a required first line)
+		args = append(args, "--exclude-if-present", options.SkipMarkerFileName)
+	}
 	args = append(args, extra...)
 	args = append(args, source)
 	capture, out, runErr := e.runRepoCommandCaptured(ctx, repo, nil, args, command.NoTotalDeadline)
@@ -156,8 +171,10 @@ func (e *resticEngine) Backup(ctx context.Context, repo models.Repository, sourc
 	}
 	if runErr != nil {
 		if partial, confirmed := resticPartialSnapshot(capture, runErr); confirmed {
-			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr}
+			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr,
+				LockedFiles: resticLockedFiles(capture, source, lockedFilesOS)}
 		}
+		reportBackupStorageFull(ctx, repo, capture, source, options.LogicalSource)
 		return models.Snapshot{}, out, runErr
 	}
 	// Stdout is the exact native machine-readable stream. Successful stderr is
@@ -330,9 +347,9 @@ func (e *resticEngine) ListPath(ctx context.Context, repo models.Repository, id,
 	return e.listPath(ctx, repo, id, path, false)
 }
 
-// This is an indexing convention, not profile visibility or retention authority.
-// A deleted job keeps its native source layout. Profile markers are evaluated
-// separately by the ordinary presentation classifier.
+// This only decides how snapshots are indexed; it doesn't affect profile
+// visibility or retention. A deleted job keeps its native source layout.
+// Profile markers are handled separately by the presentation classifier.
 func resticHasJobTag(tags []string) bool {
 	count := 0
 	for _, tag := range tags {
@@ -494,7 +511,13 @@ func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id s
 		return "", fmt.Errorf("restic original-location restore is unsupported")
 	}
 	restoreID := id
-	args := []string{"restore"}
+	// --json is how a partly failed restore is recognised. Restic carries on
+	// past files it cannot write and ends with exit code 1, but so does every
+	// fatal failure; only the structured records (per-file errors, the summary
+	// and "There were N errors") tell them apart. See
+	// resticRestoreCompletedWithErrors before removing it or reading the text
+	// output instead.
+	args := []string{"restore", "--json"}
 	if selection != "" {
 		source := options.NativeRoot.Path
 		if source == "" {
@@ -529,7 +552,15 @@ func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id s
 	default:
 		return "", fmt.Errorf("unsupported Restic conflict mode %q", options.ConflictMode)
 	}
-	out, err := e.runRepo(ctx, repo, args, command.NoTotalDeadline)
+	capture, out, err := e.runRepoCommandCaptured(ctx, repo, nil, args, command.NoTotalDeadline)
+	if capture != nil {
+		defer capture.Close()
+	}
+	if err != nil {
+		if count, reported := resticRestoreCompletedWithErrors(capture, err); reported {
+			return out, &RestoreCompletedWithErrors{Engine: ResticID, NativeErr: err, Errors: count}
+		}
+	}
 	return out, err
 }
 
@@ -624,28 +655,25 @@ func (e *resticEngine) DeleteSnapshots(ctx context.Context, repo models.Reposito
 	out, err := e.runRepo(ctx, repo, args, command.NoTotalDeadline)
 	return out, err
 }
-func (e *resticEngine) Check(ctx context.Context, repo models.Repository, id string) (output string, err error) {
-	if repo.ColdStorage && id == "" {
+func (e *resticEngine) Check(ctx context.Context, repo models.Repository) (output string, err error) {
+	// Cold storage has no integrity check path at all. The whole-repository
+	// check would read every archived pack, and the snapshot-filtered
+	// `check --read-data <id>` that cold vaults could once use was removed with
+	// the unused snapshot check endpoint. Don't add a snapshot argument back
+	// here as a way around this refusal.
+	if repo.ColdStorage {
 		return "", fmt.Errorf("%s", models.ColdStorageIntegrityHelp)
 	}
 	args := []string{"check", "--read-data"}
-	if id != "" {
-		if !resticSnapshotIDPattern.MatchString(id) || id != strings.ToLower(id) {
-			return "", fmt.Errorf("invalid canonical Restic snapshot ID")
-		}
-		// Restic 0.19.1 accepts snapshot IDs after --read-data, so a selected
-		// integrity check remains a native check instead of staging a restore.
-		args = append(args, id)
-	}
-	// Replicaro admits integrity checks only for the current vault owner and
-	// serializes all Replicaro work with the managed vault UUID lock. For the
+	// Replicaro runs integrity checks only for the current vault owner and
+	// serializes all of its own work with the managed vault UUID lock. For the
 	// supported external-backup overlap, Restic's publication order keeps this
 	// safe: an unindexed pack is a non-critical additional file, an
 	// indexed pack is verified even if its snapshot was not captured, and a pack
 	// published after enumeration is deferred to the next check. Success covers
 	// the repository view captured by this run, not every concurrent upload.
-	// Independently launched native mutations remain outside Replicaro's safety
-	// boundary and must not be overlapped with this no-lock check.
+	// Restic mutations started outside Replicaro aren't covered by any of this
+	// and must not run at the same time as this no-lock check.
 	out, err := e.runRepoWithGlobal(ctx, repo, []string{"--no-cache", "--no-lock"}, args, command.NoTotalDeadline)
 	return out, err
 }
@@ -661,7 +689,69 @@ func (e *resticEngine) changeRepositoryPassword(ctx context.Context, repo models
 	if filepath.Base(nativeInputPath) != "restic-new-password.txt" {
 		return "", requestedOperationPreparationFailure(ResticID, fmt.Errorf("native password input path is invalid"))
 	}
-	return e.runRepo(ctx, repo, []string{"key", "passwd", "--new-password-file", nativeInputPath}, command.NoTotalDeadline)
+	args := []string{"key", "passwd", "--new-password-file", nativeInputPath}
+	if hint, ok := ctx.Value(resticKeyHintKey{}).(string); ok {
+		if !resticKeyIDPattern.MatchString(hint) {
+			return "", requestedOperationPreparationFailure(ResticID, fmt.Errorf("Restic key hint is invalid"))
+		}
+		// `key passwd` replaces the key the committed password opened. When
+		// another key has the same password, Restic would otherwise pick
+		// whichever it tries first, so the change is pointed at the key
+		// recorded before the first launch, on every launch.
+		args = append(args, "--key-hint", hint)
+	}
+	return e.runRepo(ctx, repo, args, command.NoTotalDeadline)
+}
+
+type resticKeyHintKey struct{}
+
+var resticKeyIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ContextWithResticKeyHint makes the Restic password change started with ctx
+// replace the key with this full ID.
+func ContextWithResticKeyHint(ctx context.Context, keyID string) context.Context {
+	return context.WithValue(ctx, resticKeyHintKey{}, keyID)
+}
+
+// listKeys runs `key list --json` with repo.Passphrase and returns the full
+// key IDs and the ID of the key that password opened.
+func (e *resticEngine) listKeys(ctx context.Context, repo models.Repository) (current string, ids []string, err error) {
+	output, err := e.runRepo(ctx, repo, []string{"key", "list", "--json"}, command.NoTotalDeadline)
+	if err != nil {
+		return "", nil, err
+	}
+	var keys []struct {
+		Current bool   `json:"current"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(output), &keys); err != nil {
+		return "", nil, fmt.Errorf("parse Restic key list: %w", err)
+	}
+	for _, key := range keys {
+		if !resticKeyIDPattern.MatchString(key.ID) {
+			return "", nil, fmt.Errorf("Restic key list has an invalid key ID")
+		}
+		if key.Current {
+			if current != "" {
+				return "", nil, fmt.Errorf("Restic key list has more than one current key")
+			}
+			current = key.ID
+		}
+		ids = append(ids, key.ID)
+	}
+	if current == "" {
+		return "", nil, fmt.Errorf("Restic key list has no current key")
+	}
+	return current, ids, nil
+}
+
+// removeKey runs `key remove <id>` with repo.Passphrase. Restic refuses to
+// remove the key that password opened.
+func (e *resticEngine) removeKey(ctx context.Context, repo models.Repository, keyID string) (string, error) {
+	if !resticKeyIDPattern.MatchString(keyID) {
+		return "", fmt.Errorf("Restic key ID is invalid")
+	}
+	return e.runRepo(ctx, repo, []string{"key", "remove", keyID}, command.NoTotalDeadline)
 }
 
 func (e *resticEngine) probeRepositoryPassword(ctx context.Context, repo models.Repository) (string, error) {
@@ -770,10 +860,9 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 	}
 	env := append([]string{"RESTIC_PASSWORD=" + repo.Passphrase, "RESTIC_CACHE_DIR=" + cache}, connectorEnv...)
 	if eligibleResticLiveCommand(args) {
-		// Restic's native progress cadence is scoped only to the same requested
-		// user-facing commands that own live presentation. Internal probes and
-		// setup commands must not inherit it, and no user option can override the
-		// adapter-owned environment value.
+		// Only the user-facing commands that show live progress get Restic's progress
+		// rate. Internal probes and setup commands must not inherit it, and user
+		// options can't override this environment value.
 		env = append(env, "RESTIC_PROGRESS_FPS=0.5")
 	}
 	commandArgs := append(append([]string{}, global...), "--repo", repository)
@@ -820,6 +909,20 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 		}
 	}
 	trackedContext, processStarted := command.ContextWithProcessStartTracking(ctx)
+	if len(args) > 1 && args[0] == "key" && args[1] == "passwd" {
+		// Marked here rather than by the caller so storage preparation (rclone
+		// config and obscure runs) still ends with Replicaro. Killed partway,
+		// `key passwd` leaves only the old password opening the vault, both
+		// (the new key is written before the old one is removed), or only the
+		// new one. Its exclusive lock is usually left behind too: always when
+		// both open, when only the old one opens once the command has run for
+		// about half a second, and now and then when only the new one does.
+		// Password-change recovery handles all of those, but each one costs a
+		// rerun or a stale-lock unlock, and left alone the command finishes in
+		// a few seconds. Recovery waits for it through the change's
+		// native-process fence rather than racing it.
+		trackedContext = command.ContextOutlivingReplicaro(trackedContext)
+	}
 	if resticLiveOutputEnabled(repo, args) {
 		trackedContext = command.ContextWithLiveOutputEnabled(trackedContext)
 	}
@@ -864,9 +967,9 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 	started := processStarted() || runErr == nil
 	if closeStorage != nil {
 		closeErr := closeStorage()
-		// The selected local config is reopened after rclone can refresh it. A
-		// local cleanup failure is follow-up truth, not a provider postcheck or
-		// an alteration of the requested Restic command's native result.
+		// Closing reopens the selected local config after rclone may have refreshed
+		// it. A cleanup failure here is reported as a separate follow-up error; it is
+		// not a provider check and doesn't change the Restic command's own result.
 		if closeErr != nil {
 			return output, resticCommandCleanupFailure(runErr, &privateOutputError{
 				message: "local rclone session cleanup failed", cause: closeErr,
@@ -909,9 +1012,9 @@ func resticCapturedNativeFailure(err error) bool {
 	if nativeErr != nil {
 		return true
 	}
-	// Test adapters may return a plain process error rather than the production
-	// command carrier. A typed output-only failure is the one case that must not
-	// be promoted to native failure truth.
+	// Test adapters may return a plain process error instead of the production
+	// command error type. The one case that must not count as a Restic failure is
+	// a typed failure that only affected output capture.
 	return outputErr == nil
 }
 
@@ -966,9 +1069,9 @@ func resticFileBackedOutput(args []string) bool {
 	case "backup", "restore", "check", "prune", "forget", "snapshots", "ls":
 		return true
 	default:
-		// init, unlock, key passwd, and cat config return bounded control outcomes
-		// or one fixed repository-config protocol record. They do not enumerate
-		// repository content and retain the explicit legacy inline boundary.
+		// init, unlock, key passwd, and cat config return short control results or a
+		// single repository-config record. They don't list repository content, so
+		// their output stays in memory instead of being staged to a file.
 		return false
 	}
 }
@@ -1033,7 +1136,7 @@ func resticStorage(repo models.Repository) (string, []string, []string, error) {
 		// Restic parses this argument as a URL. The effective path is already
 		// literal, so escape once here; Azure/GCS colon grammars below are not URLs.
 		repository := "sftp://" + user + sftpHostPort(address) + (&url.URL{Path: separator + path}).EscapedPath()
-		sshArgs := []string{"-p", address.Port}
+		sshArgs := []string{"-p", address.Port, "-o", externalSSHBatchMode}
 		identity, err := materializeSSHPrivateKey(repo)
 		if err != nil {
 			return "", nil, nil, err
@@ -1121,12 +1224,29 @@ func prepareResticStorage(
 	func() error,
 	error,
 ) {
+	if repo.Connector == "webdav" {
+		repository, args, env, cleanup, err := prepareResticWebDAVStorage(ctx, repo)
+		if err != nil {
+			return "", nil, nil, nil, &privateOutputError{
+				message: "native Restic preparation failed",
+				cause:   err,
+			}
+		}
+		return repository, args, env, cleanup, nil
+	}
 	if !IsResticRcloneConnector(repo.Connector) {
 		repository, args, env, err := resticStorage(repo)
 		return repository, args, env, nil, err
 	}
 	session, err := newResticRcloneSession(ctx, repo)
 	if err != nil {
+		// A refused Any Rclone Remote setting, such as a saved environment
+		// variable that a newer rule refuses, carries only names and fixed
+		// text, so its message is shown instead of the generic one.
+		var remoteErr *RcloneRemoteError
+		if errors.As(err, &remoteErr) {
+			return "", nil, nil, nil, &userSafeConnectorError{message: remoteErr.Message, cause: remoteErr}
+		}
 		return "", nil, nil, nil, &privateOutputError{
 			message: "native Restic preparation failed",
 			cause:   err,
@@ -1205,8 +1325,8 @@ func parseResticBackupReader(output io.Reader) (models.Snapshot, error) {
 		_, uniqueErr := decodeUniqueJSON([]byte(line))
 		ambiguousSize := false
 		if uniqueErr != nil && strings.Contains(uniqueErr.Error(), `duplicate JSON field "total_bytes_processed"`) {
-			// Preserve independently conclusive identity from the native summary,
-			// but never publish an ambiguous optional statistics value.
+			// A duplicated total_bytes_processed makes the size ambiguous. Still take the
+			// snapshot ID and time from the summary, but don't report a size.
 			var ignored any
 			uniqueErr = json.Unmarshal([]byte(line), &ignored)
 			ambiguousSize = true
@@ -1400,11 +1520,6 @@ func resticPathPrefixMatch(prefix, value, source string) bool {
 // Windows-looking node names or trim whitespace returned by Restic.
 func normalizeResticPath(value string) string { return value }
 
-func resticWindowsStylePath(value string) bool {
-	normalized := strings.ReplaceAll(value, "\\", "/")
-	return resticWindowsDrivePath(normalized) || resticWindowsUNCPath(value)
-}
-
 func resticWindowsUNCPath(value string) bool {
 	return strings.HasPrefix(value, `\\`)
 }
@@ -1529,15 +1644,26 @@ func resticStoredPath(source, value string) (string, bool) {
 	return strings.TrimSuffix(source, "/") + "/" + relative, true
 }
 
+// resticLiteralIncludePath turns an archived path into a restic --include
+// pattern that matches only that path. Restic include patterns use Go's
+// filepath.Match syntax for each path component, so the metacharacters *, ?
+// and [ are wrapped in one-character classes ([*], [?], [[]). Go's matcher
+// treats a backslash as an escape only off Windows, so a pattern such as
+// "Trip \[1].jpg" would match nothing on Windows and restic would exit 0
+// having restored nothing. Character classes behave the same on every OS.
+// A ] outside a class is already literal.
+//
+// A literal backslash in an archived name (from a Linux or macOS source) is
+// escaped as \\ off Windows. On Windows a backslash in such a name cannot be
+// selected by an include pattern, so validateRestoreSelectionName refuses
+// that selection before any restic command runs.
 func resticLiteralIncludePath(relative string) string {
 	relative = strings.TrimLeft(normalizeResticPath(relative), "/")
-	escaped := strings.NewReplacer(
-		`\`, `\\`,
-		`*`, `\*`,
-		`?`, `\?`,
-		`[`, `\[`,
-	).Replace(relative)
-	return "/" + escaped
+	replacements := []string{`*`, `[*]`, `?`, `[?]`, `[`, `[[]`}
+	if runtime.GOOS != "windows" {
+		replacements = append(replacements, `\`, `\\`)
+	}
+	return "/" + strings.NewReplacer(replacements...).Replace(relative)
 }
 
 // Restic's ls positional filters and restore subfolder selectors use
@@ -1550,12 +1676,6 @@ func resticPathFilter(value string) string {
 		return value
 	}
 	return "/" + value
-}
-
-func resticWindowsDrivePath(value string) bool {
-	return len(value) > 2 &&
-		((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) &&
-		value[1] == ':' && value[2] == '/'
 }
 
 var resticSnapshotIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{64}$`)

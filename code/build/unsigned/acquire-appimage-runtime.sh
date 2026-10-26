@@ -5,15 +5,15 @@ build_dir=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$build_dir/../.." && pwd)
 target=${1:?linux_amd64 or linux_arm64}
 (cd "$root/backend" && go run ./tools/targetverify --target "$target" >&2)
-release_commit=75849dce7cc37e4319b633df1f116ca895c71a12
+release_commit=fedfad51acc2860b2916a1eef32ba4a500ff31ef
 case "$target" in
   linux_amd64)
-    asset_id=456065460
-    expected=1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
+    asset_id=657374641
+    expected=617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46
     ;;
   linux_arm64)
-    asset_id=456064894
-    expected=7d5d772b7c32f0c84caf0a452a3072a5709027d7eac5856feb89a7a7a8881372
+    asset_id=657373827
+    expected=9a72a744d221576c9347ec074243acc5c3c7568896b12714e0e82e9f0bf47900
     ;;
   *) echo "target must be linux_amd64 or linux_arm64" >&2; exit 2 ;;
 esac

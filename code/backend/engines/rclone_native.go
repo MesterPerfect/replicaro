@@ -2,14 +2,12 @@ package engines
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/local/replicaro/appdata"
 	replicarorclone "github.com/local/replicaro/rclone"
 )
 
@@ -39,7 +37,6 @@ func rcloneBinary(customPath string) (string, error) {
 var (
 	rcloneCleanupHooksMu sync.RWMutex
 	rcloneSessionRemover = removeRcloneSessionTree
-	rcloneConfigWiper    = wipeRcloneConfig
 	rcloneCleanupOnce    sync.Once
 	rcloneCleanupErr     error
 )
@@ -56,18 +53,6 @@ func SetRcloneSessionRemoverForTests(next func(string) error) func() {
 	}
 }
 
-func setRcloneConfigWiperForTests(next func(string) error) func() {
-	rcloneCleanupHooksMu.Lock()
-	previous := rcloneConfigWiper
-	rcloneConfigWiper = next
-	rcloneCleanupHooksMu.Unlock()
-	return func() {
-		rcloneCleanupHooksMu.Lock()
-		rcloneConfigWiper = previous
-		rcloneCleanupHooksMu.Unlock()
-	}
-}
-
 func removeRcloneSession(path string) error {
 	rcloneCleanupHooksMu.RLock()
 	remove := rcloneSessionRemover
@@ -75,38 +60,22 @@ func removeRcloneSession(path string) error {
 	return remove(path)
 }
 
-func wipeRcloneSessionConfig(path string) error {
-	rcloneCleanupHooksMu.RLock()
-	wipe := rcloneConfigWiper
-	rcloneCleanupHooksMu.RUnlock()
-	return wipe(path)
-}
-
 // CleanupRcloneSessions removes only recognized private sessions left by an
 // earlier process. Authorization and operation sessions cannot be resumed.
+// It returns every removal failure, but those are for logging only: startup
+// carries on, because a stale session never affects a new one.
+//
+// The sweep runs at most once per process, shared with the first OAuth sign-in
+// (ensureRcloneSessionsCleaned). It removes every op-* directory, so a second
+// sweep while operations are running would delete the live private directories
+// of Restic WebDAV and OAuth commands. Startup calls this before any operation
+// starts, which uses up the once.
 func CleanupRcloneSessions() error {
-	operationParent, err := appdata.RcloneSessionRoot()
-	if err != nil {
-		return err
-	}
-	if err := prepareRcloneSessionRoot(operationParent); err != nil {
-		return err
-	}
-	configParent, err := appdata.RcloneConfigSessionRoot()
-	if err != nil {
-		return err
-	}
-	if err := prepareRcloneSessionRoot(configParent); err != nil {
-		return err
-	}
-	return errors.Join(
-		cleanupRcloneSessionsSecure(operationParent),
-		cleanupRcloneSessionsSecure(configParent),
-	)
+	return ensureRcloneSessionsCleaned()
 }
 
 func ensureRcloneSessionsCleaned() error {
-	rcloneCleanupOnce.Do(func() { rcloneCleanupErr = CleanupRcloneSessions() })
+	rcloneCleanupOnce.Do(func() { rcloneCleanupErr = sweepRcloneSessions() })
 	return rcloneCleanupErr
 }
 
@@ -189,9 +158,9 @@ func readRcloneProviderConfigReader(
 			known = known || field == key
 		}
 		if !known {
-			// Rclone owns native additions. Replicaro observes only the identity
-			// and credential fields it already needs and ignores every other
-			// field without admitting, repairing, or rewriting it.
+			// Rclone may add fields of its own. Replicaro reads only the identity
+			// and credential fields it needs and ignores every other field,
+			// without validating, repairing, or rewriting it.
 			continue
 		}
 		if _, duplicate := values[key]; duplicate {

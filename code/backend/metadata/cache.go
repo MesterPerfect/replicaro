@@ -14,7 +14,6 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 )
 
@@ -167,9 +166,7 @@ func SetRepositoryAdmissionForTests(next func(context.Context, *sql.DB, models.R
 }
 
 var resolveMetadataEngine = func(repo models.Repository) (engines.Engine, error) {
-	return engines.ResolveWithRepositoryAvailabilityCheck(
-		repo, storageavailability.RequireRepositoryAvailable,
-	)
+	return engines.Resolve(repo)
 }
 var replaceMetadataSnapshot = database.ReplaceMetadataSnapshotForRefreshContext
 var replaceMetadataSnapshotWithIdentity = database.ReplaceMetadataSnapshotWithIdentityForRefreshContext
@@ -259,12 +256,6 @@ func withoutCooperativeCancellation(err error) error {
 	return err
 }
 
-// ScheduleRepositorySync starts at most one synchronization for a repository.
-// The caller must release any shared vault lock before invoking it.
-func ScheduleRepositorySync(db *sql.DB, repo models.Repository) bool {
-	return scheduleRepositorySync(db, syncRequest{repository: repo, intent: intentHeaders, bypassEntryCooldown: true}, false)
-}
-
 // ScheduleRepositorySyncAfterBackup preserves the complete mutation inventory
 // pass. Only the preliminary sizing decision differs for Keep all: it uses the
 // new backup header, while retention requires the retained maximum. Joining an
@@ -273,13 +264,6 @@ func ScheduleRepositorySync(db *sql.DB, repo models.Repository) bool {
 func ScheduleRepositorySyncAfterBackup(db *sql.DB, repo models.Repository, snapshotID string, retention bool) bool {
 	return scheduleRepositorySyncWithPendingJoin(db, syncRequest{repository: repo, intent: intentHeaders, bypassEntryCooldown: true,
 		postBackup: true, backupSnapshotIDs: []string{snapshotID}, retainedSizing: retention}, false, true)
-}
-
-// ScheduleRepositoryAccess applies the shared Restore/File History freshness
-// decision and respects the independent ordinary failure cooldowns.
-func ScheduleRepositoryAccess(db *sql.DB, repo models.Repository) bool {
-	admitted, _ := ScheduleRepositoryAccessWithReader(db, db, repo)
-	return admitted
 }
 
 // ScheduleRepositoryAccessWithReader keeps coordinator ownership and all
@@ -651,8 +635,11 @@ func DeferRepositorySyncForBackup(db *sql.DB, repo models.Repository) func() {
 }
 
 // DeferRepositorySyncForRestore cancels and drains same-repository rebuildable
-// metadata work before restore performs its one nonblocking exclusive lock try.
-// The returned release must run after the restore releases that lock.
+// metadata work before a restore or snapshot deletion waits for the exclusive
+// vault lock. The restore or deletion runs in a background worker that may
+// wait a long time for a busy vault; metadata sync stays deferred for the whole
+// wait, as it does for a queued backup. The returned release must run after the worker
+// releases that lock, which is after its final status is saved.
 func DeferRepositorySyncForRestore(
 	ctx context.Context,
 	db *sql.DB,
@@ -693,9 +680,9 @@ func deferRepositorySync(db *sql.DB, repo models.Repository) (func(), <-chan str
 	if cancel := coordinator.activeCancel[key]; cancel != nil {
 		cancels = append(cancels, cancel)
 	}
-	// Publication writers are per-vault now. Preserve same-vault cooperative
-	// yielding and coalescing, while an unrelated vault's cache transaction can
-	// continue on its independent writer connection.
+	// Each vault has its own publication writer. Keep same-vault cooperative
+	// yielding and coalescing, while an unrelated vault's cache transaction
+	// continues on its own writer connection.
 	coordinator.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -767,13 +754,6 @@ func RepositoryCoordinatorState(db *sql.DB, repo models.Repository) CoordinatorS
 }
 
 var repositoryStatusSnapshotBarrier func()
-
-// RepositoryStatusSnapshot brackets one coherent SQLite status snapshot with
-// coordinator observations. If work was active or crossed the database read,
-// it returns a conservative nonterminal state so callers poll once more.
-func RepositoryStatusSnapshot(ctx context.Context, db *sql.DB, repo models.Repository) (database.MetadataIndexState, []string, CoordinatorState, error) {
-	return RepositoryStatusSnapshotWithReader(ctx, db, db, repo)
-}
 
 // RepositoryStatusSnapshotWithReader keeps coordinator observation attached to
 // the writer identity while allowing the coherent SQLite snapshot to use the
@@ -857,11 +837,6 @@ func lockRepositoryContext(ctx context.Context, id string) (func(), error) {
 		case <-timer.C:
 		}
 	}
-}
-
-func lockRepository(id string) func() {
-	unlock, _ := lockRepositoryContext(context.Background(), id)
-	return unlock
 }
 
 // Start owns the coordinator lifecycle. Metadata work is access-driven; start
@@ -962,16 +937,6 @@ func SyncRepositoryContext(ctx context.Context, db *sql.DB, repo models.Reposito
 	return err
 }
 
-// SyncRepositoryUnderExclusive is used by the runner while it already owns
-// the repository's exclusive mutation lock.
-func SyncRepositoryUnderExclusive(db *sql.DB, repo models.Repository) error {
-	return SyncRepositoryUnderExclusiveContext(context.Background(), db, repo)
-}
-
-func SyncRepositoryUnderExclusiveContext(ctx context.Context, db *sql.DB, repo models.Repository) error {
-	return syncRepositoryRecorded(ctx, db, repo)
-}
-
 func syncRepositoryRecorded(ctx context.Context, db *sql.DB, repo models.Repository) error {
 	admitted, admissionErr := admitRepository(ctx, db, repo)
 	if admissionErr != nil {
@@ -994,15 +959,32 @@ func repositoryLockKey(repo models.Repository) string {
 	return repo.ID
 }
 
+// visibleSnapshotsForProfile classifies one native header listing and decides
+// each visible snapshot's File History grouping root from the same read of the
+// vault's jobs. A job change committed while this refresh is running is
+// handled only best effort by database.RefreshStaleMetadataGrouping. It
+// reserves a newer generation (which this refresh cannot publish over) only
+// when the grouping already published in the cache is stale for the new jobs.
+// It reserves nothing when the published grouping was not yet stale, when the
+// vault was never indexed, or when the cache could not be read at that moment
+// (for example while this refresh is rebuilding it). In those cases this
+// refresh may publish the grouping of the jobs it read. That is presentation
+// only, because restore addressing never uses grouping roots, and the next
+// header refresh corrects it.
 func visibleSnapshotsForProfile(db *sql.DB, repo models.Repository, snapshots []models.Snapshot) ([]models.Snapshot, error) {
-	knownJobs, err := database.JobIDsForRepository(db, repo.ID)
+	jobSources, err := database.JobSourcesForRepository(db, repo.ID)
 	if err != nil {
 		return nil, err
+	}
+	knownJobs := make(map[string]bool, len(jobSources))
+	for jobID := range jobSources {
+		knownJobs[jobID] = true
 	}
 	visible := make([]models.Snapshot, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		snapshot = models.PresentSnapshot(snapshot, repo.ProfileUUID, knownJobs)
 		if snapshot.Presentation != models.SnapshotPresentationHidden {
+			snapshot.MetadataGroupingRoot = database.MetadataGroupingRoot(repo.Engine, repo.ProfileUUID, snapshot, jobSources)
 			visible = append(visible, snapshot)
 		}
 	}
@@ -1458,35 +1440,6 @@ func listSnapshotIndexWindow(
 	}
 	readers.Wait()
 	return results
-}
-
-// IndexSnapshot refreshes one snapshot. It is useful for API fallback paths,
-// but normal backup completion uses SyncRepository to discover new snapshots.
-func IndexSnapshot(db *sql.DB, repo models.Repository, snapshot models.Snapshot) error {
-	unlockVault, lockErr := vaultlock.AcquireExclusiveContext(context.Background(), repositoryLockKey(repo))
-	if lockErr != nil {
-		return lockErr
-	}
-	defer unlockVault()
-	key := repositoryLockKey(repo)
-	unlock := lockRepository(key)
-	defer unlock()
-	manager, err := engines.ResolveWithRepositoryAvailabilityCheck(
-		repo, storageavailability.RequireRepositoryAvailable,
-	)
-	if err != nil {
-		return err
-	}
-	return indexSnapshot(db, repo, manager, snapshot)
-}
-
-func indexSnapshot(db *sql.DB, repo models.Repository, manager engines.Engine, snapshot models.Snapshot) error {
-	entries, output, err := manager.ListPathRecursive(context.Background(), repo, snapshot.ID, "")
-	if err != nil {
-		_ = database.MarkMetadataSnapshotFailed(db, repo.ID, snapshot, err)
-		return &engineError{output: output, err: err}
-	}
-	return database.ReplaceMetadataSnapshot(db, repo.ID, snapshot, entries)
 }
 
 type engineError struct {

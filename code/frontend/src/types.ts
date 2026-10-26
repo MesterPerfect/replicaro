@@ -18,8 +18,6 @@ export interface Repository {
 	archiveWriteClass?: "DEEP_ARCHIVE" | "GLACIER";
 	sftpPathMode?: "home" | "absolute";
     location: string;
-	resolvedRepositoryPath?: string;
-	resolvedRepositoryObservedAt?: string;
     isNetwork?: boolean;
     description: string;
     hasPassword: boolean;
@@ -43,13 +41,27 @@ export interface Repository {
 	native_repository_id: string;
 	isVaultOwner: boolean;
 	objectLock: ObjectLockSettings;
+	// Saved on the server; set when a job or background worker found that this
+	// vault needs a reconnect, cleared by a later success or a reconnect.
+	reconnectRequired?: boolean;
+	// Set only for an Any Rclone Remote vault. It never holds the rclone
+	// config password or a variable value.
+	rcloneRemote?: RcloneRemoteSettings;
+}
+
+export interface RcloneRemoteSettings {
+	configFile: string;
+	configEncrypted: boolean;
+	remote: string;
+	path: string;
+	variableNames: string[];
 }
 
 export interface IntegrationOption {
     key: string;
     label: string;
 	help?: string;
-    kind?: "boolean" | "textarea";
+    kind?: "boolean" | "textarea" | "environment";
     placeholder?: string;
     default?: string;
     required?: boolean;
@@ -176,18 +188,6 @@ export interface ExistingVaultPreview {
 	};
 }
 
-export interface ExistingVaultUpdateConfirmation {
-	vaultUUID: string;
-	previewDigest: string;
-	previousLocation: string;
-	location: string;
-	name: string;
-	description: string;
-	checkSchedule: string;
-	maintenanceSchedule: string;
-	concurrencyMode: "reduced" | "native" | "increased" | "maximum";
-}
-
 export interface DormantRecoveryJob {
 	repositoryId: string;
 	jobId: string;
@@ -254,6 +254,9 @@ export interface BackupJob {
     id: string;
     name: string;
     source: string;
+	sourceBindingState?: "bound" | "unbound_imported";
+	// The job's alias, set only by "Update job source" (or kept from an
+	// earlier version). Backups read from it; `source` stays immutable.
 	resolvedSourcePath?: string;
 	resolvedSourceObservedAt?: string;
     targets: BackupJobTarget[];
@@ -268,14 +271,27 @@ export interface BackupJob {
 	retentionMonthly?: number;
 	retentionYearly?: number;
     excludes: string;
+	// The user's own "skip the contents of any folder that contains ..."
+	// choices. The CACHEDIR.TAG one is also forced on while the job has a
+	// Kopia vault; this saved value doesn't change then.
+	skipNoBackupFolders: boolean;
+	skipCacheDirFolders: boolean;
+	skipMarkerFileName: string;
     tag: string;
 	beforeScriptPath: string;
 	beforeScriptMustSucceed: boolean;
 	afterScriptPath: string;
 	afterScriptMustSucceed: boolean;
     engineSettings: Record<string, EngineJobSettings>;
+	// True when the job also backs up to a vault that isn't attached on this
+	// computer. Its engine isn't known here, so the job's Kopia settings
+	// section decides whether the job counts as using Kopia.
+	unattachedTargets?: boolean;
     sizeBytes: number | null;
 	sizeMeasuredAt: string;
+	// Digest of the stored definition. An edit sends it back, and the backend
+	// refuses the edit (job_definition_changed) when the job changed since.
+	revision: string;
 }
 
 export interface VaultSizeStatus {
@@ -286,6 +302,7 @@ export interface VaultSizeStatus {
 	running: boolean;
 	pending: boolean;
 	paused: boolean;
+	// A failure code such as "vault_size_refresh_failed", not display text.
 	failure?: string;
 }
 
@@ -299,6 +316,9 @@ export interface BackupJobTarget {
     engine: "restic" | "kopia";
     lastRun: string;
     lastStatus: string;
+    // Set only while lastStatus is "completed_with_issues": the qualifier of
+    // the backup run that set it.
+    lastIssueKind?: OperationIssueKind;
     operationId?: string;
     pendingCatchUp: boolean;
     coalescedMissedCount: number;
@@ -314,6 +334,25 @@ export interface BackupJobTarget {
     policyError?: string;
 }
 
+// One folder-check warning from "Update job source". `reason` is the first
+// matching check: an empty folder, a different folder name, or fewer than half
+// of the latest backup's top-level items present.
+export interface JobSourceFolderCheck {
+	reason: "empty" | "name" | "items";
+	chosen: string;
+	current: string;
+	chosenName: string;
+	sourceName: string;
+	matched: number;
+	total: number;
+}
+
+export interface JobSourceUpdateResult {
+	saved: boolean;
+	check?: JobSourceFolderCheck;
+	job?: BackupJob;
+}
+
 export type StorageAvailability = "available" | "unavailable" | "unknown";
 
 export type StorageAvailabilityReason =
@@ -322,12 +361,20 @@ export type StorageAvailabilityReason =
     | "storage_missing"
     | "identity_mismatch"
     | "observation_failed"
-    | "observation_timeout";
+    | "observation_timeout"
+    | "observation_slots_exhausted";
+
+// Narrows a "completed_with_issues" backup without being a status of its own:
+// "locked_files" means every problem was a source file another program had
+// locked. Everything that ranks, counts or groups results keeps matching the
+// status, so only the label changes. Older backends never send it.
+export type OperationIssueKind = "locked_files";
 
 export interface OperationEntry {
     id: string;
     kind: string;
     status: "queued" | "running" | "success" | "failed" | "partial" | "completed_with_issues" | "interrupted" | "reconnect_required";
+    issueKind?: OperationIssueKind;
     title: string;
     jobId: string;
     repositoryId: string;
@@ -379,12 +426,15 @@ export interface OperationLogResponse {
 export interface DashboardIssue {
     id: string;
     timestamp: string;
-    kind: "operation" | "log";
+    // "kopia_policy_stuck" is a current condition of one Kopia vault, whose
+    // name is the title.
+    kind: "operation" | "log" | "kopia_policy_stuck";
     isNew?: boolean;
     operationKind?: string;
 	operationId?: string;
     severity?: "warning" | "error";
     status?: "failed" | "interrupted" | "partial" | "completed_with_issues" | "reconnect_required";
+    issueKind?: OperationIssueKind;
     level?: "ERROR" | "WARN";
     startedAt?: string;
     finishedAt?: string;
@@ -398,6 +448,19 @@ export interface DashboardIssues {
     nextCursor?: string;
 }
 
+// The dashboard timeline tabs other than Issues, which has its own feed.
+export type DashboardTimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other";
+
+export type DashboardTimelineItem =
+    | { id: string; kind: "operation"; operation: OperationEntry }
+    | { id: string; kind: "log"; log: ActivityEntry };
+
+export interface DashboardTimeline {
+    items: DashboardTimelineItem[];
+    hasMore: boolean;
+    nextCursor?: string;
+}
+
 export interface DashboardStats {
     repositoryCount: number;
     jobCount: number;
@@ -406,7 +469,6 @@ export interface DashboardStats {
     failedRuns: number;
     warningRuns?: number;
     lastBackup: string;
-    nextBackup: string;
 }
 
 export interface ActivityEntry {
@@ -485,8 +547,9 @@ export type ThemePreference = "system" | "light" | "neutral" | "dark";
 export interface Settings {
     language?: LanguagePreference;
     effectiveLocale?: string;
+    /** Read-only: the catalog the "system" preference resolves to now. */
+    systemLocale?: string;
     defaultEngine: "restic" | "kopia";
-    autoStart: boolean;
     logRetentionDays: number;
     theme: ThemePreference;
     webhookUrl: string;
@@ -498,7 +561,6 @@ export interface Settings {
     notifyWebhookOnFailure: boolean;
     startWithWindows: boolean;
     startAtLogin?: boolean;
-    minimizeToTray: boolean;
     maxConcurrentJobRuns: number;
     disableAutomaticUpdateChecks: boolean;
 }

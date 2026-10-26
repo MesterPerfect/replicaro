@@ -15,9 +15,10 @@ const vaultProgressHeader = "X-Replicaro-Vault-Progress"
 type vaultProgressKey struct{}
 type vaultProgressSink func(kind, stream, message string)
 
-// Progress is request-scoped presentation. The existing synchronous handlers
-// still own admission, durable intents, locks, native results, and failure
-// recovery; disconnecting this stream never creates a second job authority.
+// Progress is display-only and scoped to one request. The synchronous
+// handlers still own admission checks, durable intents, locks, native
+// results, and failure recovery; closing this stream never hands the job to
+// anything else.
 func reportVaultProgress(ctx context.Context, message string) {
 	if sink, ok := ctx.Value(vaultProgressKey{}).(vaultProgressSink); ok {
 		sink("stage", "", message)
@@ -85,6 +86,15 @@ func withVaultProgress(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// With full duplex on, a handler that returns before reading the whole
+		// body leaves net/http to drain it after the handler, and that drain
+		// races the server's own keep-alive read for the next request ("invalid
+		// concurrent Body.Read call"). Closing the connection after the response
+		// skips the keep-alive read, so leftover body bytes are never parsed as
+		// another request. These requests only come from vault create/connect,
+		// so giving up keep-alive for them costs nothing noticeable. Set it here
+		// so the admission rejection below carries it too.
+		w.Header().Set("Connection", "close")
 		// Admission also supplies CORS and security headers on the outer stream.
 		// The normal route retains its own check and remains the request authority.
 		if !secureAPIRequest(w, r) {
@@ -147,8 +157,9 @@ func withVaultProgress(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), vaultProgressKey{}, vaultProgressSink(writeEvent))
 		ctx = command.ContextWithLiveOutput(ctx, func(stream, output string) {
-			// Native adapters enable this observer only at admitted ordinary
-			// command boundaries; private probes and authorization stay opaque.
+			// Native adapters turn this observer on only for normal engine commands that
+			// have passed admission; output from private probes and authorization is
+			// never streamed.
 			writeEvent("native", stream, output)
 		})
 		response := &vaultProgressResponse{header: make(http.Header)}

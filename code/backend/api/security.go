@@ -18,16 +18,15 @@ const maxJSONBodyBytes int64 = 4 << 20
 
 type securityContextKey struct{}
 
-type SecurityMode uint8
-
-const (
-	SecurityModeProduction SecurityMode = iota
-	SecurityModeDevelopment
-)
-
 type requestSecurity struct {
-	endpoint   runtimeendpoint.Endpoint
-	mode       SecurityMode
+	endpoint runtimeendpoint.Endpoint
+	// lanOrigins are the HTTPS origins from --lan-origin, served by the user's
+	// own reverse proxy. Nil (no flag) keeps the checks loopback-only. Two
+	// constructors build a requestSecurity (the web UI handler and the API
+	// handler, which re-wraps every /api/ request with its own copy), and both
+	// must carry this list: with it on only one side the page loads but every
+	// API call is rejected, or the other way round.
+	lanOrigins runtimeendpoint.LANOrigins
 	clientUUID string
 }
 
@@ -46,21 +45,25 @@ var endpointMethods = map[string][]string{
 	"/api/health": {http.MethodGet}, "/api/integrations": {http.MethodGet},
 	"/api/vaults/connect/preview": {http.MethodPost}, "/api/vaults/connect": {http.MethodPost},
 	"/api/vaults/connect/retry":   {http.MethodPost},
+	rcloneRemoteListPath:          {http.MethodPost},
 	"/api/filesystem/directories": {http.MethodGet}, "/api/dashboard": {http.MethodGet},
 	"/api/dashboard/issues": {http.MethodGet}, "/api/dashboard/issues/review": {http.MethodPost},
-	"/api/dashboard/activity": {http.MethodGet}, "/api/operations/active": {http.MethodGet},
+	"/api/dashboard/timeline": {http.MethodGet}, "/api/dashboard/activity": {http.MethodGet},
+	"/api/operations/active": {http.MethodGet}, "/api/operations/latest-by-vault": {http.MethodGet},
 	"/api/operations/live": {http.MethodGet}, "/api/operations/cancel": {http.MethodPost},
-	"/api/operations/output": {http.MethodGet},
-	"/api/operations":        {http.MethodGet}, "/api/repositories": {http.MethodGet, http.MethodPost, http.MethodDelete},
+	"/api/operations/output":       {http.MethodGet},
+	"/api/operations/locked-files": {http.MethodGet},
+	"/api/operations":              {http.MethodGet}, "/api/repositories": {http.MethodGet, http.MethodPost, http.MethodDelete},
 	"/api/repository-creation-intents": {http.MethodGet, http.MethodDelete}, "/api/repository": {http.MethodGet},
 	"/api/repository-connection-intents": {http.MethodGet, http.MethodDelete},
 	"/api/dormant-recovery-jobs":         {http.MethodGet, http.MethodPost, http.MethodDelete},
-	"/api/repository/schedules":          {http.MethodPut}, "/api/repository/info": {http.MethodGet},
-	"/api/repository/ownership":      {http.MethodGet, http.MethodPost},
-	"/api/repository/password":       {http.MethodGet, http.MethodPost},
-	"/api/repository/password/retry": {http.MethodPost},
-	"/api/repository/credentials":    {http.MethodPut},
-	"/api/repository/check":          {http.MethodPost}, "/api/repository/maintenance": {http.MethodPost},
+	"/api/repository/schedules":          {http.MethodPut},
+	"/api/repository/ownership":          {http.MethodGet, http.MethodPost},
+	"/api/repository/password":           {http.MethodGet, http.MethodPost},
+	"/api/repository/password/retry":     {http.MethodPost},
+	"/api/repository/password/statuses":  {http.MethodGet},
+	"/api/repository/credentials":        {http.MethodPut},
+	"/api/repository/check":              {http.MethodPost}, "/api/repository/maintenance": {http.MethodPost},
 	"/api/repository/vault-size": {http.MethodGet}, "/api/repository/vault-size/prepare": {http.MethodPost}, "/api/repository/snapshots": {http.MethodGet},
 	"/api/snapshot/files": {http.MethodGet}, "/api/files/search": {http.MethodGet}, "/api/files/browse": {http.MethodGet},
 	"/api/files/history": {http.MethodGet}, "/api/files/index/retry": {http.MethodPost}, "/api/snapshot": {http.MethodDelete},
@@ -70,12 +73,11 @@ var endpointMethods = map[string][]string{
 	"/api/rclone/auth/start": {http.MethodPost}, "/api/rclone/auth/continue": {http.MethodPost},
 	"/api/rclone/auth/status":  {http.MethodPost},
 	"/api/rclone/auth/session": {http.MethodDelete}, "/api/rclone/auth/apply": {http.MethodPost},
-	"/api/jobs/run": {http.MethodPost}, "/api/jobs/status": {http.MethodGet},
+	"/api/jobs/run": {http.MethodPost}, "/api/jobs/status": {http.MethodGet}, "/api/jobs/source": {http.MethodPost},
 	"/api/jobs/enabled": {http.MethodPut}, "/api/engines": {http.MethodGet},
 	"/api/vault-profile-sync": {http.MethodGet, http.MethodPost},
 	"/api/engine":             {http.MethodGet}, "/api/logs": {http.MethodGet, http.MethodDelete},
 	"/api/settings": {http.MethodGet, http.MethodPost},
-	"/api/activate": {http.MethodPost},
 }
 
 func secureAPIRequest(w http.ResponseWriter, r *http.Request) bool {
@@ -153,8 +155,9 @@ func approvedFetchMetadata(r *http.Request, security requestSecurity) bool {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return true
 	}
-	// An explicitly constructed development handler may use Vite on one exact
-	// loopback origin. The already validated Origin keeps that usable.
+	// A browser can label a write cross-site when the page and the API use
+	// different accepted origins, for example two configured LAN origins for
+	// the same machine. Allow it only from an origin approvedOrigin accepts.
 	return approvedOrigin(strings.TrimSpace(r.Header.Get("Origin")), security)
 }
 
@@ -172,21 +175,30 @@ func contentSecurityPolicy(security requestSecurity) string {
 		"http://127.0.0.1:" + port,
 		"http://localhost:" + port,
 	}
-	if security.mode == SecurityModeDevelopment {
-		connectSources = append(connectSources,
-			"http://127.0.0.1:5173",
-			"http://localhost:5173",
-		)
-	}
 	return "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src " + strings.Join(connectSources, " ")
 }
 
+// approvedHost accepts the exact loopback forms, or a Host naming one of the
+// configured LAN hostnames with any port. The Host is taken as received from
+// the reverse proxy; X-Forwarded-Host and Forwarded are deliberately ignored,
+// since any client can set them and trusting them would let a request name a
+// Host the proxy never saw. The proxy must pass the browser's Host through.
 func approvedHost(host string, security requestSecurity) bool {
 	host = strings.TrimSpace(host)
-	return host != "" && security.endpoint.HostAllowed(host)
+	return host != "" && (security.endpoint.HostAllowed(host) || security.lanOrigins.HostAllowed(host))
 }
 
+// approvedOrigin accepts the loopback origins, or exactly one of the
+// configured LAN origins. Fetch Metadata's cross-site write fallback and the
+// Access-Control-Allow-Origin echo both go through here, so with two LAN
+// origins configured a page on one may write through the other (for example
+// an IP-address origin and a hostname origin for the same machine). That
+// widening is intended: every configured origin is the user's own proxy in
+// front of this same Replicaro. Unconfigured origins are still rejected.
 func approvedOrigin(origin string, security requestSecurity) bool {
+	if security.lanOrigins.OriginAllowed(origin) {
+		return true
+	}
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Hostname() == "" {
 		return false
@@ -199,17 +211,14 @@ func approvedOrigin(origin string, security requestSecurity) bool {
 	if port == "" {
 		return false
 	}
-	if port == strconv.Itoa(security.endpoint.Port()) {
-		return true
-	}
-	return security.mode == SecurityModeDevelopment && port == "5173"
+	return port == strconv.Itoa(security.endpoint.Port())
 }
 
 func securityFromRequest(r *http.Request) requestSecurity {
 	if value, ok := r.Context().Value(securityContextKey{}).(requestSecurity); ok && value.endpoint.Port() > 0 {
 		return value
 	}
-	return requestSecurity{endpoint: runtimeendpoint.Preferred(), mode: SecurityModeProduction}
+	return requestSecurity{endpoint: runtimeendpoint.Preferred()}
 }
 
 func withSecurity(r *http.Request, security requestSecurity) *http.Request {

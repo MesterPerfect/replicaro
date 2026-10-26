@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/local/replicaro/database"
+	"github.com/local/replicaro/desktop"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/integrations"
 	"github.com/local/replicaro/models"
@@ -88,12 +90,32 @@ func rcloneAuthWorkerFailure(err error) error {
 	return fmt.Errorf("native rclone authorization worker returned no flow")
 }
 
+// A sign-in whose rclone step failed (a refused or failed token exchange, for
+// example) reports one of these instead of "unavailable", so the page says the
+// sign-in failed rather than that it was cancelled or expired. They carry the
+// same fixed texts the start and continue requests use.
+var (
+	errRcloneAuthStartFailed    = errors.New("native rclone authorization could not be started")
+	errRcloneAuthContinueFailed = errors.New("native rclone authorization could not be continued")
+)
+
+func rcloneAuthTransitionFailure(worker *rcloneAuthWorker) error {
+	if worker.generation > 1 {
+		return errRcloneAuthContinueFailed
+	}
+	return errRcloneAuthStartFailed
+}
+
 type rcloneAuthStore struct {
-	mu                  sync.Mutex
-	sessions            map[string]rcloneAuthEntry
-	start               func(context.Context, string, string) (*engines.RcloneAuthorizationFlow, error)
-	startManual         func(context.Context, string, string, func(string)) (*engines.RcloneAuthorizationFlow, error)
-	manualBrowser       bool
+	mu       sync.Mutex
+	sessions map[string]rcloneAuthEntry
+	start    func(context.Context, string, string, func(string)) (*engines.RcloneAuthorizationFlow, error)
+	// openPage opens the sign-in link in the user's browser once rclone has
+	// printed it. It's nil when Replicaro mustn't open a browser: with
+	// --rclone-auth-no-open-browser (or --headless) and in the Docker package.
+	// The link goes back to the UI either way, so a user whose browser didn't
+	// open can still finish signing in.
+	openPage            func(string) error
 	now                 func() time.Time
 	lifetime            time.Duration
 	retryInterval       time.Duration
@@ -103,7 +125,7 @@ type rcloneAuthStore struct {
 	finalUses           sync.WaitGroup
 	cleanups            sync.WaitGroup
 	shutdownCleanupErrs []error
-	beforeManualHandoff func(string)
+	beforeHandoff       func(string)
 	relayFactory        rcloneAuthRelayFactory
 }
 
@@ -120,6 +142,11 @@ type rcloneApplicationOutcome struct {
 	Attached     bool                           `json:"attached"`
 	Usable       *bool                          `json:"usable,omitempty"`
 	FailureStage rcloneApplicationFailureStage  `json:"failureStage,omitempty"`
+	// Only a cloud sign-in apply that saved the new login sets this, when a
+	// cleanup after the save did not finish. Creation and connection copy
+	// just the lifecycle fields above into their own response and report
+	// their issues there.
+	foregroundOutcome
 }
 
 type rcloneApplicationFailureStage string
@@ -187,21 +214,32 @@ func writeRcloneApplicationError(w http.ResponseWriter, status int, outcome rclo
 
 var rcloneAuthConnectorSupported = engines.SupportsConnector
 
-func newRcloneAuthStore(manualBrowser ...bool) *rcloneAuthStore {
-	store := &rcloneAuthStore{
+// openRcloneAuthorizationPage opens the cloud sign-in page in the default
+// browser, the same way the running instance opens its own web interface.
+var openRcloneAuthorizationPage = desktop.OpenURL
+
+// newRcloneAuthStore returns a store that returns each sign-in link to the UI
+// without opening a browser.
+func newRcloneAuthStore() *rcloneAuthStore {
+	return &rcloneAuthStore{
 		sessions:      map[string]rcloneAuthEntry{},
 		start:         engines.StartRcloneAuthorization,
-		startManual:   engines.StartRcloneAuthorizationManual,
 		now:           time.Now,
 		lifetime:      rcloneAuthSessionLifetime,
 		retryInterval: time.Minute,
 	}
-	store.manualBrowser = len(manualBrowser) == 1 && manualBrowser[0]
+}
+
+// newDesktopRcloneAuthStore also opens each sign-in link in the default
+// browser.
+func newDesktopRcloneAuthStore() *rcloneAuthStore {
+	store := newRcloneAuthStore()
+	store.openPage = openRcloneAuthorizationPage
 	return store
 }
 
 func newContainerRcloneAuthStore(relayPort int) *rcloneAuthStore {
-	store := newRcloneAuthStore(true)
+	store := newRcloneAuthStore()
 	store.relayFactory = func(authorizationURL string) (io.Closer, error) {
 		return startRcloneAuthRelay(relayPort, authorizationURL)
 	}
@@ -230,11 +268,7 @@ func (store *rcloneAuthStore) purgeExpired() {
 			store.mu.Unlock()
 			continue
 		}
-		delete(store.sessions, id)
-		store.cleanups.Add(1)
-		store.scheduleLocked()
-		store.mu.Unlock()
-		_ = store.cleanupDetachedEntry(id, entry)
+		_ = store.discardLocked(id, entry)
 	}
 }
 
@@ -273,8 +307,12 @@ func (store *rcloneAuthStore) scheduleLocked() {
 	})
 }
 
-func (store *rcloneAuthStore) launchManualWorker(
-	ctx context.Context, id, provider string,
+// launchWorker runs one native transition (the start, or one answer) on its
+// own goroutine, because rclone's browser step keeps running until the
+// provider calls back. The returned channel receives the sign-in link if the
+// transition reaches that step.
+func (store *rcloneAuthStore) launchWorker(
+	ctx context.Context, provider string,
 	flow *engines.RcloneAuthorizationFlow,
 	answer string, generation uint64,
 ) (<-chan string, *rcloneAuthWorker) {
@@ -291,9 +329,9 @@ func (store *rcloneAuthStore) launchManualWorker(
 		var result *engines.RcloneAuthorizationFlow
 		var err error
 		if flow == nil {
-			result, err = store.startManual(workerCtx, "", provider, onURL)
+			result, err = store.start(workerCtx, "", provider, onURL)
 		} else {
-			err = flow.ContinueManual(workerCtx, answer, onURL)
+			err = flow.Continue(workerCtx, answer, onURL)
 			result = flow
 		}
 		worker.mu.Lock()
@@ -304,7 +342,7 @@ func (store *rcloneAuthStore) launchManualWorker(
 	return urlReady, worker
 }
 
-func (store *rcloneAuthStore) waitManualTransition(
+func (store *rcloneAuthStore) waitTransition(
 	requestCtx context.Context,
 	id, provider string,
 	urlReady <-chan string,
@@ -312,8 +350,8 @@ func (store *rcloneAuthStore) waitManualTransition(
 ) (rcloneAuthStatus, error) {
 	select {
 	case authorizationURL := <-urlReady:
-		if store.beforeManualHandoff != nil {
-			store.beforeManualHandoff("url")
+		if store.beforeHandoff != nil {
+			store.beforeHandoff("url")
 		}
 		store.mu.Lock()
 		entry, live := store.sessions[id]
@@ -366,12 +404,20 @@ func (store *rcloneAuthStore) waitManualTransition(
 		if relay != nil {
 			go store.closeRelayAfterWorker(id, worker, relay)
 		}
+		if store.openPage != nil {
+			// The link is returned below whether or not this works, so a user
+			// without a usable browser here (no default browser, or no
+			// graphical session) can still open it themselves.
+			if err := store.openPage(authorizationURL); err != nil {
+				log.Printf("Replicaro could not open the browser for cloud sign-in; the sign-in link is shown in Replicaro instead: %v", err)
+			}
+		}
 		return rcloneAuthStatus{
 			SessionID: id, Provider: provider, Status: "waiting_browser",
 			AuthorizationURL: authorizationURL,
 		}, nil
 	case <-worker.done:
-		return store.claimManualOutcome(requestCtx, id, worker)
+		return store.claimOutcome(requestCtx, id, worker)
 	case <-requestCtx.Done():
 		return rcloneAuthStatus{}, errors.Join(requestCtx.Err(), store.close(id))
 	}
@@ -392,7 +438,7 @@ func (store *rcloneAuthStore) closeRelayAfterWorker(id string, worker *rcloneAut
 	}
 }
 
-func (store *rcloneAuthStore) claimManualOutcome(
+func (store *rcloneAuthStore) claimOutcome(
 	requestCtx context.Context,
 	id string,
 	worker *rcloneAuthWorker,
@@ -401,7 +447,6 @@ func (store *rcloneAuthStore) claimManualOutcome(
 	if !complete {
 		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization transition is still running")
 	}
-	var detached *rcloneAuthEntry
 	store.mu.Lock()
 	entry, ok := store.sessions[id]
 	if store.shutdown || !ok || entry.worker != worker || entry.generation != worker.generation ||
@@ -411,22 +456,12 @@ func (store *rcloneAuthStore) claimManualOutcome(
 	}
 	if requestCtx != nil && requestCtx.Err() != nil {
 		requestErr := requestCtx.Err()
-		delete(store.sessions, id)
-		store.cleanups.Add(1)
-		store.scheduleLocked()
-		store.mu.Unlock()
-		cleanupErr := store.cleanupDetachedEntry(id, entry)
-		return rcloneAuthStatus{}, errors.Join(requestErr, cleanupErr)
+		return rcloneAuthStatus{}, errors.Join(requestErr, store.discardLocked(id, entry))
 	}
 	if workerErr != nil || flow == nil {
-		delete(store.sessions, id)
-		store.cleanups.Add(1)
-		copy := entry
-		detached = &copy
-		store.scheduleLocked()
-		store.mu.Unlock()
-		cleanupErr := store.cleanupDetachedEntry(id, *detached)
-		return rcloneAuthStatus{}, errors.Join(rcloneAuthWorkerFailure(workerErr), cleanupErr)
+		return rcloneAuthStatus{}, errors.Join(
+			rcloneAuthTransitionFailure(worker), rcloneAuthWorkerFailure(workerErr), store.discardLocked(id, entry),
+		)
 	}
 	relay := entry.relay
 	store.mu.Unlock()
@@ -438,8 +473,8 @@ func (store *rcloneAuthStore) claimManualOutcome(
 		}
 	}
 	ready, question := flow.Status()
-	if store.beforeManualHandoff != nil {
-		store.beforeManualHandoff("outcome")
+	if store.beforeHandoff != nil {
+		store.beforeHandoff("outcome")
 	}
 	store.mu.Lock()
 	current, live := store.sessions[id]
@@ -451,143 +486,79 @@ func (store *rcloneAuthStore) claimManualOutcome(
 	}
 	if requestCtx != nil && requestCtx.Err() != nil {
 		requestErr := requestCtx.Err()
-		delete(store.sessions, id)
-		store.cleanups.Add(1)
-		store.scheduleLocked()
-		store.mu.Unlock()
-		cleanupErr := store.cleanupDetachedEntry(id, current)
-		return rcloneAuthStatus{}, errors.Join(requestErr, cleanupErr)
+		return rcloneAuthStatus{}, errors.Join(requestErr, store.discardLocked(id, current))
 	}
 	if !ready && question == nil {
 		store.mu.Unlock()
 		return rcloneAuthStatus{}, errors.Join(
+			rcloneAuthTransitionFailure(worker),
 			fmt.Errorf("native rclone authorization returned no next action"), store.close(id),
 		)
 	}
 	current.flow = flow
 	current.worker = nil
 	current.relay = nil
+	// rclone's part is done for now, so the session's 15 minutes now count
+	// from here, as they do from every later use.
+	current.expiresAt = store.now().Add(store.lifetime)
 	store.sessions[id] = current
-	store.mu.Unlock()
-	return authStatus(id, current.provider, ready, question), nil
-}
-
-func (store *rcloneAuthStore) startManualFlow(
-	ctx context.Context,
-	provider string,
-) (rcloneAuthStatus, error) {
-	id := uuid.NewString()
-	store.mu.Lock()
-	if store.shutdown {
-		store.mu.Unlock()
-		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization is shutting down")
-	}
-	store.starting.Add(1)
-	defer store.starting.Done()
-	sessionCtx, cancel := context.WithTimeout(context.Background(), store.lifetime)
-	urlReady, worker := store.launchManualWorker(sessionCtx, id, provider, nil, "", 1)
-	store.sessions[id] = rcloneAuthEntry{
-		provider: provider, expiresAt: store.now().Add(store.lifetime), sessionCtx: sessionCtx,
-		cancel: cancel, worker: worker, generation: 1,
-	}
 	store.scheduleLocked()
 	store.mu.Unlock()
-	return store.waitManualTransition(ctx, id, provider, urlReady, worker)
+	return authStatus(id, current.provider, ready, question), nil
 }
 
 func (store *rcloneAuthStore) startFlow(
 	ctx context.Context,
 	provider string,
 ) (rcloneAuthStatus, error) {
-	if store.manualBrowser {
-		return store.startManualFlow(ctx, provider)
-	}
+	id := uuid.NewString()
 	store.mu.Lock()
+	// rclone's sign-in callback listens on one fixed loopback port, so only
+	// one sign-in can wait at the browser step. A session still waiting there
+	// after its link went out has usually lost its page (a reload, a closed
+	// tab, or a second Replicaro tab), and while it holds the port every new
+	// sign-in fails. The newest sign-in wins, so end those sessions first.
+	for !store.shutdown {
+		staleID, stale, found := "", rcloneAuthEntry{}, false
+		for candidateID, candidate := range store.sessions {
+			if candidate.worker == nil || !candidate.worker.urlHandedOff {
+				continue
+			}
+			if _, _, done := candidate.worker.result(); !done {
+				staleID, stale, found = candidateID, candidate, true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+		// A folder that can't be removed stays behind as a retry owner with no
+		// worker, so it can't match again and doesn't block this sign-in.
+		_ = store.discardLocked(staleID, stale)
+		store.mu.Lock()
+	}
 	if store.shutdown {
 		store.mu.Unlock()
 		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization is shutting down")
 	}
 	store.starting.Add(1)
-	store.mu.Unlock()
 	defer store.starting.Done()
-
-	flow, err := store.start(ctx, "", provider)
-	if err != nil {
-		if flow != nil {
-			cleanupErr := flow.Close()
-			if cleanupErr != nil {
-				store.mu.Lock()
-				if store.shutdown {
-					store.mu.Unlock()
-					for attempt := 1; attempt < 3 && cleanupErr != nil; attempt++ {
-						cleanupErr = flow.Close()
-					}
-					if cleanupErr != nil {
-						store.mu.Lock()
-						store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, cleanupErr)
-						store.mu.Unlock()
-					}
-				} else {
-					store.sessions[uuid.NewString()] = rcloneAuthEntry{flow: flow, expiresAt: store.now().Add(store.retryInterval), cleanupErr: cleanupErr}
-					store.scheduleLocked()
-					store.mu.Unlock()
-				}
-				err = errors.Join(err, cleanupErr)
-			}
-		}
-		return rcloneAuthStatus{}, err
-	}
-	ready, question := flow.Status()
-	if !ready && question == nil {
-		cleanupErr := flow.Close()
-		if cleanupErr != nil {
-			store.mu.Lock()
-			if store.shutdown {
-				store.mu.Unlock()
-				for attempt := 1; attempt < 3 && cleanupErr != nil; attempt++ {
-					cleanupErr = flow.Close()
-				}
-				if cleanupErr != nil {
-					store.mu.Lock()
-					store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, cleanupErr)
-					store.mu.Unlock()
-				}
-			} else {
-				store.sessions[uuid.NewString()] = rcloneAuthEntry{flow: flow, expiresAt: store.now().Add(store.retryInterval), cleanupErr: cleanupErr}
-				store.scheduleLocked()
-				store.mu.Unlock()
-			}
-		}
-		return rcloneAuthStatus{}, errors.Join(
-			fmt.Errorf("native rclone authorization returned no next action"),
-			cleanupErr,
-		)
-	}
-	id := uuid.NewString()
-	store.purgeExpired()
-	store.mu.Lock()
-	if store.shutdown {
-		store.mu.Unlock()
-		cleanupErr := flow.Close()
-		for attempt := 1; attempt < 3 && cleanupErr != nil; attempt++ {
-			cleanupErr = flow.Close()
-		}
-		if cleanupErr != nil {
-			store.mu.Lock()
-			store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, cleanupErr)
-			store.mu.Unlock()
-		}
-		return rcloneAuthStatus{}, errors.Join(
-			fmt.Errorf("rclone authorization is shutting down"),
-			cleanupErr,
-		)
-	}
+	// The session context only carries cancellation. How long a session lives
+	// is expiresAt, which the expiry timer enforces: 15 minutes from Connect
+	// or from an answer while rclone works (its browser step included, as
+	// nothing can refresh a session while its worker runs), and 15 minutes
+	// from the last use once it's ready or asking a question. A deadline on
+	// this context couldn't move with those refreshes, and would cancel a
+	// later answer's rclone step after 15 minutes from Connect.
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	urlReady, worker := store.launchWorker(sessionCtx, provider, nil, "", 1)
 	store.sessions[id] = rcloneAuthEntry{
-		flow: flow, expiresAt: store.now().Add(store.lifetime),
+		provider: provider, expiresAt: store.now().Add(store.lifetime), sessionCtx: sessionCtx,
+		cancel: cancel, worker: worker, generation: 1,
 	}
 	store.scheduleLocked()
 	store.mu.Unlock()
-	return authStatus(id, flow.Provider(), ready, question), nil
+	return store.waitTransition(ctx, id, provider, urlReady, worker)
 }
 
 func authStatus(
@@ -608,48 +579,11 @@ func (store *rcloneAuthStore) continueFlow(
 	ctx context.Context,
 	id, answer string,
 ) (rcloneAuthStatus, error) {
-	if store.manualBrowser {
-		return store.continueManualFlow(ctx, id, answer)
-	}
 	store.purgeExpired()
 	store.mu.Lock()
 	entry, ok := store.sessions[id]
-	if ok && entry.cleanupErr == nil && !entry.finalUse {
-		entry.expiresAt = store.now().Add(store.lifetime)
-		store.sessions[id] = entry
-	}
-	store.scheduleLocked()
-	store.mu.Unlock()
-	if !ok {
-		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session is absent or expired")
-	}
-	if entry.cleanupErr != nil {
-		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session cleanup is pending: %w", entry.cleanupErr)
-	}
-	if entry.finalUse {
-		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session is completing a vault transaction")
-	}
-	if err := entry.flow.Continue(ctx, answer); err != nil {
-		return rcloneAuthStatus{}, errors.Join(err, store.close(id))
-	}
-	ready, question := entry.flow.Status()
-	if !ready && question == nil {
-		return rcloneAuthStatus{}, errors.Join(
-			fmt.Errorf("native rclone authorization returned no next action"),
-			store.close(id),
-		)
-	}
-	return authStatus(id, entry.flow.Provider(), ready, question), nil
-}
-
-func (store *rcloneAuthStore) continueManualFlow(
-	ctx context.Context,
-	id, answer string,
-) (rcloneAuthStatus, error) {
-	store.purgeExpired()
-	store.mu.Lock()
-	entry, ok := store.sessions[id]
-	if store.shutdown || !ok || entry.cleanupErr != nil || entry.finalUse {
+	if store.shutdown || !ok || entry.cleanupErr != nil || entry.finalUse ||
+		!store.now().Before(entry.expiresAt) {
 		store.mu.Unlock()
 		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session is unavailable")
 	}
@@ -662,19 +596,19 @@ func (store *rcloneAuthStore) continueManualFlow(
 		store.mu.Unlock()
 		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session is unavailable")
 	}
+	// An answer is a use, and it also bounds the rclone step it starts,
+	// which can include another browser step.
+	entry.expiresAt = store.now().Add(store.lifetime)
 	entry.generation++
-	urlReady, worker := store.launchManualWorker(entry.sessionCtx, id, entry.provider, flow, answer, entry.generation)
+	urlReady, worker := store.launchWorker(entry.sessionCtx, entry.provider, flow, answer, entry.generation)
 	entry.worker = worker
 	store.sessions[id] = entry
 	store.scheduleLocked()
 	store.mu.Unlock()
-	return store.waitManualTransition(ctx, id, entry.provider, urlReady, worker)
+	return store.waitTransition(ctx, id, entry.provider, urlReady, worker)
 }
 
 func (store *rcloneAuthStore) status(id string) (rcloneAuthStatus, error) {
-	if !store.manualBrowser {
-		return rcloneAuthStatus{}, fmt.Errorf("manual rclone authorization status is unavailable")
-	}
 	store.purgeExpired()
 	store.mu.Lock()
 	entry, ok := store.sessions[id]
@@ -685,7 +619,7 @@ func (store *rcloneAuthStore) status(id string) (rcloneAuthStatus, error) {
 	if entry.worker != nil {
 		_, _, complete := entry.worker.result()
 		if complete {
-			return store.claimManualOutcome(nil, id, entry.worker)
+			return store.claimOutcome(nil, id, entry.worker)
 		}
 		store.mu.Lock()
 		current, live := store.sessions[id]
@@ -718,35 +652,6 @@ func (store *rcloneAuthStore) status(id string) (rcloneAuthStatus, error) {
 		return rcloneAuthStatus{}, fmt.Errorf("rclone authorization session is absent or expired")
 	}
 	return authStatus(id, entry.provider, ready, question), nil
-}
-
-func (store *rcloneAuthStore) options(
-	id, provider string,
-) (map[string]string, error) {
-	store.purgeExpired()
-	store.mu.Lock()
-	entry, ok := store.sessions[id]
-	flow, complete := entry.flow, entry.worker == nil
-	if ok && complete && flow != nil && entry.cleanupErr == nil && !entry.finalUse &&
-		flow.Provider() == provider {
-		if !store.manualBrowser {
-			entry.expiresAt = store.now().Add(store.lifetime)
-		}
-		entry.flow = flow
-		store.sessions[id] = entry
-	}
-	store.scheduleLocked()
-	store.mu.Unlock()
-	if !ok || !complete || flow == nil || flow.Provider() != provider {
-		return nil, fmt.Errorf("rclone authorization session does not match this provider")
-	}
-	if entry.cleanupErr != nil {
-		return nil, fmt.Errorf("rclone authorization session cleanup is pending: %w", entry.cleanupErr)
-	}
-	if entry.finalUse {
-		return nil, fmt.Errorf("rclone authorization session is completing a vault transaction")
-	}
-	return flow.IdentityOptions()
 }
 
 func (store *rcloneAuthStore) configPath(id, provider string) (string, error) {
@@ -782,24 +687,39 @@ func (store *rcloneAuthStore) publishConfig(
 func (store *rcloneAuthStore) close(id string) error {
 	store.mu.Lock()
 	entry, ok := store.sessions[id]
-	if ok {
-		if entry.finalUse {
-			store.mu.Unlock()
-			return fmt.Errorf("rclone authorization session is completing a vault transaction")
-		}
-		delete(store.sessions, id)
-		store.cleanups.Add(1)
-	}
-	store.scheduleLocked()
-	store.mu.Unlock()
 	if !ok {
+		store.scheduleLocked()
+		store.mu.Unlock()
 		return nil
 	}
-	return store.cleanupDetachedEntry(id, entry)
+	if entry.finalUse {
+		store.mu.Unlock()
+		return fmt.Errorf("rclone authorization session is completing a vault transaction")
+	}
+	return store.discardLocked(id, entry)
 }
 
-func (store *rcloneAuthStore) cleanupDetachedEntry(id string, entry rcloneAuthEntry) error {
+// discardLocked takes id out of the store, so no request, timer or relay can
+// use it any more, and then disposes of it. The caller holds store.mu;
+// discardLocked releases it first, because disposing waits for the native
+// worker to exit. closeAll waits for every discard still running.
+func (store *rcloneAuthStore) discardLocked(id string, entry rcloneAuthEntry) error {
+	delete(store.sessions, id)
+	store.cleanups.Add(1)
+	store.scheduleLocked()
+	store.mu.Unlock()
 	defer store.cleanups.Done()
+	return store.dispose(id, entry)
+}
+
+// dispose ends a session that is no longer in the store: it closes the Docker
+// callback relay, cancels the native worker and waits for it, and removes the
+// session's private folders. When a folder can't be removed, the entry comes
+// back under the same id as a retry owner that the expiry timer tries again
+// after retryInterval, and that blocks any further use of the session. During
+// shutdown nothing retries later, so it tries three times in all and keeps a
+// failure that remains for closeAll to report.
+func (store *rcloneAuthStore) dispose(id string, entry rcloneAuthEntry) error {
 	var relayErr error
 	if entry.relay != nil {
 		relayErr = entry.relay.Close()
@@ -811,44 +731,47 @@ func (store *rcloneAuthStore) cleanupDetachedEntry(id string, entry rcloneAuthEn
 	if entry.worker != nil {
 		entry.worker.cancel()
 		<-entry.worker.done
-		flow, _, _ := entry.worker.result()
-		if flow != nil {
+		if flow, _, _ := entry.worker.result(); flow != nil {
 			entry.flow = flow
 		}
+		entry.worker = nil
 	}
-	if entry.flow != nil {
-		if err := entry.flow.Close(); err != nil {
-			store.mu.Lock()
-			shuttingDown := store.shutdown
-			store.mu.Unlock()
-			if shuttingDown {
-				for attempt := 1; attempt < 3 && err != nil; attempt++ {
-					err = entry.flow.Close()
-				}
-				if err != nil {
-					wrapped := fmt.Errorf("clean up rclone authorization session %s: %w", id, err)
-					store.mu.Lock()
-					store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, wrapped)
-					store.mu.Unlock()
-					return errors.Join(relayErr, wrapped)
-				}
-				return relayErr
-			}
+	if entry.flow == nil {
+		return relayErr
+	}
+	err := entry.flow.Close()
+	if err == nil {
+		return relayErr
+	}
+	store.mu.Lock()
+	if !store.shutdown {
+		if _, exists := store.sessions[id]; !exists {
 			entry.cleanupErr = err
+			entry.finalUse = false
 			entry.expiresAt = store.now().Add(store.retryInterval)
-			entry.worker = nil
-			store.mu.Lock()
-			if _, exists := store.sessions[id]; !store.shutdown && !exists {
-				store.sessions[id] = entry
-				store.scheduleLocked()
-			}
-			store.mu.Unlock()
-			return errors.Join(relayErr, fmt.Errorf("clean up rclone authorization session: %w", err))
+			store.sessions[id] = entry
+			store.scheduleLocked()
 		}
+		store.mu.Unlock()
+		return errors.Join(relayErr, fmt.Errorf("clean up rclone authorization session: %w", err))
 	}
-	return relayErr
+	store.mu.Unlock()
+	for attempt := 1; attempt < 3 && err != nil; attempt++ {
+		err = entry.flow.Close()
+	}
+	if err == nil {
+		return relayErr
+	}
+	wrapped := fmt.Errorf("clean up rclone authorization session %s: %w", id, err)
+	store.mu.Lock()
+	store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, wrapped)
+	store.mu.Unlock()
+	return errors.Join(relayErr, wrapped)
 }
 
+// closeAll ends every session for shutdown. Shutdown can call it more than
+// once (see the staged shutdown in main); each failure is reported by the
+// first call that sees it, so a later call doesn't log it again.
 func (store *rcloneAuthStore) closeAll() error {
 	store.mu.Lock()
 	store.shutdown = true
@@ -866,24 +789,27 @@ func (store *rcloneAuthStore) closeAll() error {
 	}
 	store.mu.Unlock()
 	var errs []error
-	// Relay closure and cancellation are deliberately a separate first pass:
-	// one slow reap must never leave a later callback or worker admitted until
-	// its 15-minute deadline.
-	for id, entry := range entries {
-		if entry.relay != nil {
-			if relayErr := entry.relay.Close(); relayErr != nil {
-				errs = append(errs, relayErr)
+	// Closing relays and cancelling workers is a separate pass ahead of any
+	// waiting: one slow reap must never leave a later callback or worker
+	// admitted until its 15-minute deadline.
+	stopAll := func() {
+		for id, entry := range entries {
+			if entry.relay != nil {
+				if relayErr := entry.relay.Close(); relayErr != nil {
+					errs = append(errs, relayErr)
+				}
+				entry.relay = nil
+				entries[id] = entry
 			}
-			entry.relay = nil
-			entries[id] = entry
-		}
-		if entry.cancel != nil {
-			entry.cancel()
-		}
-		if entry.worker != nil {
-			entry.worker.cancel()
+			if entry.cancel != nil {
+				entry.cancel()
+			}
+			if entry.worker != nil {
+				entry.worker.cancel()
+			}
 		}
 	}
+	stopAll()
 	store.starting.Wait()
 	store.finalUses.Wait()
 	store.mu.Lock()
@@ -892,69 +818,17 @@ func (store *rcloneAuthStore) closeAll() error {
 		delete(store.sessions, id)
 	}
 	store.mu.Unlock()
-	for _, entry := range entries {
-		if entry.relay != nil {
-			if relayErr := entry.relay.Close(); relayErr != nil {
-				errs = append(errs, relayErr)
-			}
-		}
-		if entry.cancel != nil {
-			entry.cancel()
-		}
-		if entry.worker != nil {
-			entry.worker.cancel()
-		}
-	}
+	stopAll()
 	for id, entry := range entries {
-		if entry.worker != nil {
-			<-entry.worker.done
-			if flow, _, _ := entry.worker.result(); flow != nil {
-				entry.flow = flow
-			}
-		}
-		if entry.flow == nil {
-			continue
-		}
-		var cleanupErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			cleanupErr = entry.flow.Close()
-			if cleanupErr == nil {
-				break
-			}
-		}
-		if cleanupErr != nil {
-			errs = append(errs, fmt.Errorf("clean up rclone authorization session %s: %w", id, cleanupErr))
-		}
+		// A failure is kept in shutdownCleanupErrs and reported below.
+		_ = store.dispose(id, entry)
 	}
 	store.cleanups.Wait()
 	store.mu.Lock()
 	errs = append(errs, store.shutdownCleanupErrs...)
+	store.shutdownCleanupErrs = nil
 	store.mu.Unlock()
 	return errors.Join(errs...)
-}
-
-func (store *rcloneAuthStore) mergeOptions(
-	sessionID, provider string,
-	submitted map[string]string,
-) (map[string]string, error) {
-	if !engines.IsRcloneNativeLoginProvider(provider) {
-		if strings.TrimSpace(sessionID) != "" {
-			return nil, fmt.Errorf("rclone authorization session is invalid for this storage type")
-		}
-		result := make(map[string]string, len(submitted))
-		for key, value := range submitted {
-			result[key] = value
-		}
-		return result, nil
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		return nil, fmt.Errorf("connect the %s account with rclone before continuing", provider)
-	}
-	native, err := store.options(sessionID, provider)
-	if err != nil {
-		return nil, err
-	}
-	return mergeRcloneAuthorizedOptions(submitted, native)
 }
 
 func mergeRcloneAuthorizedOptions(
@@ -980,14 +854,25 @@ func mergeRcloneAuthorizedOptions(
 // authorization while a create/connect transaction is in flight. Only a
 // retained publication releases the lease for retry. Activated and
 // indeterminate publication consume the session before cleanup, and a later
-// error never restores usability.
+// error never restores usability. The existing-vault Check takes the same
+// lease and always releases it as retained: it reads the staged rclone.conf
+// too, and expiry skips a leased session, so that config can't be removed
+// while the Check runs. Taking the lease and releasing it as retained are
+// both uses that restart the session's 15 minutes.
 func (store *rcloneAuthStore) mergeOptionsForFinalTransaction(
 	sessionID, provider string,
 	submitted map[string]string,
 ) (map[string]string, func(engines.RcloneConfigDisposition) error, error) {
 	if !engines.IsRcloneNativeLoginProvider(provider) {
-		options, err := store.mergeOptions(sessionID, provider, submitted)
-		return options, func(engines.RcloneConfigDisposition) error { return nil }, err
+		noFinish := func(engines.RcloneConfigDisposition) error { return nil }
+		if strings.TrimSpace(sessionID) != "" {
+			return nil, noFinish, fmt.Errorf("rclone authorization session is invalid for this storage type")
+		}
+		options := make(map[string]string, len(submitted))
+		for key, value := range submitted {
+			options[key] = value
+		}
+		return options, noFinish, nil
 	}
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, nil, fmt.Errorf(
@@ -1004,7 +889,8 @@ func (store *rcloneAuthStore) mergeOptionsForFinalTransaction(
 		store.scheduleLocked()
 		store.mu.Unlock()
 		return nil, nil, fmt.Errorf("rclone authorization is shutting down")
-	case !ok || !complete || flow == nil || flow.Provider() != provider:
+	case !ok || !complete || flow == nil || flow.Provider() != provider ||
+		!store.now().Before(entry.expiresAt):
 		store.scheduleLocked()
 		store.mu.Unlock()
 		return nil, nil, fmt.Errorf("rclone authorization session does not match this provider")
@@ -1021,9 +907,7 @@ func (store *rcloneAuthStore) mergeOptionsForFinalTransaction(
 	}
 	entry.flow = flow
 	entry.finalUse = true
-	if !store.manualBrowser {
-		entry.expiresAt = store.now().Add(store.lifetime)
-	}
+	entry.expiresAt = store.now().Add(store.lifetime)
 	store.sessions[sessionID] = entry
 	store.finalUses.Add(1)
 	store.scheduleLocked()
@@ -1033,52 +917,30 @@ func (store *rcloneAuthStore) mergeOptionsForFinalTransaction(
 	var finishErr error
 	finish := func(disposition engines.RcloneConfigDisposition) error {
 		once.Do(func() {
+			defer store.finalUses.Done()
 			store.mu.Lock()
 			current, exists := store.sessions[sessionID]
 			if !exists || !current.finalUse {
 				finishErr = fmt.Errorf("rclone authorization final-use ownership was lost")
-			} else if disposition == engines.RcloneConfigRetained {
-				current.finalUse = false
-				if !store.manualBrowser {
-					current.expiresAt = store.now().Add(store.lifetime)
-				}
-				store.sessions[sessionID] = current
-			} else {
-				delete(store.sessions, sessionID)
+				store.scheduleLocked()
+				store.mu.Unlock()
+				return
 			}
+			if disposition == engines.RcloneConfigRetained {
+				current.finalUse = false
+				current.expiresAt = store.now().Add(store.lifetime)
+				store.sessions[sessionID] = current
+				store.scheduleLocked()
+				store.mu.Unlock()
+				return
+			}
+			// Activated and indeterminate both consume the sign-in, so it
+			// leaves the store before its folders are removed and can't be
+			// applied again even if that removal fails.
+			delete(store.sessions, sessionID)
 			store.scheduleLocked()
 			store.mu.Unlock()
-			if exists && current.finalUse && disposition != engines.RcloneConfigRetained {
-				if current.cancel != nil {
-					current.cancel()
-				}
-				if err := current.flow.Close(); err != nil {
-					current.finalUse = false
-					current.cleanupErr = err
-					current.expiresAt = store.now().Add(store.retryInterval)
-					store.mu.Lock()
-					shuttingDown := store.shutdown
-					if !shuttingDown {
-						store.sessions[sessionID] = current
-						store.scheduleLocked()
-					}
-					store.mu.Unlock()
-					if shuttingDown {
-						for attempt := 1; attempt < 3 && err != nil; attempt++ {
-							err = current.flow.Close()
-						}
-						if err != nil {
-							store.mu.Lock()
-							store.shutdownCleanupErrs = append(store.shutdownCleanupErrs, err)
-							store.mu.Unlock()
-						}
-					}
-					if err != nil {
-						finishErr = fmt.Errorf("clean up consumed rclone authorization session: %w", err)
-					}
-				}
-			}
-			store.finalUses.Done()
+			finishErr = store.dispose(sessionID, current)
 		})
 		return finishErr
 	}
@@ -1167,6 +1029,14 @@ func registerRcloneAuthHandlers(
 		}
 		status, err := store.status(req.SessionID)
 		if err != nil {
+			// A sign-in that failed is reported as a failure, once, as it ends.
+			// Unknown, cancelled and expired sessions stay 404.
+			for _, failure := range []error{errRcloneAuthStartFailed, errRcloneAuthContinueFailed} {
+				if errors.Is(err, failure) {
+					writeRcloneAuthorizationError(w, http.StatusBadRequest, failure.Error())
+					return
+				}
+			}
 			writeRcloneAuthorizationError(w, http.StatusNotFound,
 				"native rclone authorization session is unavailable")
 			return
@@ -1245,12 +1115,10 @@ func registerRcloneAuthHandlers(
 			return
 		}
 		if finishErr != nil {
-			outcome.FailureStage = rcloneFailureArtifactWork
-			writeRcloneApplicationError(w, http.StatusInternalServerError, outcome, fmt.Errorf(
-				"rclone login was saved, but its temporary authorization session needs cleanup: %w",
-				finishErr,
-			))
-			return
+			// The login is saved and in use; only the temporary session is
+			// left. That is completed with issues, not an error the page would
+			// read as "sign-in failed".
+			outcome.addIssue("The rclone login was saved, but its temporary authorization session still needs cleanup.")
 		}
 		writeJSON(w, outcome)
 	})
@@ -1268,14 +1136,14 @@ func applyRcloneAuthorizedCredentials(
 		Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 		Attached:   true,
 	}
-	// A native-login apply is an attended foreground transaction. In particular,
-	// OneDrive and Google Drive can still be completing an ordinary protected
-	// profile publication when the browser flow returns. Wait for that exact
-	// in-process vault owner, then revalidate every admission and saved-vault
-	// precondition below while holding the lock. A one-shot try here made slower
-	// providers report a spurious busy failure; cancellation still leaves the
-	// retained authorization retryable. This wait neither unlocks native work
-	// nor masks remote multi-computer races.
+	// A native-login apply runs in the foreground while the user waits. OneDrive
+	// and Google Drive in particular can still be publishing the protected
+	// profile, holding this vault's lock, when the browser flow returns. Wait for
+	// that in-process lock holder instead of trying once (a single try makes
+	// slower providers report a spurious busy error), then revalidate every check
+	// and saved-vault precondition below while holding the lock. Cancelling the
+	// wait still leaves the retained authorization retryable. The wait does not
+	// unlock any native work and does not cover races with other computers.
 	unlock, lockErr := vaultlock.AcquireExclusiveContext(ctx, repo.ID)
 	if lockErr != nil {
 		return failRcloneApplication(outcome, rcloneFailureAdmission, lockErr)
@@ -1283,12 +1151,13 @@ func applyRcloneAuthorizedCredentials(
 	defer unlock()
 	// Authorization may outlive the saved-row review. A pending reconnect or
 	// password change must be rejected under the vault lock before native
-	// validation, artifact staging, or canonical rclone config publication.
-	// Publication used to precede the database reservation check at commit.
+	// validation, artifact staging, or canonical rclone config publication, not
+	// only by the database reservation check at commit.
 	if err := database.ValidateRepositoryMutationAdmission(db, repo.ID); err != nil {
-		// The handler loaded repo before waiting for the vault owner. Removal may
-		// have committed under that owner in the meantime, so only conclusive
-		// under-lock absence replaces the pre-wait attachment truth.
+		// The handler loaded repo before waiting for the vault lock, and a removal
+		// may have committed while we waited. Only a confirmed "row not found" under
+		// the lock marks the vault as no longer attached; any other error keeps the
+		// attachment state loaded before the wait.
 		if errors.Is(err, sql.ErrNoRows) {
 			outcome.Attached = false
 		}
@@ -1331,10 +1200,10 @@ func applyRcloneAuthorizedCredentials(
 	candidate.RcloneConfigPath = stagedConfig
 	// This uses the staged rclone credentials for the existing native access
 	// probe. The protected root/profile checks below match the saved vault
-	// records; ordinary backup admission compares the actual native ID before
-	// backup. Do not add another Restic config read for the narrow false-success
-	// case described at validateRotatedCredentials: it would add a remote round
-	// trip without a demonstrated backup-integrity benefit.
+	// records, and backup admission compares the actual native ID before backup.
+	// Do not add another Restic config read here for the false-success case
+	// described at validateRotatedCredentials: it adds a remote round trip, and
+	// backup admission already checks the repository ID.
 	if err := validateRotatedCredentials(ctx, candidate); err != nil {
 		return failRcloneApplication(outcome, rcloneFailureNativeValidation, fmt.Errorf("rclone login could not access the native vault"))
 	}
@@ -1346,8 +1215,7 @@ func applyRcloneAuthorizedCredentials(
 	if err != nil {
 		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login returned an invalid vault root"))
 	}
-	if root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
-		root.Repository.NativeRepositoryID != repo.NativeRepositoryID {
+	if !root.Identifies(repo) {
 		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login addresses a different vault"))
 	}
 	profileData, err := readProfileWithRotatedCredentials(ctx, candidate)
@@ -1384,8 +1252,19 @@ func applyRcloneAuthorizedCredentials(
 	}
 	outcome.Attached = true
 	outcome.Usable = assessedUsability(true)
+	// The new login is committed above. A quarantined old engine artifact
+	// that cannot be removed is left for manual cleanup and makes the apply
+	// completed with issues; it is not a failure, because nothing should be
+	// retried.
+	//
+	// The issue text is fixed on purpose. The finalize error names the local
+	// app-data quarantine path, and apply responses never carry sensitive
+	// paths (before this was completed with issues, the same case went out
+	// through writeRcloneApplicationError, which also sends a fixed message).
+	// The raw error goes to the local log for whoever does the cleanup.
 	if err := finalizeRepositoryArtifacts(stage); err != nil {
-		return failRcloneApplication(outcome, rcloneFailureArtifactWork, fmt.Errorf("credentials were updated but quarantined old engine artifacts require manual cleanup: %w", err))
+		log.Printf("cloud sign-in apply for vault %s: quarantined old engine artifacts could not be removed: %v", repo.ID, err)
+		outcome.addIssue("credentials were updated but quarantined old engine artifacts require manual cleanup")
 	}
 	_ = database.LogActivity(db, "Repository rclone account reconnected: "+repo.Name)
 	return outcome, nil

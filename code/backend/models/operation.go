@@ -10,8 +10,17 @@ type Operation struct {
 	Engine       string          `json:"engine"`
 	StartedAt    string          `json:"startedAt"`
 	FinishedAt   string          `json:"finishedAt"`
+	IssueKind    string          `json:"issueKind,omitempty"` // "" or OperationIssueLockedFiles, only on a completed_with_issues backup
 	Steps        []OperationStep `json:"steps,omitempty"`
 }
+
+// OperationIssueLockedFiles marks a completed_with_issues backup whose only
+// problems were source files another program held locked. It is a qualifier
+// on that status rather than a status of its own: dashboards, health,
+// retention and webhook consumers keep matching "completed_with_issues"
+// exactly as before, and an older build reading the same database simply
+// shows the plain result.
+const OperationIssueLockedFiles = "locked_files"
 
 type OperationStep struct {
 	ID          string `json:"id"`

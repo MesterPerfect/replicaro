@@ -9,6 +9,7 @@ import (
 
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/storageidentity"
 	"github.com/local/replicaro/vaultprofile"
 )
 
@@ -24,6 +25,51 @@ type portableJobDefinition struct {
 	SourceStorageKey     string `json:"sourceStorageKey"`
 	SourceStorageJSON    string `json:"sourceStorageDescriptor"`
 	SourceBindingState   string `json:"sourceBindingState,omitempty"`
+	// aliased is set (never serialized) on a definition built from an active
+	// job that has an "Update job source" alias. See aliasFreeSourceBinding.
+	aliased bool
+}
+
+// Dormant recovery definitions and aliases
+//
+// An active job with an alias stores the alias's facts in its binding
+// (source_storage_json describes the location backups read). A dormant
+// definition has no alias: if it is ever restored, the job starts from its
+// immutable source. So a dormant copy must never take the active job's
+// binding while an alias is set, or the restored job would check its source
+// against another folder's mount point and filesystem type.
+//
+// Instead, the definition built from an aliased job carries a binding with no
+// facts, every writer keeps a dormant row's own binding (the source's facts,
+// recorded before the alias existed) when there is one, and the consistency
+// check between copies of one job ID does not compare bindings when one side
+// is aliased.
+
+func aliasFreeSourceBinding(definition *portableJobDefinition) {
+	encoded, err := storageidentity.EncodeBinding(storageidentity.Facts{})
+	if err != nil {
+		// Facts{} always encodes; keep the input unchanged if it ever does not.
+		return
+	}
+	definition.SourceStorageVersion = storageidentity.BindingVersion
+	definition.SourceStorageKey = definition.Source
+	definition.SourceStorageJSON = encoded
+}
+
+// keepDormantSourceBinding applies an active definition to a dormant row
+// while keeping the row's own binding when the active job is aliased. The
+// binding state travels with the binding: an unbound copy has no binding
+// fields, so giving it the active job's "bound" state would leave a bound row
+// with no binding at all.
+func keepDormantSourceBinding(active, dormant portableJobDefinition) portableJobDefinition {
+	if active.aliased && dormant.Source == active.Source {
+		active.SourceStorageVersion = dormant.SourceStorageVersion
+		active.SourceStorageKey = dormant.SourceStorageKey
+		active.SourceStorageJSON = dormant.SourceStorageJSON
+		active.SourceBindingState = dormant.SourceBindingState
+	}
+	active.aliased = false
+	return active
 }
 
 func (definition portableJobDefinition) MarshalJSON() ([]byte, error) {
@@ -73,13 +119,16 @@ func (definition *portableJobDefinition) UnmarshalJSON(data []byte) error {
 }
 
 func portableDefinitionFromModel(job models.BackupJob) portableJobDefinition {
-	return portableJobDefinition{
+	definition := portableJobDefinition{
 		BackupJob: vaultprofile.BackupJob{
 			JobUUID: job.ID, Name: job.Name, Source: job.Source, Schedule: job.Schedule,
 			Retention: job.Retention, RetentionHourly: job.RetentionHourly,
 			RetentionDaily: job.RetentionDaily, RetentionWeekly: job.RetentionWeekly,
 			RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
 			Exclusions: job.Excludes, Tag: job.Tag,
+			SkipNoBackupFolders:     job.SkipNoBackupFolders,
+			SkipCacheDirFolders:     job.SkipCacheDirFolders,
+			SkipMarkerFileName:      job.SkipMarkerFileName,
 			BeforeScriptPath:        job.BeforeScriptPath,
 			BeforeScriptMustSucceed: job.BeforeScriptMustSucceed,
 			AfterScriptPath:         job.AfterScriptPath,
@@ -92,6 +141,11 @@ func portableDefinitionFromModel(job models.BackupJob) portableJobDefinition {
 		SourceStorageJSON:    job.SourceStorageDescriptorJSON,
 		SourceBindingState:   job.SourceBindingState,
 	}
+	if job.ResolvedSourcePath != "" && normalizedJobSourceBindingState(job.SourceBindingState) == "bound" {
+		definition.aliased = true
+		aliasFreeSourceBinding(&definition)
+	}
+	return definition
 }
 
 func decodePortableDefinition(value string) (portableJobDefinition, error) {
@@ -122,6 +176,7 @@ func reconcileDormantWithActiveJobs(tx *sql.Tx, jobs []models.BackupJob) ([]stri
 		type dormantOwner struct {
 			repositoryID string
 			enabled      bool
+			definition   portableJobDefinition
 		}
 		dormantOwners := []dormantOwner{}
 		mergedTargets := append([]string(nil), active.TargetVaultUUIDs...)
@@ -141,10 +196,10 @@ func reconcileDormantWithActiveJobs(tx *sql.Tx, jobs []models.BackupJob) ([]stri
 				return nil, fmt.Errorf("portable job %s cannot be attached: its definition or settings differ from a dormant definition for the same job ID", job.ID)
 			}
 			mergedTargets = mergePortableTargetIDs(mergedTargets, dormant.TargetVaultUUIDs)
-			dormantOwners = append(dormantOwners, dormantOwner{repositoryID: repositoryID, enabled: dormant.Enabled})
+			dormantOwners = append(dormantOwners, dormantOwner{repositoryID: repositoryID, enabled: dormant.Enabled, definition: dormant})
 			affected = append(affected, repositoryID)
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return nil, err
 		}
 		if len(dormantOwners) == 0 {
@@ -158,7 +213,7 @@ func reconcileDormantWithActiveJobs(tx *sql.Tx, jobs []models.BackupJob) ([]stri
 			return nil, err
 		}
 		for _, owner := range dormantOwners {
-			updated := active
+			updated := keepDormantSourceBinding(active, owner.definition)
 			updated.Enabled = owner.enabled
 			updated.TargetVaultUUIDs = append([]string(nil), mergedTargets...)
 			encodedDefinition, err := json.Marshal(updated)
@@ -181,6 +236,17 @@ func dormantDefinitionsMatch(left, right portableJobDefinition) bool {
 	right.Enabled = false
 	left.SourceBindingState = normalizedJobSourceBindingState(left.SourceBindingState)
 	right.SourceBindingState = normalizedJobSourceBindingState(right.SourceBindingState)
+	aliased := left.aliased || right.aliased
+	left.aliased, right.aliased = false, false
+	// Dormant copies are not converted when the active job's legacy binding
+	// is; a legacy copy and a converted copy of the same source describe the
+	// same local binding. An aliased job's binding describes its alias, not
+	// its source, so it cannot be compared with a dormant copy at all.
+	if aliased || equivalentSourceBinding(left.SourceStorageVersion, left.SourceStorageKey, left.SourceStorageJSON,
+		right.SourceStorageVersion, right.SourceStorageKey, right.SourceStorageJSON) {
+		right.SourceStorageVersion, right.SourceStorageKey, right.SourceStorageJSON =
+			left.SourceStorageVersion, left.SourceStorageKey, left.SourceStorageJSON
+	}
 	return reflect.DeepEqual(left, right)
 }
 
@@ -232,25 +298,29 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 			existingDormantRows = append(existingDormantRows, existingDormant{repositoryID: ownerID, enabled: existing.Enabled})
 			affected = append(affected, ownerID)
 		}
-		if err := rows.Close(); err != nil {
+		if err := closeRows(rows); err != nil {
 			return nil, err
 		}
-		var activeJSON, portableJSON string
+		var activeJSON, portableJSON, alias string
 		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, beforeScriptPath, afterScriptPath string
+		var skipNoBackup, skipCacheDir bool
+		var skipMarkerName string
 		var beforeScriptMustSucceed, afterScriptMustSucceed bool
 		var retention, enabled int
 		var retentionHourly, retentionDaily, retentionWeekly, retentionMonthly, retentionYearly sql.NullInt64
 		err = tx.QueryRow(`SELECT name,source,source_storage_version,source_storage_key,
 			source_storage_json,source_binding_state,schedule,retention,retention_hourly,retention_daily,
-			retention_weekly,retention_monthly,retention_yearly,excludes,tag,
+			retention_weekly,retention_monthly,retention_yearly,excludes,
+			skip_nobackup_folders,skip_cachedir_folders,skip_marker_file_name,tag,
 			before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 			engine_settings,
-			portable_target_ids,enabled FROM backup_jobs WHERE id=?`, definition.JobID).Scan(
+			portable_target_ids,enabled,resolved_source_path FROM backup_jobs WHERE id=?`, definition.JobID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON, &sourceBindingState,
 			&schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
-			&retentionMonthly, &retentionYearly, &excludes, &tag, &beforeScriptPath, &beforeScriptMustSucceed,
-			&afterScriptPath, &afterScriptMustSucceed, &activeJSON, &portableJSON, &enabled)
+			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
+			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
+			&afterScriptPath, &afterScriptMustSucceed, &activeJSON, &portableJSON, &enabled, &alias)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
@@ -267,6 +337,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 					RetentionDaily: nullableRetentionValue(retentionDaily), RetentionWeekly: nullableRetentionValue(retentionWeekly),
 					RetentionMonthly: nullableRetentionValue(retentionMonthly), RetentionYearly: nullableRetentionValue(retentionYearly),
 					Exclusions: excludes, Tag: tag,
+					SkipNoBackupFolders: skipNoBackup, SkipCacheDirFolders: skipCacheDir, SkipMarkerFileName: skipMarkerName,
 					BeforeScriptPath: beforeScriptPath, BeforeScriptMustSucceed: beforeScriptMustSucceed,
 					AfterScriptPath: afterScriptPath, AfterScriptMustSucceed: afterScriptMustSucceed,
 					EngineSettings: settings, Enabled: enabled != 0, TargetVaultUUIDs: targets,
@@ -275,6 +346,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 				SourceStorageKey:     sourceStorageKey,
 				SourceStorageJSON:    sourceStorageJSON,
 				SourceBindingState:   sourceBindingState,
+				aliased:              alias != "",
 			}
 			if !dormantDefinitionsMatch(active, parsed) {
 				return nil, fmt.Errorf("dormant portable job %s cannot be stored: its definition or settings differ from the active local job", definition.JobID)
@@ -302,7 +374,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 				}
 				affected = append(affected, ownerID)
 			}
-			if closeErr := activeRows.Close(); closeErr != nil {
+			if closeErr := closeRows(activeRows); closeErr != nil {
 				return nil, closeErr
 			}
 		}
@@ -380,7 +452,7 @@ func DiscardDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) error {
 		updates = append(updates, dormantUpdate{ownerID, string(encoded)})
 		affected = append(affected, ownerID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return err
 	}
 	for _, update := range updates {
@@ -414,7 +486,7 @@ func DiscardDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) error {
 			}
 			affected = append(affected, id)
 		}
-		if err := activeRows.Close(); err != nil {
+		if err := closeRows(activeRows); err != nil {
 			return err
 		}
 	} else if err != sql.ErrNoRows {
@@ -457,7 +529,9 @@ func PrepareDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) (models.B
 		RetentionDaily: saved.RetentionDaily, RetentionWeekly: saved.RetentionWeekly,
 		RetentionMonthly: saved.RetentionMonthly, RetentionYearly: saved.RetentionYearly,
 		Excludes: saved.Exclusions, Tag: saved.Tag, Enabled: false,
-		BeforeScriptPath: saved.BeforeScriptPath, BeforeScriptMustSucceed: saved.BeforeScriptMustSucceed,
+		SkipNoBackupFolders: saved.SkipNoBackupFolders, SkipCacheDirFolders: saved.SkipCacheDirFolders,
+		SkipMarkerFileName: saved.SkipMarkerFileName,
+		BeforeScriptPath:   saved.BeforeScriptPath, BeforeScriptMustSucceed: saved.BeforeScriptMustSucceed,
 		AfterScriptPath: saved.AfterScriptPath, AfterScriptMustSucceed: saved.AfterScriptMustSucceed,
 		SourceStorageVersion: saved.SourceStorageVersion, SourceStorageKey: saved.SourceStorageKey,
 		SourceStorageDescriptorJSON: saved.SourceStorageJSON, SourceBindingState: saved.SourceBindingState,
@@ -582,7 +656,7 @@ func updateDormantTargetIDs(tx *sql.Tx, jobID string, targetIDs []string) ([]str
 		updates = append(updates, update{repositoryID: repositoryID, definition: string(encoded)})
 		affected = append(affected, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	for _, item := range updates {
@@ -596,28 +670,48 @@ func updateDormantTargetIDs(tx *sql.Tx, jobID string, targetIDs []string) ([]str
 
 func updateDormantDefinitionsForJob(tx *sql.Tx, job models.BackupJob) ([]string, error) {
 	saved := portableDefinitionFromModel(job)
-	data, err := json.Marshal(saved)
+	rows, err := tx.Query(`SELECT repository_id, definition_json FROM dormant_recovery_jobs WHERE job_id = ?`, job.ID)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(`SELECT repository_id FROM dormant_recovery_jobs WHERE job_id = ?`, job.ID)
-	if err != nil {
-		return nil, err
-	}
+	type update struct{ repositoryID, definition string }
+	updates := []update{}
 	repositories := []string{}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, existingJSON string
+		if err := rows.Scan(&id, &existingJSON); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
+		next := saved
+		next.aliased = false
+		if saved.aliased {
+			// Keep the row's own source binding; see aliasFreeSourceBinding.
+			// A row that does not decode is left as it is: overwriting it
+			// would replace whatever binding it has with the facts-free
+			// placeholder, and nothing here can tell what it held.
+			existing, decodeErr := decodePortableDefinition(existingJSON)
+			if decodeErr != nil {
+				continue
+			}
+			next = keepDormantSourceBinding(saved, existing)
+		}
+		data, err := json.Marshal(next)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		updates = append(updates, update{repositoryID: id, definition: string(data)})
 		repositories = append(repositories, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`UPDATE dormant_recovery_jobs SET definition_json = ? WHERE job_id = ?`, string(data), job.ID); err != nil {
-		return nil, err
+	for _, item := range updates {
+		if _, err := tx.Exec(`UPDATE dormant_recovery_jobs SET definition_json = ? WHERE repository_id = ? AND job_id = ?`,
+			item.definition, item.repositoryID, job.ID); err != nil {
+			return nil, err
+		}
 	}
 	return repositories, nil
 }
@@ -654,7 +748,7 @@ func deleteDormantRecoveryJobEverywhere(tx *sql.Tx, jobID string) ([]string, err
 		}
 		repositories = append(repositories, repositoryID)
 	}
-	if err := rows.Close(); err != nil {
+	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`DELETE FROM dormant_recovery_jobs WHERE job_id = ?`, jobID); err != nil {

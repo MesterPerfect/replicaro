@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/vaultidentity"
 )
 
 type resticRcloneSession struct {
@@ -164,10 +166,10 @@ func resticCommandFailure(nativeErr error, processStarted bool) error {
 		if nativeCause == nil {
 			nativeErr = nil
 		} else {
-			// Adapter-owned native classifications wrapped around the command
-			// carrier must survive separation from a simultaneous capture failure.
-			// Otherwise callers lose the established safe guidance even though the
-			// requested native failure itself remains conclusive.
+			// Keep the adapter's classification (such as the cold-storage guidance)
+			// when the native error is split from an output-capture failure that
+			// happened at the same time. Otherwise callers lose the user guidance
+			// even though the Restic command failure itself is still known.
 			if errors.Is(nativeErr, ErrColdStorageArchivedObject) {
 				nativeCause = errors.Join(ErrColdStorageArchivedObject, nativeCause)
 			}
@@ -240,6 +242,9 @@ func newResticRcloneSession(
 	if err != nil {
 		return nil, err
 	}
+	if repo.Connector == RcloneRemoteConnector {
+		return newResticRcloneRemoteSession(ctx, repo)
+	}
 	binding, err := OpenRcloneVaultConfigBinding(ctx, repo)
 	if err != nil {
 		return nil, err
@@ -286,6 +291,142 @@ func newResticRcloneSession(
 	return session, nil
 }
 
+// newResticRcloneRemoteSession points Restic's rclone child at the user's own
+// config file through RCLONE_CONFIG. There is no private config to check
+// before or after the run; the user owns the file, and the preflight checks it
+// at create, connect, and Reconnect. rclone.args stays Restic's default, so
+// RCLONE_ASK_PASSWORD=false in the environment is what stops the child from
+// prompting for the rclone config password.
+func newResticRcloneRemoteSession(
+	ctx context.Context,
+	repo models.Repository,
+) (*resticRcloneSession, error) {
+	run, err := RcloneRemoteRunForRepository(repo)
+	if err != nil {
+		return nil, err
+	}
+	binary, err := rcloneBinary(pathFor(RcloneComponentID))
+	if err != nil {
+		return nil, err
+	}
+	programOption, err := encodeResticRcloneProgramOption(binary)
+	if err != nil {
+		return nil, fmt.Errorf("encode Restic rclone program option: %w", err)
+	}
+	sessionRoot, cache, temporary, cleanup, err := privateRcloneOperationDirectories()
+	if err != nil {
+		return nil, err
+	}
+	env := append([]string{
+		"RCLONE_CONFIG=" + run.ConfigFile,
+		"RCLONE_CACHE_DIR=" + cache,
+		"RCLONE_TEMP_DIR=" + temporary,
+	}, run.Env...)
+	return &resticRcloneSession{
+		repository: "rclone:" + run.Root,
+		args:       []string{"-o", programOption},
+		env:        env,
+		root:       sessionRoot,
+		config:     run.ConfigFile,
+		ctx:        ctx,
+		cleanup:    cleanup,
+	}, nil
+}
+
+// WebDAVRcloneRemote returns the one rclone remote, "base", that every rclone
+// use of a WebDAV vault defines: Restic's transport, the sidecar, Vault Size,
+// and the connect preview. It gives the fixed TYPE, URL, VENDOR, and USER
+// settings, and the WebDAV account password separately because rclone needs
+// it obscured: the caller passes it through "rclone obscure -" and sets the
+// result as RCLONE_CONFIG_BASE_PASS before rclone runs. The vault URL already
+// contains the path, so the remote's root is "base:" itself.
+func WebDAVRcloneRemote(
+	address vaultidentity.EffectiveAddress, options map[string]string,
+) (settings []string, password string, err error) {
+	vaultURL, err := vaultidentity.WebDAVURL(address)
+	if err != nil {
+		return nil, "", err
+	}
+	return []string{
+		"RCLONE_CONFIG_BASE_TYPE=webdav",
+		"RCLONE_CONFIG_BASE_URL=" + vaultURL,
+		// Always the generic vendor: vendor-specific modes (Nextcloud chunking,
+		// SharePoint sign-in) have no Kopia equivalent, and both engines must
+		// reach the same server the same way.
+		"RCLONE_CONFIG_BASE_VENDOR=other",
+		"RCLONE_CONFIG_BASE_USER=" + options["username"],
+	}, options["password"], nil
+}
+
+// prepareResticWebDAVStorage gives Restic a WebDAV vault through its native
+// rclone backend, since Restic has no WebDAV backend of its own. It is not the
+// OAuth Restic-rclone path above: there is no per-vault authorization, so
+// nothing here reads or creates the vault's persistent rclone config. Every
+// command instead gets a throwaway empty config in a private operation
+// directory and one environment-defined remote, "base", whose URL already
+// contains the vault path (hence the repository "rclone:base:"). Because no
+// vault-ID-bound state is used, this also works for the connect Check and for
+// resume validation, which run under random repository IDs.
+//
+// The WebDAV account password is obscured with "rclone obscure -" over
+// standard input and passed as RCLONE_CONFIG_BASE_PASS. rclone takes a
+// password only on the command line when writing a config, and its obscuring
+// is reversible, so a config file would expose the password in the process
+// list and on disk; the environment does neither. Every variable name is fixed
+// here and never built from user input, so a long vault name, URL, or path
+// only ever lands in values.
+func prepareResticWebDAVStorage(
+	ctx context.Context,
+	repo models.Repository,
+) (repository string, args, env []string, cleanup func() error, err error) {
+	address, err := effectiveAddress(normalizedStorageRepository(repo, ResticID))
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	remote, password, err := WebDAVRcloneRemote(address, repo.ConnectorOptions)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	binary, err := rcloneBinary(pathFor(RcloneComponentID))
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	programOption, err := encodeResticRcloneProgramOption(binary)
+	if err != nil {
+		return "", nil, nil, nil, fmt.Errorf("encode Restic rclone program option: %w", err)
+	}
+	config, cache, temporary, cleanup, err := newTemporaryRcloneConfig(ctx, binary)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	output, err := runRcloneVaultConfigCommand(
+		ctx, binary,
+		[]string{"obscure", "-", "--config", config, "--cache-dir", cache,
+			"--temp-dir", temporary, "--log-level", "ERROR"},
+		nil, password+"\n", time.Minute, RcloneComponentID,
+	)
+	if err != nil {
+		// The runner keeps rclone's output private, so the cause carries no
+		// credential; it is kept so cancellation is still recognized upstream.
+		return "", nil, nil, nil, errors.Join(
+			fmt.Errorf("native rclone could not prepare the WebDAV account password: %w", err), cleanup(),
+		)
+	}
+	obscured := strings.TrimSpace(output)
+	if obscured == "" || strings.ContainsAny(obscured, "\r\n") {
+		return "", nil, nil, nil, errors.Join(
+			fmt.Errorf("native rclone returned an invalid obscured WebDAV account password"), cleanup(),
+		)
+	}
+	env = append([]string{
+		"RCLONE_CONFIG=" + config,
+		"RCLONE_CACHE_DIR=" + cache,
+		"RCLONE_TEMP_DIR=" + temporary,
+	}, remote...)
+	env = append(env, "RCLONE_CONFIG_BASE_PASS="+obscured)
+	return "rclone:base:", []string{"-o", programOption}, env, cleanup, nil
+}
+
 func encodeResticRcloneProgramOption(program string) (string, error) {
 	if program == "" {
 		return "", fmt.Errorf("rclone program path is empty")
@@ -297,10 +438,10 @@ func encodeResticRcloneProgramOption(program string) (string, error) {
 }
 
 func (session *resticRcloneSession) close() error {
-	// Rclone exclusively owns its opaque persisted config, including token
-	// refresh. Closing reopens the exact local path after native access and removes
-	// request-local resources. These failures are follow-up cleanup truth; neither
-	// changes Restic's result nor requires another provider/account probe.
+	// Rclone alone manages its persisted config, including token refresh.
+	// Closing revalidates the local config path after Restic has used it and
+	// removes per-request resources. Failures here are reported as follow-up
+	// cleanup errors; they don't change Restic's result or need another provider probe.
 	return errors.Join(
 		session.binding.Revalidate(context.WithoutCancel(session.ctx)),
 		session.cleanup(), session.binding.Close(),

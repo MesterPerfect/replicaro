@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -35,15 +37,36 @@ const canonicalRootObject = "vault.replicaro"
 const previousRootObject = "vault.replicaro.previous"
 const pendingRootPrefix = "vault.replicaro.pending."
 
-// Internal aliases keep the root safe-publication implementation readable in
-// existing helper and provider-proof code. They are not schema aliases.
+// Root and profile objects share one safe-publication implementation. These
+// aliases keep profile-side helpers and the real-provider tests readable;
+// they are not schema aliases.
 const canonicalProfileObject = canonicalRootObject
 const previousProfileObject = previousRootObject
 const pendingProfilePrefix = pendingRootPrefix
 
+// sidecarRemoteName is the rclone crypt remote that carries the sidecar; see
+// engines.RcloneSidecarRemoteName for why it has this name.
+const sidecarRemoteName = engines.RcloneSidecarRemoteName
+
+// sidecarRemote addresses paths inside the sidecar remote in rclone arguments.
+const sidecarRemote = sidecarRemoteName + ":"
+
+// sidecarEnvPrefix is the prefix rclone reads the sidecar remote's options from.
+var sidecarEnvPrefix = "RCLONE_CONFIG_" + strings.ToUpper(sidecarRemoteName) + "_"
+
 var runRclone = command.RunWithInputSecretsPrivateOutput
 var materializeRclone = rclone.Materialize
 var newRclonePreviewSidecarConfig = engines.NewRclonePreviewSidecarConfig
+
+// SetRcloneRunnerForTests replaces the runner for every sidecar rclone command
+// and returns a function that puts the previous one back. Tests in other
+// packages wrap command.RunWithInputSecretsPrivateOutput with it to make one
+// real rclone command fail at a chosen point of a publication.
+func SetRcloneRunnerForTests(next func(context.Context, string, []string, []string, string, time.Duration, string) (string, error)) func() {
+	previous := runRclone
+	runRclone = next
+	return func() { runRclone = previous }
+}
 
 var ErrPasswordChangeAuthority = errors.New("vault-password change authority changed")
 
@@ -65,11 +88,34 @@ func reconnectRequired(err error) error {
 	return &reconnectRequiredError{err: err}
 }
 
-// IsReconnectRequired identifies only conclusive protected-control-plane
-// attachment, password, or identity facts. Transport and ambiguous read
-// failures deliberately remain outside this classification.
+// IsReconnectRequired reports only errors that confirm a problem with the
+// protected attachment, password, or identity. Transport errors and ambiguous
+// read failures are deliberately not treated as reconnect-required.
 func IsReconnectRequired(err error) bool {
 	return errors.Is(err, errReconnectRequired)
+}
+
+// MarkReconnectRequired lets a caller outside this package classify its own
+// conclusive attachment check the same way this store classifies its reads.
+// The profile sync worker uses it when the profile it would publish, or the
+// one it just read, belongs to a different attachment than the saved vault.
+// Do not use it for transport or ambiguous read failures.
+func MarkReconnectRequired(err error) error {
+	return reconnectRequired(err)
+}
+
+// ErrOwnerTransferUnfinished is matched (errors.Is) by the errors returned
+// when the protected root still carries an ownership transfer marker. The
+// error text is unchanged; the marker only lets background workers leave an
+// unfinished transfer out of their reconnect clock, since the transfer is
+// finished by repeating the takeover, not by reconnecting.
+var ErrOwnerTransferUnfinished = errors.New("protected vault ownership transfer is unfinished")
+
+type ownerTransferUnfinishedError struct{ message string }
+
+func (e *ownerTransferUnfinishedError) Error() string { return e.message }
+func (e *ownerTransferUnfinishedError) Is(target error) bool {
+	return target == ErrOwnerTransferUnfinished
 }
 
 type Store struct {
@@ -77,15 +123,15 @@ type Store struct {
 	// ProfileUUID selects an authoritative profile object. Empty selects the
 	// vault-wide root object.
 	ProfileUUID           string
-	requireAvailableFunc  func(context.Context, models.Repository) error
 	supportsConnectorFunc func(string, string) bool
 	operationSession      **storeSession
 }
 
 // WithSession reuses native sidecar setup during one sequential operation. It
-// caches no objects or authority: every read and publication still validates
-// its own record, and every command reopens and validates the native config.
-// The callback must not retain the Store or change its repository binding.
+// caches no objects or validation results: every read and publication still
+// validates its own record, and every command reopens and validates the
+// native config. The callback must not retain the Store or change its
+// repository binding.
 func (s Store) WithSession(ctx context.Context, operation func(Store) error) (err error) {
 	if s.operationSession != nil {
 		return operation(s)
@@ -131,8 +177,7 @@ func (s Store) validateRecord(data []byte) error {
 		if err != nil {
 			return err
 		}
-		if root.VaultUUID != s.Repository.ID || root.Repository.Engine != s.Repository.Engine ||
-			root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID {
+		if !root.Identifies(s.Repository) {
 			return reconnectRequired(fmt.Errorf("the protected vault root does not match this saved vault"))
 		}
 		return nil
@@ -190,22 +235,15 @@ func validateImmutableProfileJobSources(currentData, nextData []byte, persistedS
 	return nil
 }
 
-func (s Store) WithRepositoryAvailabilityCheck(
-	check func(context.Context, models.Repository) error,
-) Store {
-	s.requireAvailableFunc = check
-	return s
-}
-
 type remoteConfig struct {
 	root      string
 	cryptRoot string
 	env       []string
 }
 
-// BaseRemoteConfiguration exposes only the already-established canonical
-// base-root translation needed by the read-only Vault Size helper role.
-// It deliberately contains no crypt remote or vault password.
+// BaseRemoteConfiguration holds only the translated base-root remote that the
+// read-only Vault Size helper needs. It deliberately contains no crypt remote
+// or vault password.
 type BaseRemoteConfiguration struct {
 	Root string
 	Env  []string
@@ -232,6 +270,9 @@ type objectStat struct {
 	Path  string `json:"Path"`
 	Size  int64  `json:"Size"`
 	IsDir bool   `json:"IsDir"`
+	// ModTime stays text, so a backend's unusual time can't fail the
+	// listing; only password-change cleanup reads it.
+	ModTime string `json:"ModTime"`
 }
 
 type recoverableProfileReadError struct{ err error }
@@ -266,9 +307,10 @@ type OwnershipObjects struct {
 	Local ReadResult
 }
 
-// RootCareAuthority is a fresh protected-control-plane readback. It is kept
-// transient so Kopia policy reconciliation cannot substitute stale local
-// owner, integrity, maintenance, or Object Lock state for the vault's current authority.
+// RootCareAuthority is a fresh read of the protected root. It is kept
+// transient so Kopia policy reconciliation always uses the vault's current
+// owner, integrity, maintenance, and Object Lock settings, never stale local
+// copies.
 type RootCareAuthority struct {
 	IntegritySchedule         string
 	MaintenanceSchedule       string
@@ -292,7 +334,7 @@ func (a RootCareAuthority) AssertRepositoryOwner(repo models.Repository) error {
 	return nil
 }
 
-const savedVaultPasswordFailureMessage = "The saved vault password no longer unlocks this vault. It may have been changed. Select Reconnect and enter the current password."
+const savedVaultPasswordFailureMessage = "The saved vault encryption password no longer unlocks this vault. It may have been changed. Select Reconnect and enter the current vault encryption password."
 
 // IsVaultPasswordDecryptionFailure recognizes only the secret-free marker from
 // a protected crypt read, without hiding a separate post-command failure.
@@ -324,12 +366,11 @@ type PublishOptions struct {
 
 func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 	if s.operationSession != nil && *s.operationSession != nil {
-		if !reflect.DeepEqual(s.Repository.RuntimeView(), (*s.operationSession).repository) {
+		if !reflect.DeepEqual(s.Repository, (*s.operationSession).repository) {
 			return nil, fmt.Errorf("sidecar operation repository binding changed")
 		}
 		return *s.operationSession, nil
 	}
-	s.Repository = s.Repository.RuntimeView()
 	started := time.Now()
 	defer func() { reportTiming(ctx, "profile session setup", time.Since(started)) }()
 	if err := models.ValidateVaultPassword(s.Repository.Passphrase); err != nil {
@@ -345,8 +386,19 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 	}
 	var cleanupConfig func() error
 	var configBinding *engines.RcloneVaultConfigBinding
+	// rcloneRemoteEnv is the Any Rclone Remote vault's own environment: no
+	// password prompts, the rclone config password, and the user's variables.
+	// It is kept apart from remote.env so nothing in it is obscured or
+	// filtered like the base remote's settings.
+	var rcloneRemoteEnv []string
 	configPath, pathErr := engines.RcloneVaultConfigPath(s.Repository.ID)
-	if pathErr != nil && !engines.IsResticRcloneConnector(s.Repository.Connector) &&
+	if s.Repository.Connector == engines.RcloneRemoteConnector {
+		// The user's own config file, read in place: there is no private
+		// config to create, bind, or check before and after each command.
+		var run engines.RcloneRemoteRun
+		run, err = engines.RcloneRemoteRunForRepository(s.Repository)
+		configPath, rcloneRemoteEnv = run.ConfigFile, run.Env
+	} else if pathErr != nil && !engines.IsResticRcloneConnector(s.Repository.Connector) &&
 		s.Repository.RcloneConfigPath == "" {
 		configPath, cleanupConfig, err = newRclonePreviewSidecarConfig(ctx)
 	} else if pathErr == nil &&
@@ -383,9 +435,11 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 		}
 	}
 	baseEnv := append([]string{}, remote.env...)
+	// For an Any Rclone Remote vault even this step points at the user's file,
+	// so it gets the same no-prompt environment as every other command.
 	output, err := runStoreRclone(
 		ctx, configBinding, binary,
-		[]string{"obscure", "-", "--config", configPath}, nil,
+		[]string{"obscure", "-", "--config", configPath}, rcloneRemoteEnv,
 		s.Repository.Passphrase+"\n", time.Minute, "rclone",
 	)
 	if err != nil {
@@ -413,26 +467,26 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 		baseEnv[index] = key + "=" + obscuredValue
 	}
 	baseEnv = append(baseEnv,
-		"RCLONE_CONFIG_CRYPT_TYPE=crypt",
-		"RCLONE_CONFIG_CRYPT_REMOTE="+strings.TrimSuffix(remote.cryptRoot, "/")+"/replicaro",
-		"RCLONE_CONFIG_CRYPT_FILENAME_ENCRYPTION=off",
-		"RCLONE_CONFIG_CRYPT_DIRECTORY_NAME_ENCRYPTION=false",
-		"RCLONE_CONFIG_CRYPT_SUFFIX=none",
-		"RCLONE_CONFIG_CRYPT_PASSWORD="+obscured,
-		"RCLONE_CONFIG_CRYPT_PASSWORD2=",
-		"RCLONE_CONFIG_CRYPT_SERVER_SIDE_ACROSS_CONFIGS=false",
-		"RCLONE_CONFIG_CRYPT_SHOW_MAPPING=false",
-		"RCLONE_CONFIG_CRYPT_NO_DATA_ENCRYPTION=false",
-		"RCLONE_CONFIG_CRYPT_PASS_BAD_BLOCKS=false",
-		"RCLONE_CONFIG_CRYPT_STRICT_NAMES=false",
-		"RCLONE_CONFIG_CRYPT_FILENAME_ENCODING=base32",
+		sidecarEnvPrefix+"TYPE=crypt",
+		sidecarEnvPrefix+"REMOTE="+strings.TrimSuffix(remote.cryptRoot, "/")+"/replicaro",
+		sidecarEnvPrefix+"FILENAME_ENCRYPTION=off",
+		sidecarEnvPrefix+"DIRECTORY_NAME_ENCRYPTION=false",
+		sidecarEnvPrefix+"SUFFIX=none",
+		sidecarEnvPrefix+"PASSWORD="+obscured,
+		sidecarEnvPrefix+"PASSWORD2=",
+		sidecarEnvPrefix+"SERVER_SIDE_ACROSS_CONFIGS=false",
+		sidecarEnvPrefix+"SHOW_MAPPING=false",
+		sidecarEnvPrefix+"NO_DATA_ENCRYPTION=false",
+		sidecarEnvPrefix+"PASS_BAD_BLOCKS=false",
+		sidecarEnvPrefix+"STRICT_NAMES=false",
+		sidecarEnvPrefix+"FILENAME_ENCODING=base32",
 	)
+	baseEnv = append(baseEnv, rcloneRemoteEnv...)
 	session = &storeSession{
 		binary: binary, config: configPath, root: remote.root, env: baseEnv,
-		repository:           s.Repository,
-		requireAvailableFunc: s.requireAvailableFunc,
-		cleanupConfig:        cleanupConfig,
-		configBinding:        configBinding,
+		repository:    s.Repository,
+		cleanupConfig: cleanupConfig,
+		configBinding: configBinding,
 	}
 	setupComplete = true
 	if s.operationSession != nil {
@@ -445,7 +499,6 @@ type storeSession struct {
 	binary, config, root string
 	env                  []string
 	repository           models.Repository
-	requireAvailableFunc func(context.Context, models.Repository) error
 	cleanupConfig        func() error
 	configBinding        *engines.RcloneVaultConfigBinding
 }
@@ -498,6 +551,58 @@ func finishStoreSession(ctx context.Context, session *storeSession, operationErr
 	*operationErr = errors.Join(*operationErr, closeErr)
 }
 
+// classifierRedactions lists the vault's path in the spellings rclone may
+// quote in an error. The failure classifiers below and in package command
+// look for words such as "not found", "permission denied" or "is a
+// directory", and those words can also be part of a vault folder's name, so
+// the path is taken out of the text before it is matched. Only rclone's own
+// wording decides.
+//
+// Every spelling keeps a path separator, so a bare word such as a bucket
+// named "cert" is never removed from inside rclone's own "certificate".
+func (s *storeSession) classifierRedactions() []string {
+	if s == nil {
+		return nil
+	}
+	location := strings.TrimSpace(s.repository.Location)
+	candidates := []string{s.repository.Location, location}
+	if s.repository.Connector == "" || s.repository.Connector == "fs" {
+		clean := filepath.Clean(location)
+		// rclone can quote a Windows share in its long form,
+		// \\?\UNC\server\share\..., where neither spelling above appears;
+		// the path without its leading separators does.
+		candidates = append(candidates, clean, filepath.ToSlash(clean), strings.TrimLeft(clean, `/\`))
+	} else if parsed, err := url.Parse(location); err == nil {
+		// Cloud and server errors quote the request path, plain or escaped.
+		candidates = append(candidates, strings.TrimRight(parsed.Path, "/"), strings.TrimRight(parsed.EscapedPath(), "/"))
+	}
+	// The crypt remote and the base remote both sit under the session root.
+	if _, path, found := strings.Cut(s.root, ":"); found {
+		candidates = append(candidates, strings.TrimRight(path, "/"))
+	}
+	values := make([]string, 0, len(candidates))
+	for _, value := range candidates {
+		if strings.ContainsAny(value, `/\`) {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// classifierText is the lowercased error text with the vault's path taken
+// out, for the classifiers that fall back to matching an error's text.
+func (s *storeSession) classifierText(err error) string {
+	text := strings.ToLower(err.Error())
+	values := s.classifierRedactions()
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	for _, value := range values {
+		if value = strings.ToLower(value); value != "" {
+			text = strings.ReplaceAll(text, value, "\x00")
+		}
+	}
+	return text
+}
+
 func (s *storeSession) run(ctx context.Context, args ...string) (string, error) {
 	return s.runWithInput(ctx, profileTimingLabel(args), "", args...)
 }
@@ -505,11 +610,8 @@ func (s *storeSession) run(ctx context.Context, args ...string) (string, error) 
 func (s *storeSession) runWithInput(ctx context.Context, timingLabel, input string, args ...string) (output string, err error) {
 	started := time.Now()
 	defer func() { reportTiming(ctx, timingLabel, time.Since(started)) }()
-	if s.requireAvailableFunc != nil {
-		if err := s.requireAvailableFunc(ctx, s.repository); err != nil {
-			return "", err
-		}
-	}
+	ctx = command.ContextWithPrivateFailureRedactions(ctx, s.classifierRedactions())
+	ctx = command.ContextWithStorageFullMarkers(ctx, engines.StorageFullMarkers(s.repository.Connector))
 	args = append(args, "--config", s.config, "--log-level", "ERROR")
 	return runStoreRclone(
 		ctx, s.configBinding, s.binary, args, s.env, input,
@@ -577,7 +679,7 @@ func runStoreRclone(
 }
 
 func rcloneCryptReadDecryptionFailure(args []string, err error) bool {
-	if len(args) < 2 || args[0] != "cat" || args[1] != "crypt:" || err == nil {
+	if len(args) < 2 || args[0] != "cat" || args[1] != sidecarRemote || err == nil {
 		return false
 	}
 	return command.PrivateOutputFailureKind(err) == command.PrivateFailureDecryptAuthentication
@@ -619,11 +721,11 @@ func (s Store) ReadDetailed(ctx context.Context) (result ReadResult, err error) 
 	return s.readDetailed(ctx, session)
 }
 
-// ReadDiscoveryRootDetailed is the one root-only bootstrap boundary used when
-// connecting storage whose protected vault tuple is not known yet. It retains
-// the ordinary bounded decrypt, schema, canonical/fallback, and root-structure
-// checks, but leaves tuple matching to the immediate known-root reread. All
-// ordinary reads and every publication continue through exact tuple validation.
+// ReadDiscoveryRootDetailed reads only the root when connecting storage whose
+// vault tuple is not known yet. It keeps the normal bounded decrypt, schema,
+// canonical/fallback, and root-structure checks, but leaves tuple matching to
+// the known-root reread that follows. All other reads and every publication
+// still validate the full tuple.
 func (s Store) ReadDiscoveryRootDetailed(ctx context.Context) (result ReadResult, err error) {
 	if s.ProfileUUID != "" {
 		return ReadResult{}, fmt.Errorf("vault-root discovery cannot read a profile object")
@@ -786,10 +888,10 @@ func boundedProfileObjects(ctx context.Context, session *storeSession, max int) 
 	// List only the protected profiles subtree. Decode one listing entry at a
 	// time and stop retaining identities at max+1, so an oversized protected
 	// tree cannot first become an unbounded in-memory object set.
-	output, err := session.run(ctx, "lsjson", "crypt:profiles", "--recursive", "--files-only", "--max-depth", "3",
+	output, err := session.run(ctx, "lsjson", sidecarRemote+"profiles", "--recursive", "--files-only", "--max-depth", "3",
 		"--include", "*/profile.replicaro", "--include", "*/profile.replicaro.previous")
 	if err != nil {
-		if rcloneObjectMissing(err) {
+		if rcloneObjectMissing(session, err) {
 			return map[string]boundedProfileObject{}, nil
 		}
 		return nil, fmt.Errorf("list protected vault profiles: %w", err)
@@ -869,8 +971,8 @@ func ValidateAttachmentResult(
 	generation int64,
 ) (Profile, error) {
 	if result.Degraded || result.Generation != "canonical" {
-		// Previous generations are recovery evidence, never current attachment
-		// authority for repository mutations or owner-only work.
+		// A previous generation can help recovery, but it never authorizes repository
+		// mutations or owner-only work for the current attachment.
 		return Profile{}, fmt.Errorf("verify vault profile attachment: canonical profile is unavailable")
 	}
 	profile, err := Parse(result.Data)
@@ -912,8 +1014,7 @@ func ValidateRootIdentityResult(result ReadResult, repository models.Repository)
 	if err != nil {
 		return Root{}, fmt.Errorf("verify protected vault root: %w", err)
 	}
-	if root.VaultUUID != repository.ID || root.Repository.Engine != repository.Engine ||
-		root.Repository.NativeRepositoryID != repository.NativeRepositoryID {
+	if !root.Identifies(repository) {
 		return Root{}, reconnectRequired(ErrProtectedRootIdentityMismatch)
 	}
 	if root.PasswordChange != nil {
@@ -936,8 +1037,7 @@ func (s Store) AssertRootOwner(ctx context.Context, clientUUID, profileUUID stri
 	if err != nil {
 		return fmt.Errorf("verify vault owner: %w", err)
 	}
-	if root.VaultUUID != s.Repository.ID || root.Repository.Engine != s.Repository.Engine ||
-		root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID {
+	if !root.Identifies(s.Repository) {
 		return fmt.Errorf("the protected vault root does not match this saved vault")
 	}
 	if root.PasswordChange != nil {
@@ -947,7 +1047,7 @@ func (s Store) AssertRootOwner(ctx context.Context, clientUUID, profileUUID stri
 		return ErrNotVaultOwner
 	}
 	if root.OwnerTransfer != nil {
-		return fmt.Errorf("protected vault ownership is transitional")
+		return &ownerTransferUnfinishedError{message: "protected vault ownership is transitional"}
 	}
 	return s.ForProfile(profileUUID).AssertAttachment(ctx, clientUUID, generation)
 }
@@ -964,11 +1064,13 @@ func (s Store) ReadRootCareAuthority(ctx context.Context) (RootCareAuthority, er
 	if err != nil {
 		return RootCareAuthority{}, fmt.Errorf("verify protected vault care: %w", err)
 	}
-	if root.VaultUUID != s.Repository.ID || root.Repository.Engine != s.Repository.Engine ||
-		root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID {
+	if !root.Identifies(s.Repository) {
 		return RootCareAuthority{}, reconnectRequired(fmt.Errorf("the protected vault root does not match this saved vault"))
 	}
-	if root.PasswordChange != nil || root.OwnerTransfer != nil {
+	if root.OwnerTransfer != nil {
+		return RootCareAuthority{}, &ownerTransferUnfinishedError{message: "protected vault care is transitional"}
+	}
+	if root.PasswordChange != nil {
 		return RootCareAuthority{}, fmt.Errorf("protected vault care is transitional")
 	}
 	ownerResult, err := s.ForProfile(root.VaultOwner.ProfileUUID).ReadDetailed(ctx)
@@ -1007,9 +1109,10 @@ func (s Store) AssertRootCare(ctx context.Context, integritySchedule, maintenanc
 	return authority, nil
 }
 
-// AssertPasswordChangeAuthority is the rotation-only owner/attachment proof.
-// Unlike AssertRootOwner it admits only this operation's exact fence and never
-// makes fenced roots valid for ordinary administration.
+// AssertPasswordChangeAuthority checks owner and attachment for password
+// rotation only. Unlike AssertRootOwner it accepts a fence only if it belongs
+// to this operation, and it never makes a fenced root valid for other
+// administration.
 func (s Store) AssertPasswordChangeAuthority(ctx context.Context, clientUUID, profileUUID string, generation int64,
 	operationUUID string, allowUnfenced, requireProfileFence bool,
 ) error {
@@ -1024,8 +1127,7 @@ func (s Store) AssertPasswordChangeAuthority(ctx context.Context, clientUUID, pr
 		return fail("the current protected vault root could not be verified")
 	}
 	root, err := ParseRoot(rootResult.Data, s.Repository.Connector)
-	if err != nil || root.VaultUUID != s.Repository.ID || root.Repository.Engine != s.Repository.Engine ||
-		root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID ||
+	if err != nil || !root.Identifies(s.Repository) ||
 		root.VaultOwner.ProfileUUID != profileUUID || root.OwnerTransfer != nil {
 		return fail("only the unchanged current vault owner may continue this password change")
 	}
@@ -1062,10 +1164,11 @@ func (s Store) AssertPasswordChangeAuthority(ctx context.Context, clientUUID, pr
 	return nil
 }
 
-// AssertPasswordChangeRootState is the publishing-recovery root proof. Profile
-// objects may already be re-encrypted at this phase, so it verifies only the
-// unchanged vault identity/owner and either this exact old-password fence or
-// the final unfenced new-password root.
+// AssertPasswordChangeRootState checks the root while recovering the
+// publishing phase of a password change. Profile objects may already be
+// re-encrypted at this point, so it checks only that the vault identity and
+// owner are unchanged and that the root has either this operation's
+// old-password fence or the final unfenced new-password state.
 func (s Store) AssertPasswordChangeRootState(ctx context.Context, profileUUID, operationUUID string, fenced bool) error {
 	fail := func() error {
 		return fmt.Errorf("%w: the protected vault root is not in the expected password-change state", ErrPasswordChangeAuthority)
@@ -1078,8 +1181,7 @@ func (s Store) AssertPasswordChangeRootState(ctx context.Context, profileUUID, o
 		return fail()
 	}
 	root, err := ParseRoot(result.Data, s.Repository.Connector)
-	if err != nil || root.VaultUUID != s.Repository.ID || root.Repository.Engine != s.Repository.Engine ||
-		root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID ||
+	if err != nil || !root.Identifies(s.Repository) ||
 		root.VaultOwner.ProfileUUID != profileUUID || root.OwnerTransfer != nil {
 		return fail()
 	}
@@ -1097,9 +1199,9 @@ func (s Store) Replace(ctx context.Context, plaintext []byte) error {
 	return s.Publish(ctx, plaintext, PublishOptions{OperationID: uuid.NewString()})
 }
 
-// Create publishes a profile only if the exact object is still absent. It is
-// used by the missing-profile connect fallback so a profile created by another
-// actor after preview is never overwritten.
+// Create checks that the exact object is absent before publishing a profile.
+// The missing-profile connect fallback uses this check, but publication is not
+// atomic across computers; see the create-only copy below.
 func (s Store) Create(ctx context.Context, plaintext []byte) error {
 	return s.Publish(ctx, plaintext, PublishOptions{OperationID: uuid.NewString(), CreateOnly: true})
 }
@@ -1107,7 +1209,6 @@ func (s Store) Create(ctx context.Context, plaintext []byte) error {
 // Publish is the single crash-recoverable state machine used for profile
 // creation, connection, and synchronization.
 func (s Store) Publish(ctx context.Context, plaintext []byte, options PublishOptions) error {
-	s.Repository = s.Repository.RuntimeView()
 	if !exactUUID(s.Repository.ID) {
 		return fmt.Errorf("repository vault UUID is invalid")
 	}
@@ -1122,9 +1223,8 @@ func (s Store) Publish(ctx context.Context, plaintext []byte, options PublishOpt
 }
 
 // PublishUnderLock publishes a profile while the caller already holds the
-// managed vault UUID lock. It is used by profile synchronization and creation
-// paths that must keep their database and remote publication sections under
-// one admission gate.
+// managed vault UUID lock. Profile synchronization and creation use it because
+// their database and remote publication steps must stay under that one lock.
 func (s Store) PublishUnderLock(ctx context.Context, plaintext []byte, options PublishOptions) error {
 	return s.publishUnderLock(ctx, plaintext, options)
 }
@@ -1247,7 +1347,7 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 		if string(pendingData) != string(plaintext) {
 			return fmt.Errorf("profile publication operation has conflicting pending data")
 		}
-	} else if _, err := session.run(ctx, "copyto", localPath, "crypt:"+pendingObject, "--immutable"); err != nil {
+	} else if _, err := session.run(ctx, "copyto", localPath, sidecarRemote+pendingObject, "--immutable"); err != nil {
 		return fmt.Errorf("upload pending vault recovery profile: %w", err)
 	}
 	pending, pendingErr := s.readObjectBounded(ctx, session, pendingObject)
@@ -1265,7 +1365,7 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 				return err
 			}
 		}
-		if _, err := session.run(ctx, "copyto", "crypt:"+canonical, "crypt:"+previous, "--ignore-times"); err != nil {
+		if _, err := session.run(ctx, "copyto", sidecarRemote+canonical, sidecarRemote+previous, "--ignore-times"); err != nil {
 			return fmt.Errorf("preserve previous vault recovery profile: %w", err)
 		}
 		preserved, preserveErr := s.readObjectBounded(ctx, session, previous)
@@ -1281,8 +1381,13 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 			return err
 		}
 	}
-	publishArgs := []string{"copyto", "crypt:" + pendingObject, "crypt:" + canonical}
+	publishArgs := []string{"copyto", sidecarRemote + pendingObject, sidecarRemote + canonical}
 	if options.CreateOnly {
+		// Pinned rclone's copyto --immutable can overwrite a differing destination.
+		// The listing above is the create-only check, not a remote reservation.
+		// Another computer can publish between that check and this copy; that
+		// small race is known and accepted product behavior. The local UUID lock
+		// and exact readback still apply, without adding remote coordination.
 		publishArgs = append(publishArgs, "--immutable")
 	} else {
 		publishArgs = append(publishArgs, "--ignore-times")
@@ -1309,8 +1414,8 @@ func (s Store) ensureExpectedCurrent(ctx context.Context, session *storeSession,
 	if err != nil {
 		return err
 	}
-	// Keep all three publication checkpoints, but read the fixed canonical
-	// address directly. Listing is recovery discovery, not additional authority.
+	// Keep all three publication checkpoints, but read the fixed canonical name
+	// directly. Listing is only needed for recovery discovery, not for this check.
 	data, readErr := s.readObjectBounded(ctx, session, canonical)
 	if readErr == nil {
 		if fmt.Sprintf("%x", sha256.Sum256(data)) != expected {
@@ -1347,7 +1452,7 @@ func (s Store) ensureExpectedCurrent(ctx context.Context, session *storeSession,
 func cleanupProfileObject(parent context.Context, session *storeSession, name string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 20*time.Second)
 	defer cancel()
-	_, _ = session.run(ctx, "deletefile", "crypt:"+name)
+	_, _ = session.run(ctx, "deletefile", sidecarRemote+name)
 }
 
 func stageProfile(plaintext []byte, pattern string) (string, error) {
@@ -1379,9 +1484,8 @@ func stageProfile(plaintext []byte, pattern string) (string, error) {
 	if err := local.Close(); err != nil {
 		return "", err
 	}
-	if err := appdata.SecurePath(path, false); err != nil {
-		return "", err
-	}
+	// The staging folder is under the app-data root, so on Windows this file
+	// already inherits the application folder's protected DACL.
 	ok = true
 	return path, nil
 }
@@ -1442,10 +1546,10 @@ func (s Store) readObjectBoundedValidated(
 	if limitErr != nil {
 		return nil, recoverableProfileRead(limitErr)
 	}
-	args := []string{"cat", "crypt:", "--files-from-raw", "-", "--no-traverse", "--count", strconv.Itoa(limit + 1)}
-	output, err := session.runWithInput(ctx, profileTimingLabel([]string{"cat", "crypt:" + name}), name+"\n", args...)
+	args := []string{"cat", sidecarRemote, "--files-from-raw", "-", "--no-traverse", "--count", strconv.Itoa(limit + 1)}
+	output, err := session.runWithInput(ctx, profileTimingLabel([]string{"cat", sidecarRemote + name}), name+"\n", args...)
 	if err != nil {
-		if rcloneObjectMissing(err) || rcloneObjectIsDirectory(err) {
+		if rcloneObjectMissing(session, err) || rcloneObjectIsDirectory(session, err) {
 			return nil, recoverableProfileRead(err)
 		}
 		return nil, err
@@ -1486,9 +1590,9 @@ func profileObjects(ctx context.Context, session *storeSession) (map[string]obje
 	// The crypt remote is already rooted at <vault>/replicaro. Listing it
 	// directly avoids enumerating a potentially huge bucket or prefix merely to
 	// discover whether that one directory exists.
-	output, err := session.run(ctx, "lsjson", "crypt:", "--recursive", "--files-only", "--max-depth", "4")
+	output, err := session.run(ctx, "lsjson", sidecarRemote, "--recursive", "--files-only", "--max-depth", "4")
 	if err != nil {
-		if rcloneObjectMissing(err) {
+		if rcloneObjectMissing(session, err) {
 			return map[string]objectStat{}, nil
 		}
 		return nil, fmt.Errorf("list Replicaro recovery metadata: %w", err)
@@ -1525,7 +1629,7 @@ func validProtectedObjectName(name string) bool {
 func statObject(ctx context.Context, session *storeSession, remote string) (objectStat, bool, error) {
 	output, err := session.run(ctx, "lsjson", remote, "--stat")
 	if err != nil {
-		if rcloneObjectMissing(err) {
+		if rcloneObjectMissing(session, err) || rcloneExitedDirectoryNotFound(err) {
 			return objectStat{}, false, nil
 		}
 		return objectStat{}, false, err
@@ -1534,10 +1638,15 @@ func statObject(ctx context.Context, session *storeSession, remote string) (obje
 	if err := json.Unmarshal([]byte(output), &stat); err != nil {
 		return objectStat{}, false, fmt.Errorf("parse rclone object metadata: %w", err)
 	}
+	// Bucket-based remotes (S3, Azure Blob, GCS) answer a missing path with a
+	// directory entry and exit 0; every object stat'ed here is a file.
+	if stat.IsDir {
+		return objectStat{}, false, nil
+	}
 	return stat, true, nil
 }
 
-func rcloneObjectMissing(err error) bool {
+func rcloneObjectMissing(session *storeSession, err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1547,7 +1656,7 @@ func rcloneObjectMissing(err error) bool {
 	if command.PrivateOutputFailureKind(err) == command.PrivateFailureMissingObject {
 		return true
 	}
-	lower := strings.ToLower(err.Error())
+	lower := session.classifierText(err)
 	for _, unsafe := range []string{"credential", "authentication", "authorization", "access denied", "permission denied", "unauthorized", "forbidden", "private key", "certificate"} {
 		if strings.Contains(lower, unsafe) {
 			return false
@@ -1561,7 +1670,29 @@ func rcloneObjectMissing(err error) bool {
 	return false
 }
 
-func rcloneObjectIsDirectory(err error) bool {
+// rcloneExitedDirectoryNotFound reports rclone's exit status 3, which rclone
+// uses only for its "directory not found" error. statObject needs it because
+// `lsjson --stat` logs that error at NOTICE level, so under the session's
+// --log-level ERROR a missing object produces no text at all for
+// rcloneObjectMissing to recognise, only the exit status. Rclone's local
+// backend also reports an unreadable parent folder this way; with the text
+// visible that would read "directory not found" too, so this treats nothing
+// as missing that the text check wouldn't. Keep it limited to lsjson --stat:
+// other commands print their own error text at ERROR level.
+func rcloneExitedDirectoryNotFound(err error) bool {
+	if err == nil || hasStorePostCommandFailure(err) {
+		return false
+	}
+	native, followup := command.FailureCauses(err)
+	if native == nil || followup != nil ||
+		errors.Is(native, context.Canceled) || errors.Is(native, context.DeadlineExceeded) {
+		return false
+	}
+	var exit *exec.ExitError
+	return errors.As(native, &exit) && exit.ExitCode() == 3
+}
+
+func rcloneObjectIsDirectory(session *storeSession, err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1571,13 +1702,25 @@ func rcloneObjectIsDirectory(err error) bool {
 	if command.PrivateOutputFailureKind(err) == command.PrivateFailureObjectIsDirectory {
 		return true
 	}
-	lower := strings.ToLower(err.Error())
+	lower := session.classifierText(err)
 	for _, marker := range []string{"is a directory", "not a regular file", "can't open directory", "cannot open directory"} {
 		if strings.Contains(lower, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsStorageFull reports whether a sidecar or profile upload failed because
+// the vault ran out of space, as rclone worded it (see
+// engines.StorageFullMarkers). When rclone's config check after the command
+// failed, the native text was withheld and the category is not trusted, the
+// same rule the other classifiers here follow.
+func IsStorageFull(err error) bool {
+	if err == nil || hasStorePostCommandFailure(err) {
+		return false
+	}
+	return command.PrivateOutputFailureKind(err) == command.PrivateFailureStorageFull
 }
 
 func hasStorePostCommandFailure(err error) bool {
@@ -1742,6 +1885,27 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 			"RCLONE_CONFIG_BASE_CLIENT_CREDENTIALS=false", "RCLONE_CONFIG_BASE_AUTH_URL=",
 			"RCLONE_CONFIG_BASE_TOKEN_URL=")
 		root = remotePath(effective.Bucket, effective.Prefix)
+	case "webdav":
+		// The same remote Restic's WebDAV transport uses. RCLONE_CONFIG_BASE_PASS
+		// is obscured by the session loop below before any command runs. These
+		// five names are the whole WebDAV remote; nothing is written to the
+		// vault's rclone config file, which stays empty.
+		settings, password, remoteErr := engines.WebDAVRcloneRemote(effective, repo.ConnectorOptions)
+		if remoteErr != nil {
+			return remoteConfig{}, remoteErr
+		}
+		env = append(env, settings...)
+		env = append(env, "RCLONE_CONFIG_BASE_PASS="+password)
+		root = "base:"
+	case engines.RcloneRemoteConnector:
+		// The base is the user's own remote, so there are no base variables:
+		// RCLONE_CONFIG_BASE_* would change a remote the user named "base".
+		// The run's environment is added separately by the session.
+		run, runErr := engines.RcloneRemoteRunForRepository(repo)
+		if runErr != nil {
+			return remoteConfig{}, runErr
+		}
+		root = run.Root
 	case "google_drive", "dropbox", "onedrive":
 		provider, ok := engines.RcloneProvider(repo.Connector)
 		if !ok || repo.Engine != engines.ResticID {
@@ -1770,7 +1934,6 @@ func remotePath(parts ...string) string {
 }
 
 func (s Store) ListRoot(ctx context.Context) (values []objectStat, err error) {
-	s.Repository = s.Repository.RuntimeView()
 	if s.Repository.Connector == "fs" {
 		info, err := os.Stat(s.Repository.Location)
 		if errors.Is(err, os.ErrNotExist) {
@@ -1794,7 +1957,7 @@ func (s Store) ListRoot(ctx context.Context) (values []objectStat, err error) {
 	}
 	output, err := session.run(ctx, "lsjson", remote.root, "--max-depth", "1")
 	if err != nil {
-		if rcloneObjectMissing(err) {
+		if rcloneObjectMissing(session, err) {
 			return []objectStat{}, nil
 		}
 		return nil, err
@@ -1848,7 +2011,7 @@ func (s Store) RemoveProfileForTests(ctx context.Context) (err error) {
 	sort.Strings(names)
 	var cleanupErr error
 	for _, name := range names {
-		if _, deleteErr := session.run(ctx, "deletefile", "crypt:"+name); deleteErr != nil {
+		if _, deleteErr := session.run(ctx, "deletefile", sidecarRemote+name); deleteErr != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete vault recovery profile %q for test cleanup: %w", name, deleteErr))
 		}
 	}

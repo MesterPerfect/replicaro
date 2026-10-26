@@ -5,10 +5,13 @@ package desktop
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -37,6 +40,10 @@ const (
 	tpmReturnCmd   = 0x0100
 	imageIcon      = 1
 	lrLoadFromFile = 0x00000010
+	msgfltAllow    = 1
+
+	wmQueryEndSession = 0x0011
+	wmEndSession      = 0x0016
 )
 
 var trayIconGUID = windows.GUID{
@@ -70,6 +77,7 @@ var (
 	procGetCursorPos          = user32.NewProc("GetCursorPos")
 	procSetForegroundWindow   = user32.NewProc("SetForegroundWindow")
 	procTrackPopupMenu        = user32.NewProc("TrackPopupMenu")
+	procChangeMessageFilter   = user32.NewProc("ChangeWindowMessageFilterEx")
 	procShellNotifyIcon       = shell32.NewProc("Shell_NotifyIconW")
 )
 
@@ -87,6 +95,12 @@ type nativeTray struct {
 	notificationMu      sync.Mutex
 	notifications       []nativeNotification
 	notificationsClosed bool
+	// sessionEnd is the application's staged shutdown, which Run passes in.
+	// WM_ENDSESSION runs it; see endSession.
+	sessionEnd func() error
+	// quitPromptOpen is set while the Quit message box is open. Only the
+	// tray's own thread reads and writes it.
+	quitPromptOpen bool
 }
 
 var errTrayNotificationsClosed = errors.New("notification tray is closed")
@@ -207,6 +221,13 @@ func (tray *nativeTray) initialize() error {
 		return win32Error("create tray window", callErr)
 	}
 	tray.window = window
+	// An elevated Replicaro doesn't receive TaskbarCreated from Explorer,
+	// which runs unelevated, unless the window lets that message through.
+	// Without it the icon wouldn't come back after Explorer restarts. A
+	// failure here only costs that, so it's ignored.
+	if procChangeMessageFilter.Find() == nil {
+		procChangeMessageFilter.Call(window, uintptr(tray.taskbarCreated), msgfltAllow, 0)
+	}
 
 	tray.icon, err = loadTrayIcon()
 	if err != nil {
@@ -233,17 +254,41 @@ func (tray *nativeTray) initialize() error {
 	}
 	copy(tray.notifyData.tip[:], tooltip)
 
-	return tray.addIcon()
+	// A missing icon isn't a reason to stop. Early in a login Explorer may not
+	// be up yet, and it can refuse the icon for other reasons. The window
+	// stays, so the icon is added when Explorer broadcasts TaskbarCreated and
+	// toasts keep working in the meantime.
+	if err := tray.addIcon(); err != nil {
+		log.Printf("Replicaro could not add its notification-area icon and will try again when Explorer restarts: %v", err)
+	}
+	return nil
 }
 
+// shellNotifyIcon calls Shell_NotifyIconW. Tests replace it.
+var shellNotifyIcon = func(message uintptr, data *notifyIconData) error {
+	result, _, callErr := procShellNotifyIcon.Call(message, uintptr(unsafe.Pointer(data)))
+	if result == 0 {
+		return callErr
+	}
+	return nil
+}
+
+// addIcon adds the icon with its fixed GUID first, and without it if Windows
+// refuses. Windows binds an icon GUID to the path of the executable that
+// first used it, so an unsigned portable copy started next to an installed
+// one is refused. Without the GUID the icon is identified by its window and
+// ID, which is how removeIcon finds it too, since both use notifyData.flags.
 func (tray *nativeTray) addIcon() error {
 	tray.notifyData.flags = nifMessage | nifIcon | nifTip | nifGUID
-	result, _, callErr := procShellNotifyIcon.Call(
-		nimAdd,
-		uintptr(unsafe.Pointer(&tray.notifyData)),
-	)
-	if result == 0 {
-		return win32Error("add notification-area icon", callErr)
+	err := shellNotifyIcon(nimAdd, &tray.notifyData)
+	if err != nil {
+		tray.notifyData.flags &^= nifGUID
+		if retryErr := shellNotifyIcon(nimAdd, &tray.notifyData); retryErr != nil {
+			return errors.Join(
+				win32Error("add notification-area icon", err),
+				win32Error("add notification-area icon without its GUID", retryErr),
+			)
+		}
 	}
 	tray.iconAdded = true
 	return nil
@@ -253,7 +298,7 @@ func (tray *nativeTray) removeIcon() {
 	if !tray.iconAdded {
 		return
 	}
-	procShellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&tray.notifyData)))
+	_ = shellNotifyIcon(nimDelete, &tray.notifyData)
 	tray.iconAdded = false
 }
 
@@ -282,16 +327,70 @@ func (tray *nativeTray) windowProc(window uintptr, message uint32, wParam, lPara
 		tray.closeNotifications(errTrayNotificationsClosed)
 		procPostQuitMessage.Call(0)
 		return 0
+
+	case wmQueryEndSession:
+		// Replicaro never vetoes or holds up the end of a session. Another
+		// app can still cancel it after this, so the shutdown waits for
+		// WM_ENDSESSION.
+		return 1
+
+	case wmEndSession:
+		if wParam != 0 {
+			tray.endSession()
+		}
+		return 0
 	}
 
+	// Explorer broadcasts TaskbarCreated when it starts or restarts. Icons it
+	// had are gone by then, and one that couldn't be added at startup gets its
+	// next chance here.
 	if message == tray.taskbarCreated {
 		tray.iconAdded = false
-		_ = tray.addIcon()
+		if err := tray.addIcon(); err != nil {
+			log.Printf("Replicaro could not add its notification-area icon after Explorer restarted: %v", err)
+		}
 		return 0
 	}
 
 	result, _, _ := procDefWindowProc.Call(window, uintptr(message), wParam, lParam)
 	return result
+}
+
+// sessionEndWait bounds how long WM_ENDSESSION waits for the staged
+// shutdown. Windows gives an app about five seconds to answer before it
+// treats it as not responding, so this stays below that. A shutdown that
+// takes longer keeps going until Windows ends the process, and the next start
+// finds whatever it left behind, as after any other abrupt stop. Tests
+// shorten it.
+var sessionEndWait = 4 * time.Second
+
+// endSession runs the staged shutdown when Windows ends the session: the user
+// signs out, Windows shuts down or restarts, or an installer closes Replicaro
+// through the Restart Manager. Windows may end the process as soon as
+// WM_ENDSESSION returns, so the shutdown has to finish inside the message,
+// and it runs on its own goroutine because this thread runs the message loop.
+// Once the HTTP server has stopped, Run's service goroutine posts WM_CLOSE,
+// so the loop ends after this message and Run returns as after Quit.
+func (tray *nativeTray) endSession() {
+	// The message loop is blocked until the shutdown ends, so a toast queued
+	// now would never be shown and its sender would wait for good. Fail
+	// them at once, the same way they fail after Quit. The tray also stops
+	// being the active one first, as it is after Quit by the time the
+	// shutdown starts: operations the shutdown interrupts then send their
+	// toasts to no tray, which isn't an error, instead of to a closed one,
+	// which would show up as a failed notification on each of them.
+	activeTrayMu.Lock()
+	if activeTray == tray {
+		activeTray = nil
+	}
+	activeTrayMu.Unlock()
+	tray.closeNotifications(errTrayNotificationsClosed)
+	if tray.sessionEnd == nil {
+		return
+	}
+	if !finishWithin(tray.sessionEnd, sessionEndWait) {
+		log.Printf("Replicaro is still shutting down after %s; Windows may end it before it finishes", sessionEndWait)
+	}
 }
 
 func (tray *nativeTray) enqueueNotification(notification nativeNotification) error {
@@ -380,9 +479,41 @@ func (tray *nativeTray) showMenu() {
 	case menuOpen:
 		_ = openWebUI()
 	case menuQuit:
-		tray.requestClose()
+		if tray.confirmQuit() {
+			tray.requestClose()
+		}
 	}
 	procPostMessage.Call(tray.window, wmNull, 0, 0)
+}
+
+// confirmQuit asks before Quit stops Replicaro, and reports whether the
+// answer was Yes. The tray icon is the same process as the service, so Quit
+// stops every scheduled and running backup until Replicaro is started again,
+// and users can read it as "hide the icon". Only this menu click asks:
+// sign-out and the service ending on its own still close the tray at once.
+//
+// The message box runs its own message loop on this thread, which keeps
+// dispatching to the tray window, so WM_ENDSESSION and a service stop are
+// still handled while it is open, and the tray menu can be opened again. A
+// second Quit from it does nothing while the box is open. Windows names the
+// buttons Yes and No in its own language, which is why the prompt is a
+// question (see ConfirmStartupRepair).
+func (tray *nativeTray) confirmQuit() bool {
+	if tray.quitPromptOpen {
+		return false
+	}
+	tray.quitPromptOpen = true
+	defer func() { tray.quitPromptOpen = false }()
+	text, err := windows.UTF16PtrFromString(strings.ReplaceAll(desktopText(TextQuitPrompt), "\x00", ""))
+	if err != nil {
+		return true
+	}
+	caption, err := windows.UTF16PtrFromString("Replicaro")
+	if err != nil {
+		return true
+	}
+	choice, _ := windows.MessageBox(0, text, caption, windows.MB_YESNO|windows.MB_ICONQUESTION|windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
+	return choice == messageBoxYes
 }
 
 func (tray *nativeTray) requestClose() {
@@ -433,8 +564,11 @@ func createTrayMenu() (uintptr, error) {
 		return 0, win32Error("create tray menu", callErr)
 	}
 
-	openLabel, _ := windows.UTF16PtrFromString("Open Replicaro")
-	quitLabel, _ := windows.UTF16PtrFromString("Quit Replicaro")
+	// The labels are read once, here, so a language change shows in them
+	// after the next start.
+	openText, quitText := trayLabels()
+	openLabel, _ := windows.UTF16PtrFromString(strings.ReplaceAll(openText, "\x00", ""))
+	quitLabel, _ := windows.UTF16PtrFromString(strings.ReplaceAll(quitText, "\x00", ""))
 	items := []struct {
 		flags uintptr
 		id    uintptr

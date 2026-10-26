@@ -9,15 +9,16 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/kopiapolicy"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/repositoryadmission"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
 )
@@ -36,10 +37,39 @@ type vaultOwnershipStatus struct {
 	ObjectLock          models.ObjectLockSettings      `json:"objectLock"`
 	Message             string                         `json:"message"`
 	TakeoverExplanation string                         `json:"takeoverExplanation"`
+	// OwnerTransfer is "unfinished" when this computer started an ownership
+	// takeover that has not completed. The page then offers Finish takeover,
+	// which repeats the takeover request; that request resumes from the saved
+	// phase. Empty otherwise.
+	OwnerTransfer string `json:"ownerTransfer,omitempty"`
+}
+
+const ownerTransferUnfinished = "unfinished"
+
+// Locale keys for an unfinished ownership takeover. The page shows the same
+// text, and the backend writes it as the dashboard issue (see
+// reportUnfinishedOwnerTransfer).
+const (
+	ownerTransferUnfinishedKey = "ui.protect.ownerTransferUnfinished"
+	ownerTransferElsewhereKey  = "ui.protect.ownerTransferElsewhere"
+)
+
+// ownerTransferElsewhereError is returned when the protected root carries an
+// ownership transfer marker for a takeover this computer has no saved record
+// of: either there is no record here, or the record is for a different
+// transfer operation. Either way another computer started that takeover and
+// only it can finish it. Its text is the generic transitional-metadata error
+// on purpose: the takeover request and owner-only checks keep refusing exactly
+// as before, and only the ownership status request tells it apart (errors.As)
+// to show a clearer message.
+type ownerTransferElsewhereError struct{}
+
+func (e *ownerTransferElsewhereError) Error() string {
+	return "vault ownership metadata is invalid or transitional"
 }
 
 func readFreshVaultOwnershipForTransfer(ctx context.Context, repo models.Repository, allowed *database.OwnerTransferOperation) (vaultprofile.Root, vaultprofile.Profile, []byte, error) {
-	store := vaultprofile.Store{Repository: repo}.WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	store := vaultprofile.Store{Repository: repo}
 	rootRead, err := store.ReadDetailed(ctx)
 	if err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, nil, vaultprofile.ExplainSavedVaultPasswordFailure(err)
@@ -70,15 +100,16 @@ func validateFreshVaultOwnershipRoot(
 		return vaultprofile.Root{}, fmt.Errorf("vault ownership requires the canonical protected root")
 	}
 	root, err := vaultprofile.ParseRoot(rootRead.Data, repo.Connector)
-	if err != nil || root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
-		root.Repository.NativeRepositoryID != repo.NativeRepositoryID {
+	if err != nil || !root.Identifies(repo) {
 		return vaultprofile.Root{}, fmt.Errorf("vault ownership metadata is invalid or transitional")
 	}
 	if root.PasswordChange != nil {
 		return vaultprofile.Root{}, fmt.Errorf("a vault-password change is in progress; owner takeover is blocked")
 	}
-	if root.OwnerTransfer != nil && (allowed == nil ||
-		root.OwnerTransfer.OperationUUID != allowed.OperationUUID ||
+	if root.OwnerTransfer != nil && (allowed == nil || root.OwnerTransfer.OperationUUID != allowed.OperationUUID) {
+		return vaultprofile.Root{}, &ownerTransferElsewhereError{}
+	}
+	if root.OwnerTransfer != nil && (root.OwnerTransfer.OperationUUID != allowed.OperationUUID ||
 		root.OwnerTransfer.FromProfileUUID != allowed.FromProfileUUID ||
 		root.OwnerTransfer.ToProfileUUID != allowed.ToProfileUUID ||
 		root.VaultOwner.ProfileUUID != allowed.FromProfileUUID ||
@@ -107,8 +138,13 @@ func validateFreshVaultOwnerProfile(
 	return owner, nil
 }
 
-func readFreshVaultOwnershipStatus(ctx context.Context, repo models.Repository) (vaultprofile.Root, vaultprofile.Profile, vaultprofile.Profile, error) {
-	store := vaultprofile.Store{Repository: repo}.WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+// readFreshVaultOwnershipStatus reads the root, owner profile and local
+// profile for the ownership status. allowed is this computer's saved
+// unfinished transfer, if any: its matching root marker is accepted, as the
+// takeover request accepts it, so the status can report the transfer as
+// unfinished instead of failing.
+func readFreshVaultOwnershipStatus(ctx context.Context, repo models.Repository, allowed *database.OwnerTransferOperation) (vaultprofile.Root, vaultprofile.Profile, vaultprofile.Profile, error) {
+	store := vaultprofile.Store{Repository: repo}
 	objects, err := store.ReadOwnershipObjects(ctx, repo.ProfileUUID)
 	if err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, vaultprofile.Profile{}, explainOwnershipObjectsReadFailure(objects, err)
@@ -116,7 +152,7 @@ func readFreshVaultOwnershipStatus(ctx context.Context, repo models.Repository) 
 	if _, err := vaultprofile.ValidateRootIdentityResult(objects.Root, repo); err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, vaultprofile.Profile{}, err
 	}
-	root, err := validateFreshVaultOwnershipRoot(repo, objects.Root, nil)
+	root, err := validateFreshVaultOwnershipRoot(repo, objects.Root, allowed)
 	if err != nil {
 		return vaultprofile.Root{}, vaultprofile.Profile{}, vaultprofile.Profile{}, err
 	}
@@ -161,6 +197,74 @@ func ownershipStatus(repo models.Repository, root vaultprofile.Root, owner vault
 		TakeoverExplanation: ownerTakeoverExplanation}
 }
 
+// reportedOwnerTransfers remembers, for this app run only, which unfinished
+// takeovers already have their dashboard issue, keyed by vault and transfer
+// operation. The ownership status is read every time vault settings open, and
+// one issue per takeover is enough. It is deliberately not saved: after a
+// restart the issue is raised again the first time the status finds the
+// takeover still unfinished, which avoids new saved state for a reminder.
+var reportedOwnerTransfers sync.Map
+
+// reportUnfinishedOwnerTransfer writes the ERROR activity entry (shown as a
+// dashboard issue) the first time this app run finds a given unfinished
+// takeover. The vault name is included because the entry is not otherwise
+// tied to a vault.
+//
+// Only the computer that can finish the takeover calls this: the one holding
+// a transfer record that Finish takeover can still resume (see
+// ownerTransferResumable). Other computers only show "Another computer is
+// taking over ownership of this vault." in the vault settings. A dashboard
+// issue there would ask for action nobody on that computer can take, and a
+// takeover abandoned elsewhere would raise it again on every app run.
+func reportUnfinishedOwnerTransfer(db *sql.DB, repo models.Repository, operationUUID string) {
+	key := repo.ID + "/" + operationUUID
+	if _, seen := reportedOwnerTransfers.LoadOrStore(key, true); seen {
+		return
+	}
+	if err := database.LogError(db, repo.Name+": "+ownerTransferText(db, ownerTransferUnfinishedKey)); err != nil {
+		// Let the next status read try again rather than losing the issue.
+		reportedOwnerTransfers.Delete(key)
+	}
+}
+
+// ownerTransferResumable reports whether the takeover request can still pick
+// up this computer's saved transfer record against the root just read. Its
+// checks mirror where the takeover request goes with that record:
+//   - with the record's own marker on the root it resumes from the marker's
+//     phase (validateFreshVaultOwnershipRoot has already matched the marker
+//     against the record);
+//   - when the root already names this profile it completes the record from
+//     any state, as a cancelled final root publish can leave it;
+//   - when the root still names the record's from-profile with no marker it
+//     resumes only a "reviewed" record, by publishing the marker. A later
+//     state expects the marker it published and is refused.
+//
+// Anything else, for example the root now naming a third profile after
+// another computer took over, or a record for a profile this computer no
+// longer uses, makes the request refuse every time. Such a record can never
+// finish, so the status must not offer Finish takeover for it or raise its
+// dashboard issue on every app run; it shows the normal status instead.
+func ownerTransferResumable(repo models.Repository, root vaultprofile.Root, record database.OwnerTransferOperation) bool {
+	if record.ToProfileUUID != repo.ProfileUUID {
+		return false
+	}
+	if root.OwnerTransfer != nil {
+		return root.OwnerTransfer.OperationUUID == record.OperationUUID
+	}
+	if root.VaultOwner.ProfileUUID == record.ToProfileUUID {
+		return true
+	}
+	return root.VaultOwner.ProfileUUID == record.FromProfileUUID && record.State == "reviewed"
+}
+
+func ownerTransferText(db *sql.DB, key string) string {
+	language := ""
+	if settings, err := database.GetSettings(db); err == nil {
+		language = settings.Language
+	}
+	return locale.Text(locale.Effective(language), key, nil)
+}
+
 func adoptFreshRootVaultCare(db *sql.DB, repo models.Repository, root vaultprofile.Root) (models.Repository, error) {
 	objectLock := models.ObjectLockSettings{}
 	if root.ObjectLock != nil {
@@ -190,8 +294,7 @@ func adoptReviewedRootVaultCare(db *sql.DB, repo models.Repository, root vaultpr
 }
 
 func readLocalOwnerCandidate(ctx context.Context, repo models.Repository) (vaultprofile.Profile, error) {
-	data, err := (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).Read(ctx)
+	data, err := (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).Read(ctx)
 	if err != nil {
 		return vaultprofile.Profile{}, err
 	}
@@ -208,7 +311,6 @@ var readOwnershipStatus = readFreshVaultOwnershipStatus
 var readOwnershipLocalCandidate = readLocalOwnerCandidate
 var assertOwnershipLocalAttachment = func(ctx context.Context, repo models.Repository) error {
 	return (vaultprofile.Store{Repository: repo}).ForProfile(repo.ProfileUUID).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		AssertAttachment(ctx, repo.ClientUUID, repo.AttachmentGeneration)
 }
 var ensureTakeoverKopiaMaintenanceOwner = engines.EnsureKopiaMaintenanceOwner
@@ -217,7 +319,6 @@ var queueTakeoverKopiaPolicy = kopiapolicy.QueueDirty
 func currentRootOwnerMaintenanceMutationContext(ctx context.Context, repo models.Repository) context.Context {
 	return engines.ContextWithKopiaMaintenanceMutationAdmission(ctx, func(admissionContext context.Context) error {
 		authority, err := (vaultprofile.Store{Repository: repo}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 			AssertRootCare(admissionContext, repo.CheckSchedule, repo.MaintenanceSchedule, repo.ObjectLock)
 		if err != nil {
 			return err
@@ -249,9 +350,11 @@ func ownerTransferMaintenanceMutationContext(
 	})
 }
 
-// admitOwnerVaultCare keeps the actual native identity proof in ordinary
-// admission and supplies its complete owner/attachment proof once. Sidecar
-// ownership alone is never enough to authorize native repository administration.
+// admitOwnerVaultCare leaves the native identity check to the normal
+// repository admission and passes the owner check (canonical root and owner
+// profile) as its AssertControlPlane in place of the default root/attachment
+// check. The attachment is re-checked after admission. Owning the sidecar
+// alone never authorizes native repository administration.
 func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository) (models.Repository, vaultprofile.Root, []byte, error) {
 	var root vaultprofile.Root
 	var rootData []byte
@@ -268,7 +371,6 @@ func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository
 		// root unchanged. Reauthorize the current canonical attachment before
 		// the reviewed root can enter publication.
 		err = (vaultprofile.Store{Repository: admitted}).
-			WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 			ForProfile(admitted.ProfileUUID).
 			AssertAttachment(ctx, admitted.ClientUUID, admitted.AttachmentGeneration)
 	}
@@ -277,7 +379,6 @@ func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository
 
 func readOwnerVaultCare(ctx context.Context, repo models.Repository) (vaultprofile.Root, []byte, error) {
 	objects, err := (vaultprofile.Store{Repository: repo}).
-		WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable).
 		ReadOwnershipObjects(ctx, repo.ProfileUUID)
 	if err != nil {
 		return vaultprofile.Root{}, nil, explainOwnershipObjectsReadFailure(objects, err)
@@ -334,6 +435,30 @@ func publishReviewedOwnerVaultCare(ctx context.Context, repo models.Repository, 
 	})
 }
 
+// takeoverPublishOptions returns the options for one takeover root publish.
+//
+// Every publish gets a new publication ID. That ID only names the pending
+// object the store uploads before it copies the root into place, and the store
+// refuses different bytes under a pending name that already exists. A takeover
+// retry rebuilds the root with a new timestamp (and a later revision once a
+// phase has been published), so its bytes never match an earlier attempt. If
+// the publishes shared one ID, a single failure between the pending upload and
+// its cleanup (a dropped connection, a failed copy, a closed page) would leave
+// a pending object that every later Finish takeover runs into. The takeover
+// itself is identified by the marker's OperationUUID inside the root, not by
+// this ID. A pending object left by an abandoned attempt is harmless: reads
+// and discovery ignore it, and the next vault password change removes it.
+//
+// Don't pass the transfer's operation UUID, or any other ID that stays the same
+// across retries, here: Finish takeover would then fail for good after one
+// interrupted publish.
+func takeoverPublishOptions(currentRootData []byte) vaultprofile.PublishOptions {
+	hash := sha256.Sum256(currentRootData)
+	return vaultprofile.PublishOptions{
+		OperationID: uuid.NewString(), ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
+	}
+}
+
 func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -352,18 +477,49 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 				return
 			}
 			defer unlock()
+			// This computer's saved transfer record, when a takeover it started
+			// has not completed. Read under the shared vault lock, so a takeover
+			// request (which needs the exclusive lock) cannot move it meanwhile.
+			var allowed *database.OwnerTransferOperation
+			if active, activeErr := database.ActiveOwnerTransfer(db, repo.ID); activeErr == nil {
+				allowed = &active
+			} else if !errors.Is(activeErr, sql.ErrNoRows) {
+				writeError(w, http.StatusConflict, activeErr)
+				return
+			}
 			var root vaultprofile.Root
 			var owner, local vaultprofile.Profile
-			repo, err = admitPersistedControlPlaneRead(readContext, db, repo, func(assertContext context.Context, candidate models.Repository) error {
+			// Admission returns an empty repository on failure; keep the one
+			// loaded above so the issue below can still name the vault.
+			admitted, err := admitPersistedControlPlaneRead(readContext, db, repo, func(assertContext context.Context, candidate models.Repository) error {
 				var readErr error
-				root, owner, local, readErr = readOwnershipStatus(assertContext, candidate)
+				root, owner, local, readErr = readOwnershipStatus(assertContext, candidate, allowed)
 				return readErr
 			})
+			var elsewhere *ownerTransferElsewhereError
+			if errors.As(err, &elsewhere) {
+				// Another computer's takeover is unfinished. Only that computer
+				// can finish it, so this one gets a plain explanation instead of
+				// the generic metadata error, and no dashboard issue (see
+				// reportUnfinishedOwnerTransfer).
+				writeCodedError(w, http.StatusConflict, "owner_transfer_elsewhere", ownerTransferText(db, ownerTransferElsewhereKey))
+				return
+			}
 			if err != nil {
 				writeError(w, http.StatusConflict, err)
 				return
 			}
-			writeJSON(w, ownershipStatus(repo, root, owner, local.Attachment.Display))
+			repo = admitted
+			status := ownershipStatus(repo, root, owner, local.Attachment.Display)
+			if allowed != nil && ownerTransferResumable(repo, root, *allowed) {
+				// The saved record is what the takeover request resumes from, so
+				// it decides "unfinished", whether or not the root marker is still
+				// there (the root may already name this profile), as long as the
+				// request can still resume it.
+				status.OwnerTransfer = ownerTransferUnfinished
+				reportUnfinishedOwnerTransfer(db, repo, allowed.OperationUUID)
+			}
+			writeJSON(w, status)
 		case http.MethodPost:
 			var req struct {
 				ReviewedOwnerProfileUUID string `json:"reviewedOwnerProfileUUID"`
@@ -373,13 +529,15 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 				badRequest(w, "Force vault owner takeover requires review and confirmation")
 				return
 			}
-			unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), repo.ID)
+			// The takeover runs in the foreground, so a busy vault is waited
+			// for rather than refused. Everything it acts on is read after the
+			// wait: admission reloads the saved vault, and the transfer record
+			// and protected root are read below, so a takeover that another
+			// request moved on (or finished) while this waited is resumed from
+			// where it is now. Closing the page cancels the wait.
+			unlock, lockErr := vaultlock.AcquireExclusiveContext(r.Context(), repo.ID)
 			if lockErr != nil {
 				writeError(w, http.StatusConflict, lockErr)
-				return
-			}
-			if !ok {
-				writeError(w, http.StatusConflict, fmt.Errorf("the selected vault is busy with another operation"))
 				return
 			}
 			defer unlock()
@@ -496,10 +654,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 						writeError(w, http.StatusInternalServerError, encodeErr)
 						return
 					}
-					hash := sha256.Sum256(rootData)
-					if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-						OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-					}); err != nil {
+					if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 						writeError(w, http.StatusConflict, fmt.Errorf("publish vault owner transition: %w", err))
 						return
 					}
@@ -527,10 +682,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 						writeError(w, http.StatusInternalServerError, encodeErr)
 						return
 					}
-					hash := sha256.Sum256(rootData)
-					if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-						OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-					}); err != nil {
+					if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 						writeError(w, http.StatusConflict, fmt.Errorf("publish native-owner transfer phase: %w", err))
 						return
 					}
@@ -584,10 +736,7 @@ func handleVaultOwnership(db *sql.DB) http.HandlerFunc {
 					writeError(w, http.StatusInternalServerError, encodeErr)
 					return
 				}
-				hash := sha256.Sum256(rootData)
-				if err := publishRecoveryRoot(r.Context(), repo, encoded, vaultprofile.PublishOptions{
-					OperationID: op.OperationUUID, ExpectedCurrentSHA256: hex.EncodeToString(hash[:]),
-				}); err != nil {
+				if err := publishRecoveryRoot(r.Context(), repo, encoded, takeoverPublishOptions(rootData)); err != nil {
 					writeError(w, http.StatusConflict, fmt.Errorf("publish vault owner takeover: %w", err))
 					return
 				}

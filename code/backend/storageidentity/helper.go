@@ -8,173 +8,35 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"strings"
-	"syscall"
+	"sync"
 	"time"
-	"unicode"
 )
 
 const (
-	HelperVersion              = "storage_observer_v4"
-	HelperPermissionDeniedCode = "permission_denied"
-	DefaultMaxInput            = 64 << 10
-	DefaultMaxOutput           = 256 << 10
+	DefaultMaxInput  = 64 << 10
+	DefaultMaxOutput = 256 << 10
 )
 
 var ErrHelperStart = errors.New("storage helper process could not start")
 
-type HelperRequest struct {
-	Version        string `json:"version"`
-	Operation      string `json:"operation"`
-	Connector      string `json:"connector"`
-	Path           string `json:"path"`
-	ObjectType     string `json:"object_type,omitempty"`
-	SelectSpelling bool   `json:"select_spelling,omitempty"`
-}
+// ErrHelperSlotsExhausted means a probe never got a helper slot because
+// helpers that already timed out still hold slots while the OS finishes them.
+// It says nothing about the storage this probe was asked about.
+var ErrHelperSlotsExhausted = errors.New("storage helper slots are held by helpers that stopped responding")
 
-type HelperResponse struct {
-	Version            string              `json:"version"`
-	ConfiguredPath     string              `json:"configured_path,omitempty"`
-	Descriptor         *Descriptor         `json:"descriptor,omitempty"`
-	Key                string              `json:"key,omitempty"`
-	ObservedFilesystem string              `json:"observed_filesystem,omitempty"`
-	Filesystems        []MountedFilesystem `json:"filesystems,omitempty"`
-	ErrorCode          string              `json:"error_code,omitempty"`
-}
+// mountResponsiveWindow is how long after a helper on a mount answered that
+// further helpers on that mount may run side by side. Outside it, helpers on
+// one mount run one at a time, so a mount that stopped responding catches only
+// one helper instead of every concurrent probe of it. The window only needs to
+// cover the gap between probes in a burst, such as many backups starting at
+// once, which keeps those probes running in parallel.
+const mountResponsiveWindow = 2 * time.Second
 
-// MountedFilesystem is one currently mounted OS-authoritative filesystem
-// root. It contains no credentials and is used only to construct bounded alias
-// candidates which still require the caller's source identity check or complete
-// native/protected destination proof.
-type MountedFilesystem struct {
-	Path       string     `json:"path"`
-	Descriptor Descriptor `json:"descriptor"`
-}
-
-func ExecuteRequest(request HelperRequest) (HelperResponse, error) {
-	if err := validateHelperRequest(request); err != nil {
-		return HelperResponse{}, err
-	}
-	switch request.Operation {
-	case "observe":
-		observed, observedFilesystem, _, err := resolveExistingObservation(request.Path, request.ObjectType)
-		if err != nil {
-			return HelperResponse{}, err
-		}
-		response, err := observationResponse(observed, observedFilesystem)
-		if err == nil && request.SelectSpelling {
-			// Keep the v4 wire field for callers that still request it. Binding
-			// preserves the validated route; directory enumeration could change a
-			// UNC root and required a second, redundant observation.
-			response.ConfiguredPath = request.Path
-		}
-		return response, err
-	case "bind_parent":
-		descriptor, err := ResolveRepositoryForCreation(request.Path)
-		if err != nil {
-			return HelperResponse{}, err
-		}
-		key, err := descriptor.CanonicalKey()
-		if err != nil {
-			return HelperResponse{}, err
-		}
-		response := HelperResponse{Version: HelperVersion, Descriptor: &descriptor, Key: key}
-		if request.SelectSpelling {
-			response.ConfiguredPath = request.Path
-		}
-		return response, nil
-	case "enumerate":
-		filesystems, err := EnumerateMountedFilesystems()
-		if err != nil {
-			return HelperResponse{}, err
-		}
-		return HelperResponse{Version: HelperVersion, Filesystems: filesystems}, nil
-	default:
-		return HelperResponse{}, fmt.Errorf("unsupported storage helper request")
-	}
-}
-
-func observationResponse(observed Descriptor, observedFilesystem string) (HelperResponse, error) {
-	descriptor := observed
-	if strings.TrimSpace(observedFilesystem) == "" {
-		observedFilesystem = observed.Filesystem
-	}
-	if normalized := strings.ToLower(strings.TrimSpace(observedFilesystem)); normalized == "" || normalized != observedFilesystem ||
-		strings.IndexFunc(observedFilesystem, unicode.IsControl) >= 0 || len(observedFilesystem) > maxDescriptorFieldBytes {
-		return HelperResponse{}, fmt.Errorf("observed filesystem type is invalid")
-	}
-	// The separate fact makes the current OS observation explicit. Path-only
-	// bindings persist the same type for continuity, while stable Windows
-	// network descriptors keep protocol-key semantics.
-	response := HelperResponse{Version: HelperVersion, ObservedFilesystem: observedFilesystem}
-	key, err := descriptor.CanonicalKey()
-	if err != nil {
-		return HelperResponse{}, err
-	}
-	response.Descriptor, response.Key = &descriptor, key
-	return response, nil
-}
-
-// ObservationFilesystem returns the authoritative type for one exact helper
-// observation. Ordinary descriptors persist that same type. Stable Windows
-// network descriptors retain their protocol key and therefore require the
-// explicit actual-type fact.
-func (response HelperResponse) ObservationFilesystem() (string, error) {
-	if response.Descriptor == nil {
-		return "", fmt.Errorf("storage helper descriptor is missing")
-	}
-	value := response.ObservedFilesystem
-	if value == "" {
-		if (response.Descriptor.Kind == KindSMB || response.Descriptor.Kind == KindNFS) && response.Descriptor.Provider != "" {
-			return "", fmt.Errorf("Windows network filesystem observation is missing")
-		}
-		value = response.Descriptor.Filesystem
-	}
-	normalized := strings.ToLower(strings.TrimSpace(value))
-	if normalized == "" || normalized != value || strings.IndexFunc(value, unicode.IsControl) >= 0 || len(value) > maxDescriptorFieldBytes {
-		return "", fmt.Errorf("observed filesystem type is invalid")
-	}
-	windowsNetwork := (response.Descriptor.Kind == KindSMB || response.Descriptor.Kind == KindNFS) && response.Descriptor.Provider != ""
-	if windowsNetwork {
-		kind, err := WindowsNetworkProviderKind(response.Descriptor.Provider)
-		if err != nil || kind != response.Descriptor.Kind || response.Descriptor.Filesystem != string(response.Descriptor.Kind) {
-			return "", fmt.Errorf("Windows network identity facts are inconsistent")
-		}
-	} else if value != response.Descriptor.Filesystem {
-		// Two competing OS observations are unsafe at the operation boundary.
-		return "", fmt.Errorf("filesystem observation contradicts descriptor")
-	}
-	return normalized, nil
-}
-
-func validateHelperRequest(request HelperRequest) error {
-	if request.Version != HelperVersion || request.Operation != "observe" && request.Operation != "bind_parent" && request.Operation != "enumerate" {
-		return fmt.Errorf("unsupported storage helper request")
-	}
-	if request.Connector != "fs" {
-		return fmt.Errorf("only filesystem storage may be observed")
-	}
-	if (request.Operation == "observe" || request.Operation == "bind_parent") && request.Path == "" {
-		return fmt.Errorf("storage path is required")
-	}
-	if request.Operation == "observe" && request.ObjectType != "" && request.ObjectType != "directory" && request.ObjectType != "file" {
-		return fmt.Errorf("unsupported storage object type")
-	}
-	if request.Operation != "observe" && request.ObjectType != "" {
-		return fmt.Errorf("storage object type is only valid for exact observation")
-	}
-	if request.SelectSpelling {
-		configured, err := NormalizeConfiguredPath(request.Path)
-		if err != nil || configured != request.Path {
-			return fmt.Errorf("spelling selection requires a normalized configured path")
-		}
-	}
-	if request.Operation == "enumerate" && (request.Path != "" || request.SelectSpelling) {
-		return fmt.Errorf("enumeration does not accept a path")
-	}
-	return nil
-}
-
+// ServeHelper reads one probe request, performs it, and writes one response.
+// Storage that cannot be observed is a normal response (access "missing",
+// "denied", or "failed" with a step label and OS code). Only an invalid request
+// or an oversized response is an error, which makes the helper exit non-zero
+// so the parent reports a protocol failure instead of guessing.
 func ServeHelper(reader io.Reader, writer io.Writer, maxInput, maxOutput int64) error {
 	if maxInput <= 0 {
 		maxInput = DefaultMaxInput
@@ -192,11 +54,7 @@ func ServeHelper(reader io.Reader, writer io.Writer, maxInput, maxOutput int64) 
 	}
 	response, err := ExecuteRequest(request)
 	if err != nil {
-		// Only actual OS inspection errors mean that this candidate could not
-		// be inspected. Invalid or conflicting identity facts must survive the
-		// process boundary as a conclusive failure, not apparent absence.
-		code := helperErrorCode(err)
-		response = HelperResponse{Version: HelperVersion, ErrorCode: code}
+		return err
 	}
 	encoded, err := json.Marshal(response)
 	if err != nil {
@@ -211,20 +69,15 @@ func ServeHelper(reader io.Reader, writer io.Writer, maxInput, maxOutput int64) 
 	return nil
 }
 
-func helperErrorCode(err error) string {
-	if !IsInspectionError(err) {
-		return "observation_invalid"
-	}
-	var missing *MissingStorageError
-	if errors.As(err, &missing) {
-		return "storage_missing"
-	}
-	if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
-		return HelperPermissionDeniedCode
-	}
-	return "observation_failed"
-}
-
+// ProcessRunner launches one helper process per probe. A helper holds one of
+// the live slots until the OS has reaped it, which bounds the number of helper
+// processes even when some are stuck in a network filesystem call that the OS
+// doesn't let them leave. Helpers are also counted per mount (the recorded
+// mount point, or the path when none is recorded), and a mount with a
+// timed-out helper that is still running gets no new helper until that one is
+// gone. Together with mountResponsiveWindow, this normally keeps a mount that
+// stops answering to one slot, so it can't stop the checks of every other
+// drive or share.
 type ProcessRunner struct {
 	Executable string
 	Args       []string
@@ -233,6 +86,46 @@ type ProcessRunner struct {
 	MaxOutput  int64
 	live       chan struct{}
 	newProcess func([]byte, io.Writer, io.Writer) helperProcess
+
+	mu sync.Mutex
+	// mounts keeps one small entry per mount or path ever probed, which is
+	// bounded by the storage the user has configured.
+	mounts map[string]*mountHelpers
+	// stuck counts helpers past their deadline that the OS hasn't reaped yet.
+	stuck int
+}
+
+type mountHelpers struct {
+	running         int // helpers started on this mount and not yet reaped
+	stuck           int // of those, the ones past their deadline
+	responsiveUntil time.Time
+	// changed is closed and replaced whenever the counts or the window
+	// change, to wake probes waiting for this mount.
+	changed chan struct{}
+}
+
+// helperLaunch is one helper's place in the mount and slot accounting. Its
+// fields are guarded by ProcessRunner.mu.
+type helperLaunch struct {
+	mount    *mountHelpers
+	timedOut bool
+	reaped   bool
+}
+
+// mountKey spells a Windows drive or share the way SameMountPoint compares
+// them, so \\NAS\Photos, \\nas\photos\ and \\?\UNC\nas\photos share one entry.
+func mountKey(request HelperRequest) string {
+	if request.MountPoint != "" {
+		return "mount:" + helperMountSpelling(request.MountPoint)
+	}
+	return "path:" + helperMountSpelling(request.Path)
+}
+
+func helperMountSpelling(value string) string {
+	if windowsShapedMount(value) {
+		return windowsMountKey(value)
+	}
+	return value
 }
 
 func NewProcessRunner(executable string, args []string, timeout time.Duration, maxConcurrent int) (*ProcessRunner, error) {
@@ -244,6 +137,7 @@ func NewProcessRunner(executable string, args []string, timeout time.Duration, m
 		MaxInput: DefaultMaxInput, MaxOutput: DefaultMaxOutput,
 		live: make(chan struct{}, maxConcurrent),
 	}
+	runner.mounts = make(map[string]*mountHelpers)
 	runner.newProcess = func(input []byte, stdout, stderr io.Writer) helperProcess {
 		command := exec.Command(runner.Executable, runner.Args...)
 		configureStorageHelperCommand(command)
@@ -277,10 +171,9 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 	if err := deadlineContext.Err(); err != nil {
 		return HelperResponse{}, err
 	}
-	select {
-	case runner.live <- struct{}{}:
-	case <-deadlineContext.Done():
-		return HelperResponse{}, deadlineContext.Err()
+	launch, err := runner.acquire(deadlineContext, mountKey(request))
+	if err != nil {
+		return HelperResponse{}, err
 	}
 	maxOutput := runner.MaxOutput
 	if maxOutput <= 0 {
@@ -290,17 +183,17 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 	stderr := &boundedBuffer{limit: maxOutput}
 	process := runner.newProcess(encoded, stdout, stderr)
 	if process == nil {
-		<-runner.live
+		runner.release(launch, false)
 		return HelperResponse{}, fmt.Errorf("create storage helper process")
 	}
 	if err := process.Start(); err != nil {
-		<-runner.live
+		runner.release(launch, false)
 		return HelperResponse{}, fmt.Errorf("%w: %w", ErrHelperStart, err)
 	}
 	waited := make(chan error, 1)
 	go func() {
 		err := process.Wait()
-		<-runner.live
+		runner.release(launch, true)
 		waited <- err
 	}()
 	select {
@@ -312,6 +205,10 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 			return HelperResponse{}, fmt.Errorf("storage helper failed")
 		}
 	case <-deadlineContext.Done():
+		// Counted as timed out whether the deadline passed or the caller
+		// cancelled: either way nothing waits for this helper any more, and
+		// if the kill doesn't end it, its mount isn't answering.
+		runner.markTimedOut(launch)
 		_ = process.Kill()
 		// Wait continues in the bounded live-helper goroutine. The caller
 		// returns at its deadline, while the live slot remains held until the
@@ -326,51 +223,114 @@ func (runner *ProcessRunner) Run(ctx context.Context, request HelperRequest) (He
 	if err := decodeStrict(stdout.Bytes(), &response); err != nil {
 		return HelperResponse{}, fmt.Errorf("decode storage helper response: %w", err)
 	}
-	if response.Version != HelperVersion {
-		return HelperResponse{}, fmt.Errorf("unsupported storage helper response")
-	}
-	if response.ErrorCode != "" {
-		if response.Descriptor != nil || response.Key != "" || response.ConfiguredPath != "" ||
-			response.ObservedFilesystem != "" || len(response.Filesystems) != 0 {
-			return HelperResponse{}, fmt.Errorf("storage helper error response contains observation facts")
-		}
-		return response, fmt.Errorf("storage observation failed")
-	}
-	if _, err := response.BindingPath(request); err != nil {
+	if err := ValidateHelperResponse(request, response); err != nil {
 		return HelperResponse{}, err
-	}
-	if request.Operation == "enumerate" {
-		if response.Descriptor != nil || response.Key != "" || response.ObservedFilesystem != "" {
-			return HelperResponse{}, fmt.Errorf("storage helper enumeration response is invalid")
-		}
-		for _, mounted := range response.Filesystems {
-			if mounted.Path == "" {
-				return HelperResponse{}, fmt.Errorf("storage helper enumeration path is empty")
-			}
-			if err := mounted.Descriptor.Validate(); err != nil {
-				return HelperResponse{}, err
-			}
-		}
-		return response, nil
-	}
-	if response.Descriptor == nil || response.Key == "" || len(response.Filesystems) != 0 {
-		return HelperResponse{}, fmt.Errorf("storage helper response is incomplete")
-	}
-	if err := response.Descriptor.Validate(); err != nil {
-		return HelperResponse{}, err
-	}
-	if request.Operation == "observe" {
-		if _, err := response.ObservationFilesystem(); err != nil {
-			return HelperResponse{}, err
-		}
-	} else if response.ObservedFilesystem != "" {
-		return HelperResponse{}, fmt.Errorf("storage helper bind response contains observation-only facts")
-	}
-	key, err := response.Descriptor.CanonicalKey()
-	if err != nil || key != response.Key {
-		return HelperResponse{}, fmt.Errorf("storage helper identity key mismatch")
 	}
 	return response, nil
+}
+
+// acquire waits until a helper may start for the mount and then takes a live
+// slot. Waiting for the mount ends with the context's error, because only that
+// mount's own helper is holding things up; the storage behind it may be the
+// problem. Waiting for a slot while timed-out helpers hold slots ends with
+// ErrHelperSlotsExhausted instead, because the stuck storage is elsewhere.
+func (runner *ProcessRunner) acquire(ctx context.Context, key string) (*helperLaunch, error) {
+	for {
+		if err := runner.waitForMount(ctx, key); err != nil {
+			return nil, err
+		}
+		select {
+		case runner.live <- struct{}{}:
+		case <-ctx.Done():
+			runner.mu.Lock()
+			stuckElsewhere := runner.stuck > runner.mountLocked(key).stuck
+			runner.mu.Unlock()
+			if stuckElsewhere && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrHelperSlotsExhausted
+			}
+			return nil, ctx.Err()
+		}
+		// Another probe of the same mount may have started, or a helper there
+		// may have timed out, while this one waited for a slot.
+		runner.mu.Lock()
+		mount := runner.mountLocked(key)
+		if mountAcceptsHelperLocked(mount, time.Now()) {
+			mount.running++
+			runner.mu.Unlock()
+			return &helperLaunch{mount: mount}, nil
+		}
+		runner.mu.Unlock()
+		<-runner.live
+	}
+}
+
+func (runner *ProcessRunner) waitForMount(ctx context.Context, key string) error {
+	for {
+		runner.mu.Lock()
+		mount := runner.mountLocked(key)
+		if mountAcceptsHelperLocked(mount, time.Now()) {
+			runner.mu.Unlock()
+			return nil
+		}
+		// Only a helper on this mount finishing, timing out or being reaped
+		// can let this probe start; the window closing never does.
+		changed := mount.changed
+		runner.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func mountAcceptsHelperLocked(mount *mountHelpers, now time.Time) bool {
+	return mount.stuck == 0 && (mount.running == 0 || now.Before(mount.responsiveUntil))
+}
+
+func (runner *ProcessRunner) mountLocked(key string) *mountHelpers {
+	mount := runner.mounts[key]
+	if mount == nil {
+		mount = &mountHelpers{changed: make(chan struct{})}
+		runner.mounts[key] = mount
+	}
+	return mount
+}
+
+func (mount *mountHelpers) signalLocked() {
+	close(mount.changed)
+	mount.changed = make(chan struct{})
+}
+
+func (runner *ProcessRunner) markTimedOut(launch *helperLaunch) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if launch.reaped || launch.timedOut {
+		return
+	}
+	launch.timedOut = true
+	launch.mount.stuck++
+	launch.mount.responsiveUntil = time.Time{}
+	runner.stuck++
+	launch.mount.signalLocked()
+}
+
+// release runs once the helper is reaped, or right away when it never
+// started, and frees its mount place and live slot. exited says the helper ran
+// and exited; one that did so before its deadline shows the mount answers.
+func (runner *ProcessRunner) release(launch *helperLaunch, exited bool) {
+	runner.mu.Lock()
+	launch.reaped = true
+	launch.mount.running--
+	if launch.timedOut {
+		launch.mount.stuck--
+		runner.stuck--
+	} else if exited {
+		launch.mount.responsiveUntil = time.Now().Add(mountResponsiveWindow)
+	}
+	launch.mount.signalLocked()
+	runner.mu.Unlock()
+	<-runner.live
 }
 
 type helperProcess interface {

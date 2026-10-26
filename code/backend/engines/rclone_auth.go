@@ -61,6 +61,7 @@ func SetRcloneAuthorizationRunnerForTests(next func(
 	time.Duration,
 ) (string, error)) func() {
 	previous := runRcloneAuthorizationCommand
+	previousObserved := runObservedRcloneAuthorizationCommand
 	runRcloneAuthorizationCommand = func(
 		ctx context.Context, path string, args, env []string, timeout time.Duration,
 	) (string, error) {
@@ -80,8 +81,34 @@ func SetRcloneAuthorizationRunnerForTests(next func(
 		}
 		return next(ctx, path, args, env, timeout)
 	}
-	return func() { runRcloneAuthorizationCommand = previous }
+	// The browser step prints its sign-in link before rclone waits for the
+	// provider's callback. Emit the same two notices pinned rclone prints, then
+	// let next answer as if the callback arrived. Tests that need control over
+	// this step install their own runner with
+	// SetObservedRcloneAuthorizationRunnerForTests afterwards.
+	runObservedRcloneAuthorizationCommand = func(
+		ctx context.Context, path string, args, env []string, timeout time.Duration,
+		observe func([]byte) error,
+	) (string, error) {
+		for _, line := range []string{
+			`{"level":"notice","msg":"` + rcloneAuthorizationLinkPrefix + rcloneAuthorizationTestURL + `\n"}` + "\n",
+			`{"level":"notice","msg":"Log in and authorize rclone for access\n"}` + "\n",
+		} {
+			if err := observe([]byte(line)); err != nil {
+				return "", err
+			}
+		}
+		return next(ctx, path, args, env, timeout)
+	}
+	return func() {
+		runRcloneAuthorizationCommand = previous
+		runObservedRcloneAuthorizationCommand = previousObserved
+	}
 }
+
+// rcloneAuthorizationTestURL is the sign-in link the test runner above
+// reports for the browser step.
+const rcloneAuthorizationTestURL = "http://127.0.0.1:53682/auth?state=replicaro-test-state"
 
 func SetObservedRcloneAuthorizationRunnerForTests(next func(
 	context.Context,
@@ -106,7 +133,6 @@ type RcloneAuthQuestion struct {
 	Prompt       string             `json:"prompt"`
 	DefaultValue string             `json:"defaultValue"`
 	Choices      []RcloneAuthChoice `json:"choices"`
-	Notice       string             `json:"notice,omitempty"`
 }
 
 type rcloneConfigResponse struct {
@@ -141,7 +167,6 @@ type RcloneAuthorizationFlow struct {
 	provider            RcloneProviderDefinition
 	root, operationRoot string
 	config, cache, tmp  string
-	browserEnvironment  func() ([]string, error)
 	state               string
 	question            *rcloneConfigQuestion
 	oneDriveSurveyed    bool
@@ -149,7 +174,6 @@ type RcloneAuthorizationFlow struct {
 	options             map[string]string
 	ready, closed       bool
 	cleanupComplete     bool
-	manualBrowser       bool
 }
 
 func rcloneNativeLoginProvider(storageType string) (RcloneProviderDefinition, error) {
@@ -162,45 +186,20 @@ func rcloneNativeLoginProvider(storageType string) (RcloneProviderDefinition, er
 	}
 }
 
+// StartRcloneAuthorization runs a new native sign-in up to its first
+// question, or to the end when rclone asks none that the user has to answer.
+// When rclone reaches its browser step, it prints the sign-in link and waits
+// for the provider's callback; onAuthorizationURL receives the validated link
+// once, while rclone is still waiting, so the caller can present it.
 func StartRcloneAuthorization(
 	ctx context.Context,
 	customBinary, storageType string,
-) (*RcloneAuthorizationFlow, error) {
-	return startRcloneAuthorization(
-		ctx, customBinary, storageType, rcloneAuthorizationBrowserEnvironment,
-	)
-}
-
-func StartRcloneAuthorizationManual(
-	ctx context.Context,
-	customBinary, storageType string,
 	onAuthorizationURL func(string),
 ) (*RcloneAuthorizationFlow, error) {
-	return startRcloneAuthorizationMode(
-		ctx, customBinary, storageType, nil, true, onAuthorizationURL,
-	)
-}
-
-func startRcloneAuthorization(
-	ctx context.Context,
-	customBinary, storageType string,
-	browserEnvironment func() ([]string, error),
-) (*RcloneAuthorizationFlow, error) {
-	return startRcloneAuthorizationMode(
-		ctx, customBinary, storageType, browserEnvironment, false, nil,
-	)
-}
-
-func startRcloneAuthorizationMode(
-	ctx context.Context,
-	customBinary, storageType string,
-	browserEnvironment func() ([]string, error),
-	manualBrowser bool,
-	onAuthorizationURL func(string),
-) (*RcloneAuthorizationFlow, error) {
-	if err := ensureRcloneSessionsCleaned(); err != nil {
-		return nil, fmt.Errorf("clean stale rclone sessions: %w", err)
-	}
+	// Startup normally runs (and logs) the sweep before anything else; this
+	// only covers a sign-in that comes first. A stale session that couldn't be
+	// removed doesn't block a new sign-in, which gets its own fresh folder.
+	_ = ensureRcloneSessionsCleaned()
 	provider, err := rcloneNativeLoginProvider(storageType)
 	if err != nil {
 		return nil, err
@@ -213,8 +212,8 @@ func startRcloneAuthorizationMode(
 	if err != nil {
 		return nil, err
 	}
-	if err := prepareRcloneSessionRoot(parent); err != nil {
-		return nil, fmt.Errorf("validate private rclone authorization root: %w", err)
+	if err := makePrivateRcloneDirectory(parent); err != nil {
+		return nil, fmt.Errorf("create private rclone authorization root: %w", err)
 	}
 	root, err := os.MkdirTemp(parent, "config-")
 	if err != nil {
@@ -227,21 +226,16 @@ func startRcloneAuthorizationMode(
 	if err := os.Chmod(root, 0o700); err != nil {
 		return cleanup(err)
 	}
-	if err := appdata.SecurePath(root, true); err != nil {
-		return cleanup(err)
-	}
 	operationRoot, cache, temporary, _, err := privateRcloneOperationDirectories()
 	if err != nil {
 		return cleanup(err)
 	}
 	flow := &RcloneAuthorizationFlow{
 		binary: binary, provider: provider, root: root, operationRoot: operationRoot,
-		config:             filepath.Join(root, "rclone.conf"),
-		cache:              cache,
-		tmp:                temporary,
-		options:            map[string]string{},
-		browserEnvironment: browserEnvironment,
-		manualBrowser:      manualBrowser,
+		config:  filepath.Join(root, "rclone.conf"),
+		cache:   cache,
+		tmp:     temporary,
+		options: map[string]string{},
 	}
 	if err := flow.advanceLocked(ctx, true, "", "", onAuthorizationURL); err != nil {
 		return failRcloneAuthorization(flow, err)
@@ -303,43 +297,32 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 				"--state", state, "--result", result, "--non-interactive",
 			}
 		}
-		timeout := 2 * time.Minute
-		var environment []string
-		if browserAuthorization {
-			timeout = rcloneAuthorizationTimeout
-			if !flow.manualBrowser {
-				if flow.browserEnvironment == nil {
-					return fmt.Errorf("native rclone browser authorization environment is unavailable")
-				}
-				browserEnvironment, environmentErr := flow.browserEnvironment()
-				if environmentErr != nil {
-					return environmentErr
-				}
-				environment = browserEnvironment
-			}
-		}
 		var output string
 		var err error
-		if browserAuthorization && flow.manualBrowser {
+		if browserAuthorization {
+			// rclone always runs its no-browser mode here and only prints the
+			// link. A browser that rclone starts is part of rclone's process
+			// tree, and ending that tree after sign-in (or on cancel or timeout)
+			// can end the browser with it. The caller opens the link instead,
+			// or shows it when Replicaro mustn't open a browser.
 			if onAuthorizationURL == nil {
-				return fmt.Errorf("native rclone manual authorization presentation is unavailable")
+				return fmt.Errorf("native rclone authorization link presentation is unavailable")
 			}
-			manualArgs := append([]string(nil), args[:3]...)
-			manualArgs = append(manualArgs, "config_auth_no_browser", "true")
-			manualArgs = append(manualArgs, args[3:]...)
-			manualArgs = append(manualArgs, "--use-json-log")
+			browserArgs := append([]string(nil), args[:3]...)
+			browserArgs = append(browserArgs, "config_auth_no_browser", "true")
+			browserArgs = append(browserArgs, args[3:]...)
+			browserArgs = append(browserArgs, "--use-json-log")
 			observer := newRcloneAuthorizationURLObserver(onAuthorizationURL)
 			output, err = runObservedRcloneAuthorizationCommand(
-				ctx, flow.binary, flow.argsWithLogLevel("NOTICE", manualArgs...), nil,
-				timeout, observer.observe,
+				ctx, flow.binary, flow.argsWithLogLevel("NOTICE", browserArgs...), nil,
+				rcloneAuthorizationTimeout, observer.observe,
 			)
 			if finishErr := observer.finish(); finishErr != nil {
 				err = errors.Join(err, finishErr)
 			}
 		} else {
 			output, err = runRcloneAuthorizationCommand(
-				ctx, flow.binary, flow.args(args...), environment,
-				timeout,
+				ctx, flow.binary, flow.args(args...), nil, 2*time.Minute,
 			)
 		}
 		if err != nil {
@@ -387,17 +370,17 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 			initial, browserAuthorization = false, false
 			continue
 		case "config_shared_client_id":
-			// Rclone's shared Google client retirement notice was previously
-			// surfaced as a UI question even though Replicaro has no custom
-			// client-ID input. Keep the notice internal in every login flow and
-			// use the only supported native choice; rclone reports any failure.
+			// Rclone asks about its shared Google client (a retirement notice).
+			// Replicaro has no custom client-ID input, so keep the question out of
+			// the UI in every login flow and answer with the only supported native
+			// choice; rclone reports any failure.
 			state, result = response.State, "true"
 			initial, browserAuthorization = false, false
 			continue
 		case "config_change_team_drive":
-			// Rclone used to ask users whether to use a Google Shared Drive
-			// after login. This login path defaults to My Drive, so
-			// answer No in every create, connect, and reauthorization flow.
+			// Rclone asks whether to use a Google Shared Drive after login.
+			// This login path always uses My Drive, so answer No in every
+			// create, connect, and reauthorization flow.
 			state, result = response.State, "false"
 			initial, browserAuthorization = false, false
 			continue
@@ -409,9 +392,9 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 			initial, browserAuthorization = false, false
 			continue
 		case "config_drive_ok":
-			// Rclone already validated the selected location's root. Its
-			// redundant "Use this drive?" confirmation used to reach the UI;
-			// answer Yes consistently after the location was selected.
+			// Rclone has already validated the selected location's root, so its
+			// "Use this drive?" confirmation is redundant. Answer Yes without
+			// showing it to the user.
 			state, result = response.State, "true"
 			initial, browserAuthorization = false, false
 			continue
@@ -428,11 +411,11 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 	}
 }
 
-// surveyOneDriveLocationsLocked fixes the old numbered chooser, which asked
-// users to guess among untested OneDrive IDs. It runs the same native root and
-// identity checks that previously ran only after a user picked one location.
-// Probe every discovered ID before deciding whether a choice is necessary.
-// The checks are read-only remotely; rclone updates the private local config.
+// surveyOneDriveLocationsLocked runs the native root and identity checks on
+// every OneDrive ID rclone discovers, so users never have to guess among
+// untested IDs. Probe every discovered ID before deciding whether a choice is
+// necessary. The checks are read-only remotely; rclone updates the private
+// local config.
 func (flow *RcloneAuthorizationFlow) surveyOneDriveLocationsLocked(
 	ctx context.Context,
 	state string,
@@ -657,24 +640,21 @@ func (flow *RcloneAuthorizationFlow) readProviderConfigIfPresent(ctx context.Con
 	if err != nil || relative != "rclone.conf" {
 		return nil, false, fmt.Errorf("native rclone provider configuration path is unsafe")
 	}
-	if err := prepareRcloneSessionRoot(root); err != nil {
-		return nil, false, fmt.Errorf("native rclone authorization session is unsafe")
-	}
-	info, err := os.Lstat(config)
-	if os.IsNotExist(err) {
+	info, err := os.Stat(config)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		removeErr := os.Remove(config)
-		return nil, false, errors.Join(
-			fmt.Errorf("native rclone provider configuration is linked or special"),
-			removeErr,
-		)
+	if err != nil {
+		return nil, false, fmt.Errorf("native rclone provider configuration could not be inspected")
 	}
-	if err := os.Chmod(config, 0o600); err != nil {
-		return nil, false, fmt.Errorf("protect native rclone provider configuration")
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("native rclone provider configuration is not a regular file")
 	}
-	if err := appdata.SecurePath(config, false); err != nil {
+	// rclone created this file inside the session folder. Make it owner-only
+	// before it's used (0600 on Unix; on Windows it inherits the application
+	// folder's protected DACL); rclone keeps that mode when it saves the file
+	// again.
+	if err := hardenNewRcloneConfigFile(config); err != nil {
 		return nil, false, fmt.Errorf("protect native rclone provider configuration")
 	}
 	if info.Size() < 0 || info.Size() > maximumRcloneVaultConfigBytes {
@@ -694,14 +674,6 @@ func (flow *RcloneAuthorizationFlow) readProviderConfigIfPresent(ctx context.Con
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("native rclone provider observation was invalid")
-	}
-	info, err = os.Lstat(config)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		removeErr := os.Remove(config)
-		return nil, false, errors.Join(
-			fmt.Errorf("native rclone provider configuration became unsafe"),
-			removeErr,
-		)
 	}
 	return values, true, nil
 }
@@ -867,25 +839,15 @@ func rcloneAuthPublicChoiceLabel(question string, index int) string {
 	}
 }
 
+// Continue answers the current question. onAuthorizationURL works as for
+// StartRcloneAuthorization when the answer leads to rclone's browser step.
 func (flow *RcloneAuthorizationFlow) Continue(
-	ctx context.Context,
-	answer string,
-) error {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-	return flow.continueLocked(ctx, answer, nil)
-}
-
-func (flow *RcloneAuthorizationFlow) ContinueManual(
 	ctx context.Context,
 	answer string,
 	onAuthorizationURL func(string),
 ) error {
 	flow.mu.Lock()
 	defer flow.mu.Unlock()
-	if !flow.manualBrowser {
-		return fmt.Errorf("rclone authorization does not use manual browser presentation")
-	}
 	return flow.continueLocked(ctx, answer, onAuthorizationURL)
 }
 
@@ -972,7 +934,7 @@ func (flow *RcloneAuthorizationFlow) discoverIdentityLocked(
 		return nil, fmt.Errorf("native rclone account identity discovery returned invalid JSON")
 	}
 	if identityLog != "" {
-		if err := appdata.SecurePath(identityLog, false); err != nil {
+		if err := os.Chmod(identityLog, 0o600); err != nil {
 			return nil, fmt.Errorf("secure native rclone identity output")
 		}
 	}
@@ -1223,14 +1185,14 @@ func (flow *RcloneAuthorizationFlow) StagedConfigPath() (string, error) {
 		return "", fmt.Errorf("rclone authorization is not complete")
 	}
 	if err := validateRcloneVaultFile(flow.config); err != nil {
-		return "", fmt.Errorf("native rclone authorization config is unsafe")
+		return "", fmt.Errorf("native rclone authorization config is missing, not a regular file, or larger than 8 MiB")
 	}
 	return flow.config, nil
 }
 
-// PublishVaultConfig securely transfers the opaque native config to the
-// authoritative repository-ID path. A retained pre-activation failure leaves
-// the candidate in this flow; activation and indeterminate results consume it.
+// PublishVaultConfig moves the opaque native config to the vault's
+// repository-ID path with one atomic rename. A retained failure leaves the
+// candidate in this flow; activated and indeterminate results consume it.
 func (flow *RcloneAuthorizationFlow) PublishVaultConfig(
 	ctx context.Context,
 	repositoryID string,
@@ -1260,19 +1222,16 @@ func (flow *RcloneAuthorizationFlow) Close() error {
 			delete(flow.options, key)
 		}
 	}
-	wipeErr := wipeRcloneAuthorizationConfig(flow.config)
+	// Removing the session folder removes the candidate config with it. There's
+	// no separate truncate-then-delete step: truncating doesn't scrub the disk
+	// blocks, so it only helps against someone holding a hard link to the file,
+	// which is outside what Replicaro defends against. If removal fails, Close
+	// can be called again, and the next startup sweep removes the folder.
 	removeErr := errors.Join(removeRcloneSession(flow.root), removeRcloneSession(flow.operationRoot))
-	if wipeErr == nil && removeErr == nil {
+	if removeErr == nil {
 		flow.cleanupComplete = true
 	}
-	return errors.Join(wipeErr, removeErr)
-}
-
-func wipeRcloneAuthorizationConfig(filename string) error {
-	if err := wipeRcloneConfig(filename); err != nil {
-		return fmt.Errorf("wipe private rclone authorization config: %w", err)
-	}
-	return nil
+	return removeErr
 }
 
 func IsRcloneNativeLoginProvider(storageType string) bool {

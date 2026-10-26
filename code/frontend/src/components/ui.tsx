@@ -181,7 +181,9 @@ export function Tooltip({
     content,
     children,
 }: {
-    content: string;
+    // Content that isn't plain text (such as a <bdi> around a path) needs an
+    // aria-label on the child, because it can't name the control itself.
+    content: ReactNode;
     children: ReactElement;
 }) {
     const id = useId();
@@ -221,7 +223,7 @@ export function Tooltip({
             fitTooltip(event.currentTarget);
         },
         "aria-describedby": describedBy,
-        "aria-label": props["aria-label"] ?? content,
+        "aria-label": props["aria-label"] ?? (typeof content === "string" ? content : undefined),
         children: (
             <>
                 {props.children}
@@ -234,25 +236,20 @@ export function Tooltip({
 }
 
 /* ------------------------------------------------------------------ */
-/* Badges & status                                                     */
-/* ------------------------------------------------------------------ */
-
-export function StatusBadge({ status }: { status: string }) {
-    switch (status) {
-        case "running":
-            return <span className="badge info running">{t("ui.components.ui.running")}</span>;
-        case "success":
-            return <span className="badge ok">{t("ui.components.ui.healthy")}</span>;
-        case "failed":
-            return <span className="badge danger">{t("ui.components.ui.failed")}</span>;
-        default:
-            return <span className="badge muted">{t("ui.components.ui.never.run")}</span>;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* Modal                                                               */
 /* ------------------------------------------------------------------ */
+
+// Open modals in mount order; the last entry is the one on top. Every Modal
+// listens on window, so without this a single Escape reached every open
+// dialog at once: pressing it in a DirectoryPicker opened from a job dialog
+// closed the picker and the job dialog behind it, and the Tab focus trap of
+// every open dialog ran on each key press. Only the topmost Modal may act on
+// a key; the ones underneath ignore keys until they are on top again.
+// Entries are removed by identity, not popped, because a dialog lower in the
+// stack can close first (for example when the page that opened it unmounts).
+// Nested dialogs are portals rather than DOM descendants, so the order is
+// tracked here instead of being read from the DOM tree.
+const openModalStack: object[] = [];
 
 export function Modal({
     title,
@@ -260,12 +257,24 @@ export function Modal({
     children,
     wide,
 	topAction,
+	lang,
+	dir,
+	describedBy,
+	closeLabel,
 }: {
     title: string;
     onClose: () => void;
     children: ReactNode;
     wide?: boolean;
 	topAction?: ReactNode;
+	// For a dialog whose text is in another language than the page, such as
+	// an English-only dialog on a translated page. closeLabel replaces the
+	// translated Close label so the whole dialog is in that language.
+	lang?: string;
+	dir?: "ltr" | "rtl";
+	// id of the element that describes the dialog, read out after its title.
+	describedBy?: string;
+	closeLabel?: string;
 }) {
 	const dialogRef = useRef<HTMLDivElement>(null);
 	const onCloseRef = useRef(onClose);
@@ -281,7 +290,10 @@ export function Modal({
 		) ?? []).filter((element) => !element.hidden);
 		const preferred = dialog?.querySelector<HTMLElement>("[autofocus]") ?? focusable()[0] ?? dialog;
 		preferred?.focus();
+		const stackEntry = {};
+		openModalStack.push(stackEntry);
         const onKey = (e: KeyboardEvent) => {
+			if (openModalStack[openModalStack.length - 1] !== stackEntry) return;
 			if (e.key === "Escape") onCloseRef.current();
 			if (e.key !== "Tab") return;
 			const items = focusable();
@@ -303,6 +315,8 @@ export function Modal({
         window.addEventListener("keydown", onKey);
 		return () => {
 			window.removeEventListener("keydown", onKey);
+			const index = openModalStack.indexOf(stackEntry);
+			if (index !== -1) openModalStack.splice(index, 1);
 			previousFocus?.focus();
 		};
 	}, []);
@@ -320,6 +334,9 @@ export function Modal({
                 role="dialog"
 				aria-modal="true"
 				aria-label={title}
+				aria-describedby={describedBy}
+				lang={lang}
+				dir={dir}
 				tabIndex={-1}
             >
 				{/* Optional actions precede the title and body so callers can keep a
@@ -327,8 +344,8 @@ export function Modal({
 				{topAction && <div className="modal-top-action">{topAction}</div>}
                 <div className="row spread" style={{ marginBottom: 4 }}>
                     <h3 style={{ margin: 0 }}>{title}</h3>
-                    <button className="modal-close" onClick={onClose} aria-label={t("ui.components.ui.close")}>
-                        {t("ui.components.ui.close")} <Icon name="x" size={13} />
+                    <button className="modal-close" onClick={onClose} aria-label={closeLabel ?? t("ui.components.ui.close")}>
+                        {closeLabel ?? t("ui.components.ui.close")} <Icon name="x" size={13} />
                     </button>
                 </div>
                 <div style={{ marginTop: 12 }}>{children}</div>

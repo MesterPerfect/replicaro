@@ -9,7 +9,6 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
-	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultprofile"
 )
 
@@ -40,7 +39,7 @@ func repairMissing(ctx context.Context, db *sql.DB, repo models.Repository, nati
 		return repo, false, fmt.Errorf("local installation identity is unavailable; select Reconnect to review the vault")
 	}
 	if !nativeIdentityProven {
-		engine, err := engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
+		engine, err := engines.Resolve(repo)
 		if err != nil {
 			return repo, false, fmt.Errorf("saved vault connection is unavailable; select Reconnect to review it: %w", err)
 		}
@@ -56,14 +55,13 @@ func repairMissing(ctx context.Context, db *sql.DB, repo models.Repository, nati
 			return repo, false, fmt.Errorf("saved connection does not identify the expected vault; select Reconnect to review it")
 		}
 	}
-	store := (vaultprofile.Store{Repository: repo}).WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	store := (vaultprofile.Store{Repository: repo})
 	rootData, err := store.Read(ctx)
 	if err != nil {
 		return repo, false, fmt.Errorf("read expected vault identity before profile repair: %w", err)
 	}
 	root, err := vaultprofile.ParseRoot(rootData, repo.Connector)
-	if err != nil || root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
-		root.Repository.NativeRepositoryID != repo.NativeRepositoryID || root.OwnerTransfer != nil {
+	if err != nil || !root.Identifies(repo) || root.OwnerTransfer != nil {
 		return repo, false, fmt.Errorf("protected root does not identify the expected stable vault; select Reconnect to review it")
 	}
 	matchUUID, matchGeneration, matches, profileCount, err := selectClientProfile(repo.ClientUUID, func(visit func(vaultprofile.Profile) error) error {
@@ -80,7 +78,7 @@ func repairMissing(ctx context.Context, db *sql.DB, repo models.Repository, nati
 	if matches != 1 {
 		return repo, false, fmt.Errorf("multiple authoritative vault profiles name this computer; select Reconnect to resolve the identity conflict")
 	}
-	if automaticSoleProfileConnector(repo.Connector) && profileCount != 1 {
+	if models.SoleProfileConnector(repo.Connector) && profileCount != 1 {
 		return repo, false, fmt.Errorf("this cloud vault must contain exactly one authoritative profile; select Reconnect to review it")
 	}
 	isOwner := root.VaultOwner.ProfileUUID == matchUUID
@@ -91,15 +89,6 @@ func repairMissing(ctx context.Context, db *sql.DB, repo models.Repository, nati
 	repaired, err := database.GetRepository(db, repo.ID)
 	repaired.IsVaultOwner = isOwner
 	return repaired, err == nil, err
-}
-
-func automaticSoleProfileConnector(connector string) bool {
-	switch connector {
-	case "dropbox", "google_drive", "onedrive":
-		return true
-	default:
-		return false
-	}
 }
 
 func selectClientProfile(clientUUID string, scan func(func(vaultprofile.Profile) error) error) (string, int64, int, int, error) {

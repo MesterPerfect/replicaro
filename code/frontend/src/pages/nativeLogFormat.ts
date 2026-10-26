@@ -303,6 +303,75 @@ function formatResticBackup(value: unknown) {
     }
 }
 
+// Restic restores run with --json, so their progress, summary, per-file errors
+// and exit record arrive as structured records. These lines repeat Restic's own
+// figures and nothing more: Restic counts files that later failed as restored,
+// so the summary is not a success statement. The per-file error records and
+// the exit record carry the failures, and the operation status (completed with
+// issues or failed) comes from the backend, never from these counts.
+const resticRestoreCountKeys = ["total_files", "files_restored", "files_skipped", "files_deleted", "total_bytes", "bytes_restored", "bytes_skipped"];
+
+function resticRestoreDetails(value: JsonRecord) {
+    const filesRestored = optionalNumber(value, "files_restored");
+    const totalFiles = optionalNumber(value, "total_files");
+    const bytesRestored = optionalNumber(value, "bytes_restored");
+    const totalBytes = optionalNumber(value, "total_bytes");
+    const filesSkipped = optionalNumber(value, "files_skipped");
+    const bytesSkipped = optionalNumber(value, "bytes_skipped");
+    const filesDeleted = optionalNumber(value, "files_deleted");
+    const details: string[] = [];
+    // Restic omits zero counts, so a missing count reads as zero.
+    if (typeof totalFiles === "number") details.push(`${filesRestored ?? 0}/${totalFiles} files`);
+    else if (typeof filesRestored === "number") details.push(plural(filesRestored, "file"));
+    if (typeof totalBytes === "number") details.push(`${readableBytes(bytesRestored ?? 0)} / ${readableBytes(totalBytes)}`);
+    else if (typeof bytesRestored === "number") details.push(readableBytes(bytesRestored));
+    if (typeof filesSkipped === "number" && filesSkipped > 0) {
+        details.push(`${plural(filesSkipped, "file")} skipped${typeof bytesSkipped === "number" ? ` (${readableBytes(bytesSkipped)})` : ""}`);
+    }
+    if (typeof filesDeleted === "number" && filesDeleted > 0) details.push(`${plural(filesDeleted, "file")} deleted`);
+    return details;
+}
+
+function formatResticRestoreStatus(value: JsonRecord) {
+    if (!hasOnlyKeys(value, ["message_type", "seconds_elapsed", "seconds_remaining", "percent_done", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["seconds_elapsed", "seconds_remaining", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["percent_done"], false)) return null;
+    const percent = optionalNumber(value, "percent_done", false);
+    const remaining = optionalNumber(value, "seconds_remaining");
+    const details: string[] = [];
+    if (typeof percent === "number" && percent <= 1) details.push(`${Number((percent * 100).toFixed(1))}%`);
+    else if (percent !== undefined) return null;
+    details.push(...resticRestoreDetails(value));
+    if (typeof remaining === "number" && remaining > 0) details.push(`${readableDuration(remaining)} remaining`);
+    return details.length ? `Restic restore progress: ${details.join(" · ")}` : null;
+}
+
+function formatResticRestoreSummary(value: JsonRecord) {
+    if (!hasOnlyKeys(value, ["message_type", "seconds_elapsed", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["seconds_elapsed", ...resticRestoreCountKeys])) return null;
+    const elapsed = optionalNumber(value, "seconds_elapsed");
+    const details = resticRestoreDetails(value);
+    if (typeof elapsed === "number") details.push(readableDuration(elapsed));
+    return details.length ? `Restic restore summary: ${details.join(" · ")}` : "Restic restore summary";
+}
+
+function formatResticRestore(value: unknown) {
+    const row = record(value);
+    if (!row || typeof row.message_type !== "string") return null;
+    switch (row.message_type) {
+    case "status":
+        return formatResticRestoreStatus(row);
+    case "summary":
+        return formatResticRestoreSummary(row);
+    case "error":
+        return formatResticError(row);
+    case "exit_error":
+        return formatResticExitError(row);
+    default:
+        return null;
+    }
+}
+
 function formatResticRetentionRecord(value: unknown, summaryOnly = false) {
     if (Array.isArray(value)) return formatResticRetention(value, summaryOnly);
     const row = record(value);
@@ -474,7 +543,9 @@ function structuredDiagnostics(value: unknown, engine: string, diagnostics: stri
 
 export const retentionSummaryUnavailable = "Restic retention summary unavailable for this incomplete or unsupported record. See Raw in the completed log for details.";
 
-export interface LogPresentation { concise?: boolean; maintenanceOnly?: boolean; operationKind?: string }
+// lockedFilesSkipped narrows a completed-with-issues backup heading to the
+// locked-files result; it means nothing unless completedWithIssues is also set.
+export interface LogPresentation { concise?: boolean; maintenanceOnly?: boolean; operationKind?: string; lockedFilesSkipped?: boolean }
 
 function formatNativeLogLine(engine: NativeEngine | "replicaro", operationKind: string, line: string, diagnostics?: string[], concise = false, hiddenSection = false) {
     const unparsed = () => {
@@ -495,6 +566,7 @@ function formatNativeLogLine(engine: NativeEngine | "replicaro", operationKind: 
     const formatted = engine === "restic"
         ? Array.isArray(value) ? formatResticRetentionRecord(value, concise && retentionContext)
             : operationKind === "backup" || operationKind === "live" ? formatResticBackup(value)
+            : operationKind === "restore" ? formatResticRestore(value)
             : record(value) ? formatResticExitError(value as JsonRecord) : null
         : formatKopia(value);
     // Summaries intentionally condense native facts, including rounded sizes.
@@ -590,9 +662,13 @@ export function formatNativeLogText(engine: string, operationKind: string, text:
 
 const operationSection = /(^|(?:\r?\n){2})(\[(restic|kopia|replicaro) · ([^\]\r\n]+) · ([^\]\r\n]+)\])(\r?\n)([\s\S]*?)(?=(?:\r?\n){2}\[(?:restic|kopia|replicaro) · [^\]\r\n]+ · [^\]\r\n]+\]|$)/g;
 
-export function completedBackupHeading(header: string, completedWithIssues: boolean) {
+// The log stays in English, so the heading carries the English outcome. The
+// locked-files wording uses a comma rather than the UI label's "·", which
+// already separates the heading's fields.
+export function completedBackupHeading(header: string, completedWithIssues: boolean, lockedFilesSkipped = false) {
     return completedWithIssues
-        ? header.replace(/^(\[(?:restic|kopia|replicaro) · (?:backup|backup and retention) · )failed(\]\r?)$/, "$1completed with issues$2")
+        ? header.replace(/^(\[(?:restic|kopia|replicaro) · (?:backup|backup and retention) · )failed(\]\r?)$/,
+            `$1${lockedFilesSkipped ? "completed, locked files skipped" : "completed with issues"}$2`)
         : header;
 }
 
@@ -613,7 +689,7 @@ export function formatOperationLogText(text: string, pageEngine?: NativeEngine, 
 	const sectionText = text.slice(leadingBodyEnd);
 	const result = (presentation.maintenanceOnly ? "" : cleanBody(formattedLeadingBody)) + sectionText.replace(operationSection, (_section, prefix: string, header: string, component: string,
 		sectionKind: string, status: string, newline: string, body: string) => {
-        const displayHeader = completedBackupHeading(header, completedWithIssues);
+        const displayHeader = completedBackupHeading(header, completedWithIssues, presentation.lockedFilesSkipped);
         const failedSection = ["failed", "warning", "interrupted"].includes(status);
         const hiddenSection = presentation.concise && ["metadata_cache", "backup_admission"].includes(sectionKind);
         if (failedSection) {
@@ -658,15 +734,21 @@ export function formatOperationLogText(text: string, pageEngine?: NativeEngine, 
 
 export interface ReadableLogContext {
     operationStatus?: string;
+    operationIssueKind?: string;
     operationKind?: string;
     engine?: NativeEngine;
     partial?: boolean;
 }
 
+// The summary's only line when nothing was found. Overview compares against
+// it to decide whether the summary actually lists errors or warnings.
+export const noSummaryDiagnosticsLine = "No errors or warnings identified in the loaded output.";
+
 export function formatReadableLog(text: string, context: ReadableLogContext, live = false, formattedBody?: string, pageDiagnostics?: readonly string[]) {
     const diagnostics: string[] = pageDiagnostics ? [...pageDiagnostics] : [];
     const completedWithIssues = context.operationKind === "backup" && context.operationStatus === "completed_with_issues";
-    const presentation = { concise: true, operationKind: context.operationKind, maintenanceOnly: context.operationKind === "prune" || context.operationKind === "maintenance" };
+    const presentation = { concise: true, operationKind: context.operationKind, maintenanceOnly: context.operationKind === "prune" || context.operationKind === "maintenance",
+        lockedFilesSkipped: completedWithIssues && context.operationIssueKind === "locked_files" };
     const formatted = pageDiagnostics && formattedBody !== undefined ? formattedBody : live && context.engine
         ? formatNativeLogText(context.engine, context.operationKind ?? "live", text, diagnostics, true)
         : formatOperationLogText(text, context.engine, diagnostics, completedWithIssues, presentation);
@@ -689,7 +771,7 @@ export function formatReadableLog(text: string, context: ReadableLogContext, liv
     if (summaryDiagnostics.length > 12) concise.push("Additional errors or warnings are in Raw in the completed log.");
     const summary = ["[errors / warnings summary]",
         ...(live ? ["Errors and warnings shown below cover the currently loaded log output."] : []),
-        ...(concise.length ? concise : ["No errors or warnings identified in the loaded output."]),
+        ...(concise.length ? concise : [noSummaryDiagnosticsLine]),
     ];
     return `${summary.join("\n")}\n\n${trimSectionLines(body)}`.trimEnd();
 }

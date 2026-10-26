@@ -1,7 +1,10 @@
 package engines
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"runtime"
 	"strings"
@@ -38,6 +41,43 @@ func kopiaDestinationBasename(name, operatingSystem string) string {
 	return name
 }
 
+// ErrKopiaSelectionIncludesFolder refuses a Kopia restore of several selected
+// items when any of them is a folder.
+//
+// Kopia restores a selected folder's contents straight into the destination,
+// not into a folder of that name. With several selected items in one
+// destination, two folders would merge there, and a same-named file in one
+// would silently overwrite the other's (or a separately selected file), while
+// every item still reports restored. Restic keeps each item's archived path,
+// so it is not affected. Giving each folder its own subfolder would mean
+// Replicaro laying out a restore Kopia did not make; selected-file naming is
+// the only destination translation Replicaro does for Kopia. So the request
+// is refused instead. A single folder and several regular files stay allowed.
+//
+// Don't relax this, or replace it with per-folder subfolders, without a
+// product decision: it is what keeps a Kopia multi-selection from merging.
+var ErrKopiaSelectionIncludesFolder = errors.New("Replicaro can restore multiple files at the same time for Kopia vaults. Replicaro can also restore one folder at a time for Kopia vaults. But Replicaro cannot restore multiple folders or files with folders at the same time for Kopia vaults. This is a Kopia limitation. Please rerun your selective restore accordingly.")
+
+// ErrKopiaSelectedFileDestinationMissing refuses a Kopia restore that
+// includes selected files when the destination folder doesn't exist.
+//
+// Pinned Kopia creates a missing destination folder for a whole snapshot or a
+// selected folder, but writes a selected file straight to <folder>/<name>, and
+// that fails with "no such file or directory" while nothing is restored.
+// Replicaro doesn't create the folder for Kopia, because that would be a
+// destination layout Kopia didn't make, so the restore is refused before
+// anything runs. Whole-snapshot and folder restores, and every Restic restore,
+// keep Kopia's and Restic's own behaviour.
+var ErrKopiaSelectedFileDestinationMissing = errors.New("The destination folder doesn't exist. Replicaro can restore selected files only into a folder that already exists. Create the folder or choose an existing one, then try again.")
+
+// RestoreDestinationMissing reports whether nothing exists at a restore
+// destination. Any other answer, including an error reading it, is left to
+// the engine.
+func RestoreDestinationMissing(destination string) bool {
+	_, err := os.Stat(destination)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // KopiaRestoreFileNames belongs to one sequential selection request. It never
 // inspects disk and never changes overwrite policy. Reserving selected names
 // first prevents a generated file_1.txt from consuming an explicit selection.
@@ -52,6 +92,16 @@ func NewKopiaRestoreFileNames(selections []string) *KopiaRestoreFileNames {
 		names.reserved = append(names.reserved, kopiaDestinationBasename(path.Base(selection), runtime.GOOS))
 	}
 	return names
+}
+
+// selections is how many items the request selected. It is the only part of
+// the request a single item's restore can see, so the folder check in Restore
+// uses it.
+func (names *KopiaRestoreFileNames) selections() int {
+	if names == nil {
+		return 0
+	}
+	return len(names.reserved)
 }
 
 // Comparison is local to destination allocation, never source/cache identity.

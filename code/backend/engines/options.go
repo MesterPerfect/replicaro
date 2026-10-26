@@ -8,9 +8,67 @@ import (
 	"github.com/local/replicaro/models"
 )
 
+// allowedBackupFlags lists the advanced backup flags each engine accepts. None
+// of them takes a separate value; only Restic's --verbose accepts an inline
+// "=level".
 var allowedBackupFlags = map[string]map[string]bool{
-	ResticID: {"--verbose": false, "--no-scan": false, "--exclude-caches": false, "--one-file-system": false, "--ignore-ctime": false, "--ignore-inode": false, "--with-atime": false, "--skip-if-unchanged": false},
-	KopiaID:  {"--fail-fast": false},
+	ResticID: {"--verbose": true, "--no-scan": true, "--exclude-caches": true, "--one-file-system": true, "--ignore-ctime": true, "--ignore-inode": true, "--with-atime": true, "--skip-if-unchanged": true},
+	KopiaID:  {"--fail-fast": true},
+}
+
+// retiredBackupFlags lists Advanced options that a job setting now replaces,
+// with the name of that setting. Saving a job refuses them
+// (RejectRetiredBackupOptions); everything else (backups, profile publication
+// and loading, recovery and import) still accepts them through
+// allowedBackupFlags above, so jobs saved with one keep working until they
+// are edited. Keep a retired flag in allowedBackupFlags for that reason, and
+// don't convert saved jobs at startup.
+var retiredBackupFlags = map[string]map[string]string{
+	ResticID: {"--exclude-caches": "Skip the contents of any folder that contains a CACHEDIR.TAG file"},
+}
+
+// RetiredBackupOptionCode is the API error code of a job save refused by
+// RejectRetiredBackupOptions. The UI builds its translated message from the
+// code and the flag, and quotes the replacement setting's label from its own
+// catalog, so the quote always matches the checkbox the user sees.
+const RetiredBackupOptionCode = "retired_backup_option"
+
+// RetiredBackupOptionError is a job save refused because its Advanced options
+// use a retired flag. Error() is the English text API clients read; Flag is
+// sent next to the code so the UI can fill in its own translation.
+type RetiredBackupOptionError struct {
+	// Flag is the retired flag in lower case, as the message shows it.
+	Flag string
+	// Replacement is the English label of the setting to use instead.
+	Replacement string
+}
+
+func (e *RetiredBackupOptionError) Error() string {
+	return fmt.Sprintf("%s can no longer be set in Advanced CLI options. Use \"%s\" instead.", e.Flag, e.Replacement)
+}
+
+// RejectRetiredBackupOptions refuses a job's Advanced options that use a
+// retired flag, naming the setting to use instead. The error is always a
+// *RetiredBackupOptionError.
+func RejectRetiredBackupOptions(settings models.EngineSettings) error {
+	for engineID, section := range settings {
+		retired := retiredBackupFlags[engineID]
+		if len(retired) == 0 {
+			continue
+		}
+		tokens, err := optionTokens(section.AdditionalOptions)
+		if err != nil {
+			// Malformed options get their own message from validateOptions.
+			continue
+		}
+		for _, token := range tokens {
+			flag, _, _ := strings.Cut(token, "=")
+			if replacement, ok := retired[strings.ToLower(flag)]; ok {
+				return &RetiredBackupOptionError{Flag: strings.ToLower(flag), Replacement: replacement}
+			}
+		}
+	}
+	return nil
 }
 
 var disabledBackupFlags = map[string]bool{
@@ -56,16 +114,10 @@ func validateOptions(engine string, options []string) error {
 		if alwaysProtectedFlags[flag] || strings.Contains(flag, "pass") || strings.Contains(flag, "secret") || strings.Contains(flag, "token") || strings.Contains(flag, "credential") || strings.Contains(flag, "repository") || strings.Contains(flag, "repo") || strings.Contains(flag, "config") || strings.Contains(flag, "limit") || strings.Contains(flag, "concurr") {
 			return fmt.Errorf("%s advanced option %q is controlled by Replicaro", engine, flag)
 		}
-		valueExpected, ok := allowed[flag]
-		if !ok || (len(flag) > 2 && strings.HasPrefix(flag, "-") && strings.HasPrefix(flag[1:], "-") == false && len(flag) > 2) {
+		if !allowed[flag] || (len(flag) > 2 && strings.HasPrefix(flag, "-") && strings.HasPrefix(flag[1:], "-") == false && len(flag) > 2) {
 			return fmt.Errorf("%s advanced option %q is not allowed for backup", engine, flag)
 		}
-		if valueExpected && !hasValue {
-			if index+1 >= len(tokens) {
-				return fmt.Errorf("%s advanced option %q is missing its value", engine, flag)
-			}
-			index++
-		} else if !valueExpected && hasValue {
+		if hasValue {
 			if !(engine == ResticID && flag == "--verbose" && validResticVerbosity(token[strings.IndexByte(token, '=')+1:])) {
 				return fmt.Errorf("%s advanced option %q does not accept a value", engine, flag)
 			}

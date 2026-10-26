@@ -9,16 +9,21 @@ import (
 	"syscall"
 )
 
+// atomicReplace renames a finished private file over its destination and
+// fsyncs the folder so the new name survives a crash. Callers create the
+// source in the destination's folder, usually with os.CreateTemp and
+// sometimes under a fixed staging name (Kopia reconnect's .staged and
+// .restore files), so the rename stays on one filesystem.
+//
+// There's intentionally no ancestor walk or symlink check on the source or
+// destination here. rename(2) replaces a link at the destination rather than
+// writing through it, and the remaining cases only matter if anyone with
+// access to the computer (other local users or software running on it) is
+// swapping files under us, which Replicaro doesn't try to defend against.
 func atomicReplace(source, destination string) error {
-	if err := validateManagedAncestors(destination); err != nil {
-		return err
-	}
-	info, err := os.Lstat(source)
+	info, err := os.Stat(source)
 	if err != nil {
 		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("atomic replacement source must be a regular file")
 	}
 	mode := info.Mode().Perm()
 	if mode != 0o600 && mode != 0o700 {
@@ -33,11 +38,6 @@ func atomicReplace(source, destination string) error {
 				return fmt.Errorf("atomic replacement crosses filesystems")
 			}
 		}
-	}
-	if destinationInfo, statErr := os.Lstat(destination); statErr == nil && (destinationInfo.Mode()&os.ModeSymlink != 0 || !destinationInfo.Mode().IsRegular()) {
-		return fmt.Errorf("atomic replacement destination must be a regular file")
-	} else if statErr != nil && !os.IsNotExist(statErr) {
-		return statErr
 	}
 	if err := os.Rename(source, destination); err != nil {
 		return err

@@ -63,7 +63,7 @@ func fingerprintRegularFile(path string) (string, error) {
 // KopiaActiveConfigFingerprint returns the exact isolated active-config
 // fingerprint that is persisted before any relocation staging begins.
 func KopiaActiveConfigFingerprint(engine Engine, repo models.Repository) (KopiaFilesystemReconnectPaths, string, error) {
-	target, _, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return KopiaFilesystemReconnectPaths{}, "", err
 	}
@@ -76,7 +76,7 @@ func KopiaActiveConfigFingerprint(engine Engine, repo models.Repository) (KopiaF
 }
 
 func KopiaFilesystemReconnectArtifacts(engine Engine, repo models.Repository, token string) (KopiaFilesystemReconnectPaths, error) {
-	target, _, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return KopiaFilesystemReconnectPaths{}, err
 	}
@@ -84,6 +84,19 @@ func KopiaFilesystemReconnectArtifacts(engine Engine, repo models.Repository, to
 }
 
 func copyKopiaReconnectConfig(source, destination string) error {
+	// Check the type before opening. Opening a FIFO for reading blocks until
+	// something opens the other end, and that open can't be cancelled, so a
+	// FIFO (or another special file) left at the config path would hang the
+	// caller forever instead of failing. Stat follows a link like any other
+	// read; a link to a regular config file is fine. The checks after the
+	// open still bound the size. Only someone deliberately swapping the file
+	// in the instant between the two could slip a FIFO past this, and that
+	// kind of local tampering isn't something Replicaro defends against.
+	if info, err := os.Stat(source); err != nil {
+		return err
+	} else if !info.Mode().IsRegular() {
+		return fmt.Errorf("Kopia configuration is not a bounded regular file")
+	}
 	input, err := os.Open(source)
 	if err != nil {
 		return err
@@ -121,7 +134,7 @@ func copyKopiaReconnectConfig(source, destination string) error {
 		return err
 	}
 	remove = false
-	return appdata.SecurePath(destination, false)
+	return os.Chmod(destination, 0o600)
 }
 
 func kopiaReconnectBase(target *kopiaEngine, repo models.Repository, config string) ([]string, []string, error) {
@@ -137,7 +150,11 @@ func kopiaReconnectBase(target *kopiaEngine, repo models.Repository, config stri
 	return base, env, nil
 }
 
-func validateKopiaReconnectStatus(repo models.Repository, output string) error {
+// validateKopiaReconnectStatus runs under the vault lock (staging also holds
+// the Kopia initialization lock; verifying the active config does not), so the
+// filesystem marker read for the fingerprint is bounded by ctx; a read stuck on
+// a hung share returns ctx's error instead of holding those locks.
+func validateKopiaReconnectStatus(ctx context.Context, repo models.Repository, output string) error {
 	if err := validateKopiaBinding(repo, output); err != nil {
 		return err
 	}
@@ -159,7 +176,7 @@ func validateKopiaReconnectStatus(repo models.Repository, output string) error {
 	if repositoryStatus.ClientOptions.FormatBlobCacheDuration != expectedCacheDuration {
 		return fmt.Errorf("Kopia repository format cache policy did not match the reconnect requirement")
 	}
-	fingerprint, err := RepositoryFingerprint(repo, output)
+	fingerprint, err := RepositoryFingerprintContext(ctx, repo, output)
 	if err != nil {
 		return err
 	}
@@ -173,7 +190,7 @@ func validateKopiaReconnectStatus(repo models.Repository, output string) error {
 // connection. It never invokes repository create/init and leaves the active
 // configuration untouched.
 func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo models.Repository, token, expectedPriorSHA string) (KopiaFilesystemReconnectPaths, string, error) {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return KopiaFilesystemReconnectPaths{}, "", err
 	}
@@ -216,7 +233,6 @@ func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo mo
 	// so its first connect after rotation must bypass that stale entry. Kopia
 	// owns the refresh; parsing or deleting its cache here is not necessary.
 	args = append(args, "--disable-repository-format-cache")
-	ctx = repositoryProcessContext(ctx, repo, check)
 	var output string
 	if input != "" {
 		output, err = target.runWithInput(ctx, env, append(base, args...), input, command.NoTotalDeadline)
@@ -246,7 +262,7 @@ func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo mo
 	if err != nil {
 		return paths, output, err
 	}
-	if err := validateKopiaReconnectStatus(repo, status); err != nil {
+	if err := validateKopiaReconnectStatus(ctx, repo, status); err != nil {
 		return paths, output, err
 	}
 	return paths, output, nil
@@ -273,7 +289,7 @@ func ActivateKopiaFilesystemReconnect(paths KopiaFilesystemReconnectPaths, prior
 // VerifyActiveKopiaFilesystemReconnect verifies the activated exact config,
 // native repository ID, storage path, and client identity.
 func VerifyActiveKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo models.Repository, token, stagedSHA string) (KopiaFilesystemReconnectPaths, string, error) {
-	target, check, err := concreteKopiaEngine(engine)
+	target, err := concreteKopiaEngine(engine)
 	if err != nil {
 		return KopiaFilesystemReconnectPaths{}, "", err
 	}
@@ -289,15 +305,28 @@ func VerifyActiveKopiaFilesystemReconnect(ctx context.Context, engine Engine, re
 	if err != nil {
 		return paths, "", err
 	}
-	ctx = repositoryProcessContext(ctx, repo, check)
 	status, err := target.run(ctx, env, append(base, "repository", "status", "--json"), command.NoTotalDeadline)
 	if err != nil {
 		return paths, status, err
 	}
-	if err := validateKopiaReconnectStatus(repo, status); err != nil {
+	if err := validateKopiaReconnectStatus(ctx, repo, status); err != nil {
 		return paths, status, err
 	}
 	return paths, status, nil
+}
+
+// DiscardKopiaReconnectArtifacts removes the staged and previous config
+// copies of one reconnect intent that startup discarded (an automatic
+// relocation intent, see database.retireAutomaticRelocationState). They are
+// copies of the vault's isolated Kopia config file and hold no credentials;
+// the active config is never touched. Only the vault ID and token are needed
+// to derive the paths, so no engine binary is resolved.
+func DiscardKopiaReconnectArtifacts(repositoryID, token string) error {
+	paths, err := kopiaReconnectPaths(&kopiaEngine{}, models.Repository{ID: repositoryID, Engine: KopiaID}, token)
+	if err != nil {
+		return err
+	}
+	return CleanupKopiaFilesystemReconnect(paths)
 }
 
 func CleanupKopiaFilesystemReconnect(paths KopiaFilesystemReconnectPaths) error {
@@ -308,17 +337,4 @@ func CleanupKopiaFilesystemReconnect(paths KopiaFilesystemReconnectPaths) error 
 		}
 	}
 	return result
-}
-
-func RestoreKopiaFilesystemReconnect(paths KopiaFilesystemReconnectPaths, priorSHA string) error {
-	backupSHA, err := fingerprintRegularFile(paths.Previous)
-	if err != nil || backupSHA != priorSHA {
-		return fmt.Errorf("saved prior Kopia configuration does not match reconnect intent")
-	}
-	temporary := paths.Active + ".restore"
-	_ = os.Remove(temporary)
-	if err := copyKopiaReconnectConfig(paths.Previous, temporary); err != nil {
-		return err
-	}
-	return appdata.AtomicReplace(temporary, paths.Active)
 }
